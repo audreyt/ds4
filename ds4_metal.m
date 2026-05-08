@@ -139,6 +139,13 @@ static uint64_t g_model_wrap_count;
 static uint64_t g_model_wrap_bytes;
 static uint64_t g_model_wrap_max_bytes;
 static uint64_t g_model_residency_count;
+static int g_metal4_runtime_available;
+static int g_metal4_family_supported;
+static int g_metal4_queue_supported;
+static int g_metal4_m5_neural_accelerators_hint;
+static int g_metal4_tensor_api_enabled;
+static int g_metal4_tensor_api_compile_supported;
+static char g_metal_device_name[128];
 static NSUInteger g_flash_attn_mask_bytes;
 static NSUInteger g_flash_attn_pad_bytes;
 static NSUInteger g_flash_attn_tmp_bytes;
@@ -654,6 +661,116 @@ static int ds4_metal_use_compressor_pair_nr4(void) {
     return enabled;
 }
 
+static int ds4_metal_device_name_contains(const char *needle) {
+    return g_metal_device_name[0] != '\0' && strstr(g_metal_device_name, needle) != NULL;
+}
+
+static int ds4_metal_compile_tensor_probe(void) {
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+    if (!g_device) return 0;
+    if (@available(macOS 26.0, *)) {
+        const char *src =
+            "#include <metal_stdlib>\n"
+            "#include <metal_tensor>\n"
+            "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
+            "using namespace metal;\n"
+            "using namespace mpp::tensor_ops;\n"
+            "kernel void ds4_tensor_probe(\n"
+            "        tensor<device half,  dextents<int32_t, 2>> A [[buffer(0)]],\n"
+            "        tensor<device half,  dextents<int32_t, 2>> B [[buffer(1)]],\n"
+            "        device float *C [[buffer(2)]],\n"
+            "        uint2 tgid [[threadgroup_position_in_grid]]) {\n"
+            "    auto tA = A.slice(0, (int)tgid.y);\n"
+            "    auto tB = B.slice((int)tgid.x, 0);\n"
+            "    matmul2d<matmul2d_descriptor(16, 16, dynamic_extent), execution_simdgroups<4>> mm;\n"
+            "    auto cT = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();\n"
+            "    auto sA = tA.slice(0, 0);\n"
+            "    auto sB = tB.slice(0, 0);\n"
+            "    mm.run(sB, sA, cT);\n"
+            "    auto tC = tensor<device float, dextents<int32_t, 2>, tensor_inline>(C, dextents<int32_t, 2>(16, 16));\n"
+            "    cT.store(tC);\n"
+            "}\n";
+
+        NSError *error = nil;
+        NSString *source = [NSString stringWithUTF8String:src];
+        id<MTLLibrary> probe_library = [g_device newLibraryWithSource:source options:[MTLCompileOptions new] error:&error];
+        if (!probe_library) {
+            fprintf(stderr, "ds4: Metal 4 tensor API probe compile failed: %s\n",
+                    error ? [[error localizedDescription] UTF8String] : "(unknown)");
+            return 0;
+        }
+        id<MTLFunction> fn = [probe_library newFunctionWithName:@"ds4_tensor_probe"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal 4 tensor API probe function missing\n");
+            return 0;
+        }
+        error = nil;
+        id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!pipeline) {
+            fprintf(stderr, "ds4: Metal 4 tensor API probe pipeline failed: %s\n",
+                    error ? [[error localizedDescription] UTF8String] : "(unknown)");
+            return 0;
+        }
+        return 1;
+    }
+#endif
+    return 0;
+}
+
+static void ds4_metal_detect_metal4_features(void) {
+    g_metal4_runtime_available = 0;
+    g_metal4_family_supported = 0;
+    g_metal4_queue_supported = 0;
+    g_metal4_m5_neural_accelerators_hint = 0;
+    g_metal4_tensor_api_enabled = 0;
+    g_metal4_tensor_api_compile_supported = 0;
+    g_metal_device_name[0] = '\0';
+
+    if (!g_device) return;
+
+    const char *name = [[g_device name] UTF8String];
+    if (name) {
+        snprintf(g_metal_device_name, sizeof(g_metal_device_name), "%s", name);
+    }
+
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+    if (@available(macOS 26.0, *)) {
+        g_metal4_runtime_available = 1;
+        g_metal4_family_supported = [g_device supportsFamily:MTLGPUFamilyMetal4] ? 1 : 0;
+        g_metal4_queue_supported = [g_device respondsToSelector:@selector(newMTL4CommandQueue)] ? 1 : 0;
+
+        /*
+         * Apple does not currently expose a separate "Neural Accelerator" bit
+         * through Metal.  On public M5 systems the hardware signal is the device
+         * generation plus Metal 4 support, so keep this as a conservative hint
+         * for diagnostics and future opt-in MPP/tensor kernels.
+         */
+        if (g_metal4_family_supported && ds4_metal_device_name_contains("M5")) {
+            g_metal4_m5_neural_accelerators_hint = 1;
+        }
+
+        if (g_metal4_family_supported && getenv("DS4_METAL_TENSOR_DISABLE") == NULL) {
+            const int explicit_enable = getenv("DS4_METAL_TENSOR_ENABLE") != NULL;
+            const int default_enable =
+                ds4_metal_device_name_contains("M5") ||
+                ds4_metal_device_name_contains("M6") ||
+                ds4_metal_device_name_contains("A19") ||
+                ds4_metal_device_name_contains("A20");
+
+            if (explicit_enable || default_enable) {
+                g_metal4_tensor_api_compile_supported = ds4_metal_compile_tensor_probe();
+                g_metal4_tensor_api_enabled = g_metal4_tensor_api_compile_supported;
+                if (!g_metal4_tensor_api_enabled) {
+                    fprintf(stderr, "ds4: Metal 4 tensor API probe failed; using legacy Metal kernels\n");
+                }
+            } else {
+                fprintf(stderr, "ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices (set DS4_METAL_TENSOR_ENABLE=1 to experiment)\n");
+            }
+        }
+    }
+#endif
+}
+
 static int ds4_metal_warm_model_views(void) {
     if (g_model_view_count == 0) return 1;
 
@@ -1094,6 +1211,15 @@ void ds4_metal_print_memory_report(const char *label) {
             (unsigned long long)g_model_residency_count,
             getenv("DS4_METAL_NO_RESIDENCY") != NULL ? " (disabled)" : "");
     fprintf(stderr,
+            "ds4:   device %s, Metal 4 runtime %s, family %s, MTL4 queue %s, tensor API %s, M5 neural accelerators %s\n",
+            g_metal_device_name[0] ? g_metal_device_name : "(unknown)",
+            g_metal4_runtime_available ? "yes" : "no",
+            g_metal4_family_supported ? "yes" : "no",
+            g_metal4_queue_supported ? "yes" : "no",
+            g_metal4_tensor_api_enabled ? "enabled" :
+                (g_metal4_tensor_api_compile_supported ? "available" : "disabled"),
+            g_metal4_m5_neural_accelerators_hint ? "likely" : "not detected");
+    fprintf(stderr,
             "ds4:   scratch %.2f MiB (flash mask %.2f, pad %.2f, tmp %.2f, blk %.2f, ring %.2f, kv %.2f, compressor %.2f, router %.2f, indexer %.2f, moe %.2f, f16 %.2f, raw-store %.2f)\n",
             ds4_metal_mib(scratch),
             ds4_metal_mib((uint64_t)g_flash_attn_mask_bytes),
@@ -1135,7 +1261,14 @@ static id<MTLBuffer> ds4_metal_wrap_model_range(
 
 static const char *ds4_metal_source =
 "#include <metal_stdlib>\n"
+"#ifdef DS4_METAL_HAS_TENSOR\n"
+"#include <metal_tensor>\n"
+"#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
+"#endif\n"
 "using namespace metal;\n"
+"#ifdef DS4_METAL_HAS_TENSOR\n"
+"using namespace mpp::tensor_ops;\n"
+"#endif\n"
 "\n"
 "#define MAX(x, y) ((x) > (y) ? (x) : (y))\n"
 "#define MIN(x, y) ((x) < (y) ? (x) : (y))\n"
@@ -2648,6 +2781,7 @@ int ds4_metal_init(void) {
             fprintf(stderr, "ds4: Metal device not available\n");
             return 0;
         }
+        ds4_metal_detect_metal4_features();
 
         g_queue = [g_device newCommandQueue];
         if (!g_queue) {
@@ -2678,6 +2812,10 @@ int ds4_metal_init(void) {
             return 0;
         }
         MTLCompileOptions *options = [MTLCompileOptions new];
+        if (g_metal4_tensor_api_enabled) {
+            options.preprocessorMacros = @{ @"DS4_METAL_HAS_TENSOR": @"1" };
+            fprintf(stderr, "ds4: Metal 4 tensor API enabled for MPP tensor kernels\n");
+        }
         id<MTLLibrary> library = [g_device newLibraryWithSource:source options:options error:&error];
         if (!library) {
             fprintf(stderr, "ds4: Metal shader compilation failed: %s\n",

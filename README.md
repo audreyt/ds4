@@ -103,6 +103,41 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
 
+## Metal 4 and M5 Neural Accelerators
+
+The current production path is still hand-written Metal compute kernels over
+`MTLBuffer` storage. That is intentional: DS4's hot path is dominated by
+quantized routed-MoE matvec/matmul, sparse compressed attention, and mmap-backed
+model views, which do not map cleanly to a whole-model Core ML package.
+
+Metal 4 is the right next target, but it should be introduced as a feature-gated
+kernel backend rather than a rewrite. On macOS 26+ with `MTLGPUFamilyMetal4`,
+Apple exposes tensor resources and Metal 4 command infrastructure that can run
+machine-learning work on the same GPU timeline as compute work. On M5 hardware,
+Apple describes the per-GPU-core Neural Accelerators as available to developers
+through the Metal 4 Tensor APIs. `DS4_METAL_MEMORY_REPORT=1` now reports the
+device, Metal 4 family support, MTL4 queue availability, and whether the device
+looks like an M5 Neural Accelerator target.
+
+The implementation follows the same conservative shape used by llama.cpp's
+current Metal backend: the tensor API is disabled by default on pre-M5/pre-A19
+devices, can be forced with `DS4_METAL_TENSOR_ENABLE=1`, and can always be
+disabled with `DS4_METAL_TENSOR_DISABLE=1`. At startup ds4 compiles a tiny MPP
+tensor matmul probe before it lets the main Metal shader source see
+`DS4_METAL_HAS_TENSOR`, so unsupported SDK/device combinations fall back to the
+legacy kernels.
+
+The practical implementation plan is:
+
+1. Keep the existing kernels as the correctness path.
+2. Add opt-in Metal 4/MPP tensor kernels for dense F16/Q8 prefill GEMMs first,
+   where tensor-core-style acceleration has the cleanest shape.
+3. Extend only if benchmarks beat the current fused kernels: routed-MoE batched
+   gate/up/down projections are the next candidate, while decode matvec and
+   indexed attention are likely to remain custom kernels.
+4. Gate every new path by runtime capability and official-vector/logit tests,
+   then promote it only when quality and speed are both proven.
+
 ## CLI
 
 One-shot prompt:
