@@ -764,7 +764,7 @@ static int ds4_metal_mpp_routed_moe_stage_mask(void) {
                 if (strstr(stages, "down") != NULL) mask |= DS4_METAL_MOE_MPP_DOWN;
             }
         } else if (default_policy) {
-            mask = DS4_METAL_MOE_MPP_DOWN;
+            mask = DS4_METAL_MOE_MPP_GATE | DS4_METAL_MOE_MPP_UP | DS4_METAL_MOE_MPP_DOWN;
         }
         if (mask && forced) {
             fprintf(stderr,
@@ -773,7 +773,7 @@ static int ds4_metal_mpp_routed_moe_stage_mask(void) {
                     (mask & DS4_METAL_MOE_MPP_UP) ? ((mask & DS4_METAL_MOE_MPP_GATE) ? ",up" : "up") : "",
                     (mask & DS4_METAL_MOE_MPP_DOWN) ? ((mask & (DS4_METAL_MOE_MPP_GATE | DS4_METAL_MOE_MPP_UP)) ? ",down" : "down") : "");
         } else if (mask) {
-            fprintf(stderr, "ds4: Metal MPP routed MoE down projection enabled by default for late prefill layers\n");
+            fprintf(stderr, "ds4: Metal MPP routed MoE projections enabled by default for late prefill layers\n");
         }
         initialized = 1;
     }
