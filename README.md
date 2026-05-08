@@ -140,6 +140,11 @@ The F16 prefill MPP variant remains available for low-level investigation via
 `DS4_METAL_MPP_EXPERIMENTAL_F16=1`, but it currently fails graph-level tests and
 should not be used for quality comparisons.
 
+An experimental routed-MoE MPP matmul variant is available for profiling via
+`DS4_METAL_MPP_EXPERIMENTAL_MOE=1`. It roughly halves the profiled gate/up/down
+MoE matmul stage times on M5, but currently fails the long-context graph test
+and should not be used for quality comparisons.
+
 The attention-output low-projection also uses MPP by default on Metal 4 tensor
 targets for full 32-token tiles, falling back to the existing indexed simdgroup
 kernel for partial tiles. Set `DS4_METAL_MPP_ATTN_OUT_DISABLE=1` to isolate or

@@ -577,14 +577,16 @@ static id<MTLComputePipelineState> ds4_metal_get_mul_mm_pipeline(
 
 static id<MTLComputePipelineState> ds4_metal_get_mul_mm_id_pipeline(
         const char *function_name,
-        bool        bc_inp) {
-    NSString *key = [NSString stringWithFormat:@"%s_bci=%d",
-                     function_name, bc_inp ? 1 : 0];
+        bool        bc_inp,
+        bool        use_mpp) {
+    NSString *key = [NSString stringWithFormat:@"%s_bci=%d_mpp=%d",
+                     function_name, bc_inp ? 1 : 0, use_mpp ? 1 : 0];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
     if (cached) return cached;
 
     MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
     [constants setConstantValue:&bc_inp type:MTLDataTypeBool atIndex:700];
+    [constants setConstantValue:&use_mpp type:MTLDataTypeBool atIndex:702];
 
     NSError *error = nil;
     NSString *name = [NSString stringWithUTF8String:function_name];
@@ -720,6 +722,21 @@ static int ds4_metal_use_mpp_attn_out_low_matmul(void) {
                   getenv("DS4_METAL_MPP_ATTN_OUT_DISABLE") == NULL;
         if (enabled) {
             fprintf(stderr, "ds4: Metal MPP attention-output low projection enabled by default\n");
+        }
+        initialized = 1;
+    }
+    return enabled;
+}
+
+static int ds4_metal_use_mpp_routed_moe_matmul(void) {
+    static int initialized;
+    static int enabled;
+    if (!initialized) {
+        enabled = g_metal4_tensor_api_enabled &&
+                  getenv("DS4_METAL_MPP_DISABLE") == NULL &&
+                  getenv("DS4_METAL_MPP_EXPERIMENTAL_MOE") != NULL;
+        if (enabled) {
+            fprintf(stderr, "ds4: experimental Metal MPP routed MoE matmul enabled for profiling; this path is known to fail long-context graph tests\n");
         }
         initialized = 1;
     }
@@ -8439,7 +8456,7 @@ int ds4_metal_attention_output_q8_batch_tensor(
                                                   n_groups,
                                                   n_tokens);
                 id<MTLComputePipelineState> mm_pipeline =
-                    ds4_metal_get_mul_mm_id_pipeline("kernel_attn_out_low_q8_0_mpp_exp", false);
+                    ds4_metal_get_mul_mm_id_pipeline("kernel_attn_out_low_q8_0_mpp_exp", false, false);
                 ok = ds4_metal_encode_attn_out_low_q8_mpp(cb,
                                                           mm_pipeline,
                                                           &mm_args,
@@ -8477,7 +8494,7 @@ int ds4_metal_attention_output_q8_batch_tensor(
                             id<MTLComputePipelineState> map_pipeline =
                                 ds4_metal_get_pipeline(ds4_metal_mul_mm_id_map0_name(n_groups));
                             id<MTLComputePipelineState> fallback_pipeline =
-                                ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_q8_0_f32", false);
+                                ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_q8_0_f32", false, false);
                             ok = ds4_metal_encode_mul_mm_id(cb,
                                                             map_pipeline,
                                                             fallback_pipeline,
@@ -8513,7 +8530,7 @@ int ds4_metal_attention_output_q8_batch_tensor(
                 id<MTLComputePipelineState> map_pipeline =
                     ds4_metal_get_pipeline(ds4_metal_mul_mm_id_map0_name(n_groups));
                 id<MTLComputePipelineState> mm_pipeline =
-                    ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_q8_0_f32", false);
+                    ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_q8_0_f32", false, false);
                 ok = ds4_metal_encode_mul_mm_id(cb,
                                                 map_pipeline,
                                                 mm_pipeline,
@@ -11945,23 +11962,24 @@ static id<MTLComputePipelineState> ds4_metal_routed_mv_pipeline(uint32_t type) {
 }
 
 static id<MTLComputePipelineState> ds4_metal_routed_mm_pipeline(uint32_t type) {
+    const bool use_mpp = ds4_metal_use_mpp_routed_moe_matmul() != 0;
     switch (type) {
     case DS4_METAL_TENSOR_IQ2_XXS:
         if (!g_moe_mul_mm_id_iq2_xxs_pipeline) {
             g_moe_mul_mm_id_iq2_xxs_pipeline =
-                ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32", false);
+                ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32", false, use_mpp);
         }
         return g_moe_mul_mm_id_iq2_xxs_pipeline;
     case DS4_METAL_TENSOR_Q2_K:
         if (!g_moe_mul_mm_id_q2_k_pipeline) {
             g_moe_mul_mm_id_q2_k_pipeline =
-                ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false);
+                ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false, use_mpp);
         }
         return g_moe_mul_mm_id_q2_k_pipeline;
     case DS4_METAL_TENSOR_Q4_K:
         if (!g_moe_mul_mm_id_q4_k_pipeline) {
             g_moe_mul_mm_id_q4_k_pipeline =
-                ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32", false);
+                ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32", false, use_mpp);
         }
         return g_moe_mul_mm_id_q4_k_pipeline;
     default:
@@ -11970,13 +11988,14 @@ static id<MTLComputePipelineState> ds4_metal_routed_mm_pipeline(uint32_t type) {
 }
 
 static id<MTLComputePipelineState> ds4_metal_routed_mm_f16_rhs_pipeline(uint32_t type) {
+    const bool use_mpp = ds4_metal_use_mpp_routed_moe_matmul() != 0;
     switch (type) {
     case DS4_METAL_TENSOR_IQ2_XXS:
-        return ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f16", false);
+        return ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f16", false, use_mpp);
     case DS4_METAL_TENSOR_Q2_K:
-        return ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16", false);
+        return ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16", false, use_mpp);
     case DS4_METAL_TENSOR_Q4_K:
-        return ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16", false);
+        return ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16", false, use_mpp);
     default:
         return nil;
     }
