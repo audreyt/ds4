@@ -138,23 +138,12 @@ tensor path is unavailable, and is covered by the isolated
 long-context and official logprob-vector regressions on M5. Set
 `DS4_METAL_MPP_DISABLE=1` to compare or temporarily disable the MPP route.
 
-The F16 prefill MPP variant remains available for low-level investigation via
-`DS4_METAL_MPP_EXPERIMENTAL_F16=1`, but it currently fails graph-level tests and
-should not be used for quality comparisons.
-
 The routed-MoE projections also use MPP by default on M5-class Metal 4 tensor
 targets for staged prefill layers: the down projection starts at layer 2, the
 gate and up projections start at layer 13. This constrained route has passed
 the long-context and official logprob-vector regressions. Starting down at
 layer 1, or gate/up together at layer 12, fails the long-context regression,
-so the boundaries are intentionally conservative. The full-layer routed-MoE MPP
-experiment remains available via `DS4_METAL_MPP_EXPERIMENTAL_MOE=1`; it is
-useful for profiling but currently fails the long-context graph test and should
-not be used for quality comparisons. Use
-`DS4_METAL_MPP_EXPERIMENTAL_MOE_STAGES=gate,up,down` plus
-`DS4_METAL_MPP_EXPERIMENTAL_MOE_LAYER_MIN` and
-`DS4_METAL_MPP_EXPERIMENTAL_MOE_LAYER_MAX` to isolate projections or layer
-ranges while investigating numerical drift.
+so the boundaries are intentionally conservative.
 
 For the common six-routed-expert prefill shape, the down-projection expert
 outputs are summed with a single Metal kernel instead of five chained add
@@ -165,31 +154,6 @@ The attention-output low-projection also uses MPP by default on Metal 4 tensor
 targets for full 32-token tiles, falling back to the existing indexed simdgroup
 kernel for partial tiles. Set `DS4_METAL_MPP_ATTN_OUT_DISABLE=1` to isolate or
 temporarily disable this route.
-
-For repeatable measurements, run the benchmark harness:
-
-```
-make bench-mpp BENCH_ARGS="--sizes 512,2048,4096,8192 --repeats 3"
-```
-
-The harness synthesizes prompt files from `README.md`, runs legacy Metal
-(`DS4_METAL_MPP_DISABLE=1`) and forced Q8_0 MPP (`DS4_METAL_MPP_ENABLE=1`),
-records logs and `results.csv` under `/tmp`, and prints a prefill throughput
-summary grouped by encoded input tokens when the CLI emits progress, or by the
-requested prompt size for very short prompts.
-Add `--include-attn-out` to include a Q8 MPP ablation with attention-output MPP
-disabled.
-
-The practical implementation plan is:
-
-1. Keep the existing kernels as the correctness path.
-2. Add opt-in Metal 4/MPP tensor kernels for dense F16/Q8 prefill GEMMs first,
-   where tensor-core-style acceleration has the cleanest shape.
-3. Extend only if benchmarks beat the current fused kernels: routed-MoE batched
-   gate/up/down projections are the next candidate, while decode matvec and
-   indexed attention are likely to remain custom kernels.
-4. Gate every new path by runtime capability and official-vector/logit tests,
-   then promote it only when quality and speed are both proven.
 
 ## CLI
 

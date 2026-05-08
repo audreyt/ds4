@@ -1827,7 +1827,7 @@ template [[host_name("kernel_mul_mm_id_q4_K_f16")]]    kernel mul_mm_id_f16_rhs 
 template [[host_name("kernel_mul_mm_id_iq2_xxs_f16")]] kernel mul_mm_id_f16_rhs kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4>;
 
 #ifdef DS4_METAL_HAS_TENSOR
-kernel void kernel_attn_out_low_q8_0_mpp_exp(
+kernel void kernel_attn_out_low_q8_0_mpp(
         constant ds4_metal_args_mul_mm_id & args,
         device const char * srcA,
         device const char * srcB,

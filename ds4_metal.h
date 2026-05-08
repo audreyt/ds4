@@ -135,7 +135,7 @@ int ds4_metal_matmul_q8_0_tensor(
         const ds4_metal_tensor *x,
         uint64_t                n_tok);
 
-int ds4_metal_matmul_q8_0_mpp_experimental_tensor(
+int ds4_metal_matmul_q8_0_mpp_tensor(
         ds4_metal_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -158,16 +158,6 @@ int ds4_metal_shared_gate_up_swiglu_q8_0_tensor(
         const ds4_metal_tensor *x);
 
 int ds4_metal_matmul_f16_tensor(
-        ds4_metal_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_metal_tensor *x,
-        uint64_t                n_tok);
-
-int ds4_metal_matmul_f16_mpp_experimental_tensor(
         ds4_metal_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,

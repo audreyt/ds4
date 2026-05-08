@@ -915,7 +915,7 @@ template<
     typename SA, typename SA_4x4, typename block_q, short nl,
     void (*dequantize_func)(device const block_q *, short, thread SA_4x4 &),
     typename T0, typename T0_4x4, typename T1>
-kernel void kernel_mul_mm_mpp_exp(
+kernel void kernel_mul_mm_mpp(
         constant ds4_metal_args_mul_mm & args,
         device const char * srcA,
         device const char * srcB,
@@ -1003,10 +1003,9 @@ kernel void kernel_mul_mm_mpp_exp(
     cT.store(mD);
 }
 
-typedef decltype(kernel_mul_mm_mpp_exp<half, half4x4, float4x4, 1, dequantize_f32, float, float4x4, float>) mul_mm_mpp_exp_t;
+typedef decltype(kernel_mul_mm_mpp<half, half4x4, float4x4, 1, dequantize_f32, float, float4x4, float>) mul_mm_mpp_t;
 
-template [[host_name("kernel_mul_mm_f16_f32_mpp_exp")]] kernel mul_mm_mpp_exp_t kernel_mul_mm_mpp_exp<half, half4x4, half4x4, 1, dequantize_f16, half, half4x4, float>;
-template [[host_name("kernel_mul_mm_q8_0_f32_mpp_exp")]] kernel mul_mm_mpp_exp_t kernel_mul_mm_mpp_exp<half, half4x4, block_q8_0, 2, dequantize_q8_0, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_q8_0_f32_mpp")]] kernel mul_mm_mpp_t kernel_mul_mm_mpp<half, half4x4, block_q8_0, 2, dequantize_q8_0, float, float4x4, float>;
 #endif
 
 // Tiled matrix-matrix kernel used for prompt batches larger than 8. DS4 uses

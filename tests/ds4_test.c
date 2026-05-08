@@ -146,118 +146,7 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
     free(weights_raw);
 }
 
-static void test_metal_f16_mpp_experimental_matmul(void) {
-    const uint32_t in_dim = 128;
-    const uint32_t out_dim = 96;
-    const uint32_t n_tok = 48;
-    const uint64_t weight_bytes = (uint64_t)in_dim * out_dim * sizeof(uint16_t);
-    const uint64_t weight_alloc = test_round_up_u64(weight_bytes, (uint64_t)getpagesize());
-
-    void *weights_raw = NULL;
-    TEST_ASSERT(posix_memalign(&weights_raw, (size_t)getpagesize(), (size_t)weight_alloc) == 0);
-    if (!weights_raw) return;
-
-    uint16_t *weights = weights_raw;
-    memset(weights, 0, (size_t)weight_alloc);
-    for (uint32_t o = 0; o < out_dim; o++) {
-        for (uint32_t i = 0; i < in_dim; i++) {
-            float w = (float)((int)((o * 7u + i * 11u) % 37u) - 18) / 96.0f;
-            weights[(uint64_t)o * in_dim + i] = test_float_to_f16(w);
-        }
-    }
-
-    const uint64_t x_bytes = (uint64_t)n_tok * in_dim * sizeof(float);
-    const uint64_t out_bytes = (uint64_t)n_tok * out_dim * sizeof(float);
-    ds4_metal_tensor *x = ds4_metal_tensor_alloc(x_bytes);
-    ds4_metal_tensor *out_ref = ds4_metal_tensor_alloc(out_bytes);
-    ds4_metal_tensor *out_mpp = ds4_metal_tensor_alloc(out_bytes);
-    TEST_ASSERT(x != NULL);
-    TEST_ASSERT(out_ref != NULL);
-    TEST_ASSERT(out_mpp != NULL);
-    if (!x || !out_ref || !out_mpp) {
-        ds4_metal_tensor_free(x);
-        ds4_metal_tensor_free(out_ref);
-        ds4_metal_tensor_free(out_mpp);
-        free(weights_raw);
-        return;
-    }
-
-    float *x_host = malloc((size_t)x_bytes);
-    float *ref_host = malloc((size_t)out_bytes);
-    float *mpp_host = malloc((size_t)out_bytes);
-    TEST_ASSERT(x_host != NULL);
-    TEST_ASSERT(ref_host != NULL);
-    TEST_ASSERT(mpp_host != NULL);
-    if (!x_host || !ref_host || !mpp_host) {
-        free(x_host);
-        free(ref_host);
-        free(mpp_host);
-        ds4_metal_tensor_free(x);
-        ds4_metal_tensor_free(out_ref);
-        ds4_metal_tensor_free(out_mpp);
-        free(weights_raw);
-        return;
-    }
-
-    for (uint32_t t = 0; t < n_tok; t++) {
-        for (uint32_t i = 0; i < in_dim; i++) {
-            x_host[(uint64_t)t * in_dim + i] =
-                (float)((int)((t * 13u + i * 17u) % 41u) - 20) / 64.0f;
-        }
-    }
-
-    TEST_ASSERT(ds4_metal_tensor_write(x, 0, x_host, x_bytes) != 0);
-    TEST_ASSERT(ds4_metal_set_model_map(weights_raw, weight_alloc) != 0);
-    ds4_metal_set_quality(false);
-    TEST_ASSERT(ds4_metal_matmul_f16_tensor(out_ref, weights_raw, weight_alloc, 0,
-                                            in_dim, out_dim, x, n_tok) != 0);
-
-    int have_mpp = ds4_metal_matmul_f16_mpp_experimental_tensor(
-        out_mpp, weights_raw, weight_alloc, 0, in_dim, out_dim, x, n_tok);
-    if (!have_mpp) {
-        fprintf(stderr, "ds4-test: skipping experimental MPP F16 matmul; Metal 4 tensor API unavailable\n");
-        free(x_host);
-        free(ref_host);
-        free(mpp_host);
-        ds4_metal_tensor_free(x);
-        ds4_metal_tensor_free(out_ref);
-        ds4_metal_tensor_free(out_mpp);
-        free(weights_raw);
-        return;
-    }
-
-    TEST_ASSERT(ds4_metal_tensor_read(out_ref, 0, ref_host, out_bytes) != 0);
-    TEST_ASSERT(ds4_metal_tensor_read(out_mpp, 0, mpp_host, out_bytes) != 0);
-
-    float max_abs = 0.0f;
-    uint64_t max_index = 0;
-    for (uint64_t i = 0; i < (uint64_t)n_tok * out_dim; i++) {
-        float err = fabsf(mpp_host[i] - ref_host[i]);
-        if (err > max_abs) {
-            max_abs = err;
-            max_index = i;
-        }
-    }
-    if (max_abs >= 0.08f) {
-        fprintf(stderr, "ds4-test: experimental MPP F16 matmul max_abs=%f at token=%llu out=%llu ref=%f mpp=%f\n",
-                max_abs,
-                (unsigned long long)(max_index / out_dim),
-                (unsigned long long)(max_index % out_dim),
-                ref_host[max_index],
-                mpp_host[max_index]);
-    }
-    TEST_ASSERT(max_abs < 0.08f);
-
-    free(x_host);
-    free(ref_host);
-    free(mpp_host);
-    ds4_metal_tensor_free(x);
-    ds4_metal_tensor_free(out_ref);
-    ds4_metal_tensor_free(out_mpp);
-    free(weights_raw);
-}
-
-static void test_metal_q8_0_mpp_experimental_matmul(void) {
+static void test_metal_q8_0_mpp_matmul(void) {
     const uint32_t in_dim = 128;
     const uint32_t out_dim = 96;
     const uint32_t n_tok = 48;
@@ -330,10 +219,10 @@ static void test_metal_q8_0_mpp_experimental_matmul(void) {
     TEST_ASSERT(ds4_metal_matmul_q8_0_tensor(out_ref, weights_raw, weight_alloc, 0,
                                              in_dim, out_dim, x, n_tok) != 0);
 
-    int have_mpp = ds4_metal_matmul_q8_0_mpp_experimental_tensor(
+    int have_mpp = ds4_metal_matmul_q8_0_mpp_tensor(
         out_mpp, weights_raw, weight_alloc, 0, in_dim, out_dim, x, n_tok);
     if (!have_mpp) {
-        fprintf(stderr, "ds4-test: skipping experimental MPP Q8_0 matmul; Metal 4 tensor API unavailable\n");
+        fprintf(stderr, "ds4-test: skipping MPP Q8_0 matmul; Metal 4 tensor API unavailable\n");
         free(x_host);
         free(ref_host);
         free(mpp_host);
@@ -357,7 +246,7 @@ static void test_metal_q8_0_mpp_experimental_matmul(void) {
         }
     }
     if (max_abs >= 0.10f) {
-        fprintf(stderr, "ds4-test: experimental MPP Q8_0 matmul max_abs=%f at token=%llu out=%llu ref=%f mpp=%f\n",
+        fprintf(stderr, "ds4-test: MPP Q8_0 matmul max_abs=%f at token=%llu out=%llu ref=%f mpp=%f\n",
                 max_abs,
                 (unsigned long long)(max_index / out_dim),
                 (unsigned long long)(max_index % out_dim),
@@ -377,8 +266,7 @@ static void test_metal_q8_0_mpp_experimental_matmul(void) {
 
 static void test_metal_kernel_group(void) {
     test_metal_f16_matvec_fast_nr0_4();
-    test_metal_f16_mpp_experimental_matmul();
-    test_metal_q8_0_mpp_experimental_matmul();
+    test_metal_q8_0_mpp_matmul();
 }
 
 static char *test_read_file(const char *path) {

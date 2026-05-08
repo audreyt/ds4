@@ -18,7 +18,7 @@ NATIVE_CORE_OBJS = ds4_native.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all clean test bench-mpp
+.PHONY: all clean test
 
 all: ds4 ds4-server
 
@@ -74,9 +74,6 @@ ds4_test: ds4_test.o rax.o $(CORE_OBJS)
 
 test: ds4_test
 	./ds4_test
-
-bench-mpp: ds4
-	./tools/bench_mpp_prefill.sh --no-build $(BENCH_ARGS)
 
 clean:
 	rm -f ds4 ds4-server ds4_native ds4_server_test ds4_test *.o

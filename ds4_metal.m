@@ -663,19 +663,6 @@ static int ds4_metal_use_compressor_pair_nr4(void) {
 
 static int ds4_metal_device_name_contains(const char *needle);
 
-static int ds4_metal_use_mpp_experimental_f16_matmul(void) {
-    static int initialized;
-    static int enabled;
-    if (!initialized) {
-        enabled = getenv("DS4_METAL_MPP_EXPERIMENTAL_F16") != NULL;
-        if (enabled) {
-            fprintf(stderr, "ds4: experimental Metal MPP F16 prefill matmul enabled for benchmarking; this path is known to fail graph-level tests\n");
-        }
-        initialized = 1;
-    }
-    return enabled;
-}
-
 static int ds4_metal_mpp_q8_0_default_target(void) {
     return ds4_metal_device_name_contains("M5") ||
            ds4_metal_device_name_contains("M6") ||
@@ -686,11 +673,7 @@ static int ds4_metal_mpp_q8_0_default_target(void) {
 static int ds4_metal_mpp_q8_0_policy_enabled(void) {
     if (!g_metal4_tensor_api_enabled) return 0;
     if (getenv("DS4_METAL_MPP_DISABLE") != NULL) return 0;
-    if (getenv("DS4_METAL_MPP_ENABLE") != NULL ||
-        getenv("DS4_METAL_MPP_EXPERIMENTAL") != NULL ||
-        getenv("DS4_METAL_MPP_EXPERIMENTAL_Q8_0") != NULL) {
-        return 1;
-    }
+    if (getenv("DS4_METAL_MPP_ENABLE") != NULL) return 1;
     return ds4_metal_mpp_q8_0_default_target();
 }
 
@@ -700,9 +683,7 @@ static int ds4_metal_use_mpp_q8_0_matmul(void) {
     if (!initialized) {
         enabled = ds4_metal_mpp_q8_0_policy_enabled();
         if (enabled) {
-            const int forced = getenv("DS4_METAL_MPP_ENABLE") != NULL ||
-                               getenv("DS4_METAL_MPP_EXPERIMENTAL") != NULL ||
-                               getenv("DS4_METAL_MPP_EXPERIMENTAL_Q8_0") != NULL;
+            const int forced = getenv("DS4_METAL_MPP_ENABLE") != NULL;
             fprintf(stderr, "ds4: Metal MPP Q8_0 prefill matmul enabled%s\n",
                     forced ? " by environment" : " by default");
         }
@@ -740,16 +721,9 @@ static int ds4_metal_mpp_routed_moe_default_target(void) {
     return ds4_metal_device_name_contains("M5");
 }
 
-static int ds4_metal_mpp_routed_moe_forced(void) {
-    return g_metal4_tensor_api_enabled &&
-           getenv("DS4_METAL_MPP_DISABLE") == NULL &&
-           getenv("DS4_METAL_MPP_EXPERIMENTAL_MOE") != NULL;
-}
-
 static int ds4_metal_mpp_routed_moe_default_policy(void) {
     return g_metal4_tensor_api_enabled &&
            getenv("DS4_METAL_MPP_DISABLE") == NULL &&
-           getenv("DS4_METAL_MPP_EXPERIMENTAL_MOE") == NULL &&
            ds4_metal_mpp_routed_moe_default_target();
 }
 
@@ -757,26 +731,10 @@ static int ds4_metal_mpp_routed_moe_stage_mask(void) {
     static int initialized;
     static int mask;
     if (!initialized) {
-        const int forced = ds4_metal_mpp_routed_moe_forced();
-        if (forced) {
-            const char *stages = getenv("DS4_METAL_MPP_EXPERIMENTAL_MOE_STAGES");
-            if (!stages || !stages[0] || strstr(stages, "all") != NULL) {
-                mask = DS4_METAL_MOE_MPP_GATE | DS4_METAL_MOE_MPP_UP | DS4_METAL_MOE_MPP_DOWN;
-            } else {
-                if (strstr(stages, "gate") != NULL) mask |= DS4_METAL_MOE_MPP_GATE;
-                if (strstr(stages, "up") != NULL)   mask |= DS4_METAL_MOE_MPP_UP;
-                if (strstr(stages, "down") != NULL) mask |= DS4_METAL_MOE_MPP_DOWN;
-            }
-        } else if (ds4_metal_mpp_routed_moe_default_policy()) {
+        if (ds4_metal_mpp_routed_moe_default_policy()) {
             mask = DS4_METAL_MOE_MPP_GATE | DS4_METAL_MOE_MPP_UP | DS4_METAL_MOE_MPP_DOWN;
         }
-        if (mask && forced) {
-            fprintf(stderr,
-                    "ds4: experimental Metal MPP routed MoE matmul enabled for profiling stages=%s%s%s; this path is known to fail long-context graph tests\n",
-                    (mask & DS4_METAL_MOE_MPP_GATE) ? "gate" : "",
-                    (mask & DS4_METAL_MOE_MPP_UP) ? ((mask & DS4_METAL_MOE_MPP_GATE) ? ",up" : "up") : "",
-                    (mask & DS4_METAL_MOE_MPP_DOWN) ? ((mask & (DS4_METAL_MOE_MPP_GATE | DS4_METAL_MOE_MPP_UP)) ? ",down" : "down") : "");
-        } else if (mask) {
+        if (mask) {
             fprintf(stderr, "ds4: Metal MPP routed MoE projections enabled by default for staged prefill layers\n");
         }
         initialized = 1;
@@ -784,54 +742,9 @@ static int ds4_metal_mpp_routed_moe_stage_mask(void) {
     return mask;
 }
 
-static uint32_t ds4_metal_env_u32_or(const char *name, uint32_t fallback) {
-    const char *value = getenv(name);
-    if (!value || !value[0]) return fallback;
-
-    char *end = NULL;
-    unsigned long parsed = strtoul(value, &end, 10);
-    if (end == value || parsed > UINT32_MAX) return fallback;
-    return (uint32_t)parsed;
-}
-
-static int ds4_metal_mpp_routed_moe_layer_allowed(uint32_t layer_index) {
-    static int initialized;
-    static uint32_t min_layer;
-    static uint32_t max_layer;
-    if (!initialized) {
-        const int default_policy = ds4_metal_mpp_routed_moe_default_policy();
-        min_layer = ds4_metal_env_u32_or("DS4_METAL_MPP_EXPERIMENTAL_MOE_LAYER_MIN",
-                                         default_policy ? 27u : 0u);
-        max_layer = ds4_metal_env_u32_or("DS4_METAL_MPP_EXPERIMENTAL_MOE_LAYER_MAX", UINT32_MAX);
-        if (min_layer > max_layer) {
-            uint32_t tmp = min_layer;
-            min_layer = max_layer;
-            max_layer = tmp;
-        }
-        if (min_layer != 0 || max_layer != UINT32_MAX) {
-            if (max_layer == UINT32_MAX) {
-                fprintf(stderr,
-                        "ds4: Metal MPP routed MoE layer range %u..end\n",
-                        min_layer);
-            } else {
-                fprintf(stderr,
-                        "ds4: Metal MPP routed MoE layer range %u..%u\n",
-                        min_layer,
-                        max_layer);
-            }
-        }
-        initialized = 1;
-    }
-    return layer_index >= min_layer && layer_index <= max_layer;
-}
-
 static int ds4_metal_mpp_routed_moe_mask_for_layer(uint32_t layer_index) {
     const int requested_mask = ds4_metal_mpp_routed_moe_stage_mask();
     if (!requested_mask) return 0;
-
-    if (ds4_metal_mpp_routed_moe_forced()) {
-        return ds4_metal_mpp_routed_moe_layer_allowed(layer_index) ? requested_mask : 0;
-    }
 
     if (ds4_metal_mpp_routed_moe_default_policy()) {
         static int initialized;
@@ -853,10 +766,10 @@ static int ds4_metal_mpp_routed_moe_mask_for_layer(uint32_t layer_index) {
     return 0;
 }
 
-static void ds4_metal_warn_mpp_experimental_fallback(void) {
+static void ds4_metal_warn_mpp_fallback(void) {
     static int warned;
     if (!warned) {
-        fprintf(stderr, "ds4: experimental Metal MPP prefill matmul requested but unavailable; falling back to legacy kernel\n");
+        fprintf(stderr, "ds4: Metal MPP prefill matmul unavailable; falling back to legacy kernel\n");
         warned = 1;
     }
 }
@@ -5274,11 +5187,11 @@ int ds4_metal_matmul_q8_0_tensor(
     }
 
     if (n_tok > 8 && ds4_metal_use_mpp_q8_0_matmul()) {
-        if (ds4_metal_matmul_q8_0_mpp_experimental_tensor(out, model_map, model_size, weight_offset,
-                                                          in_dim, out_dim, x, n_tok)) {
+        if (ds4_metal_matmul_q8_0_mpp_tensor(out, model_map, model_size, weight_offset,
+                                             in_dim, out_dim, x, n_tok)) {
             return 1;
         }
-        ds4_metal_warn_mpp_experimental_fallback();
+        ds4_metal_warn_mpp_fallback();
     }
 
     @autoreleasepool {
@@ -5400,7 +5313,7 @@ int ds4_metal_matmul_q8_0_tensor(
     return 1;
 }
 
-int ds4_metal_matmul_q8_0_mpp_experimental_tensor(
+int ds4_metal_matmul_q8_0_mpp_tensor(
         ds4_metal_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -5424,7 +5337,7 @@ int ds4_metal_matmul_q8_0_mpp_experimental_tensor(
         if (!xbuf || !outbuf ||
             ds4_metal_tensor_bytes(x) < x_bytes ||
             ds4_metal_tensor_bytes(out) < out_bytes) {
-            fprintf(stderr, "ds4: experimental Metal MPP Q8_0 matmul received undersized activation buffers\n");
+            fprintf(stderr, "ds4: Metal MPP Q8_0 matmul received undersized activation buffers\n");
             return 0;
         }
 
@@ -5432,7 +5345,7 @@ int ds4_metal_matmul_q8_0_mpp_experimental_tensor(
         const uint64_t row_bytes = blocks * 34;
         const uint64_t weight_bytes = out_dim * row_bytes;
         if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
-            fprintf(stderr, "ds4: experimental Metal MPP Q8_0 matmul range is outside the mapped model\n");
+            fprintf(stderr, "ds4: Metal MPP Q8_0 matmul range is outside the mapped model\n");
             return 0;
         }
 
@@ -5443,7 +5356,7 @@ int ds4_metal_matmul_q8_0_mpp_experimental_tensor(
         const bool bc_inp = (in_dim % 32u) != 0;
         const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
         id<MTLComputePipelineState> pipeline =
-            ds4_metal_get_mul_mm_pipeline("kernel_mul_mm_q8_0_f32_mpp_exp", bc_inp, bc_out);
+            ds4_metal_get_mul_mm_pipeline("kernel_mul_mm_q8_0_f32_mpp", bc_inp, bc_out);
         if (!pipeline) return 0;
 
         int owned = 0;
@@ -5465,7 +5378,7 @@ int ds4_metal_matmul_q8_0_mpp_experimental_tensor(
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         ds4_metal_end_compute_encoder(cb, enc);
 
-        if (!ds4_metal_finish_command_buffer(cb, owned, "experimental Metal MPP Q8_0 matmul")) return 0;
+        if (!ds4_metal_finish_command_buffer(cb, owned, "Metal MPP Q8_0 matmul")) return 0;
     }
 
     return 1;
@@ -5570,14 +5483,6 @@ int ds4_metal_matmul_f16_tensor(
         uint64_t                n_tok) {
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
-
-    if (n_tok > 8 && ds4_metal_use_mpp_experimental_f16_matmul()) {
-        if (ds4_metal_matmul_f16_mpp_experimental_tensor(out, model_map, model_size, weight_offset,
-                                                         in_dim, out_dim, x, n_tok)) {
-            return 1;
-        }
-        ds4_metal_warn_mpp_experimental_fallback();
-    }
 
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_metal_tensor_buffer(x);
@@ -5690,76 +5595,6 @@ int ds4_metal_matmul_f16_tensor(
         ds4_metal_end_compute_encoder(cb, enc);
 
         if (!ds4_metal_finish_command_buffer(cb, owned, "F16 tensor matmul")) return 0;
-    }
-
-    return 1;
-}
-
-int ds4_metal_matmul_f16_mpp_experimental_tensor(
-        ds4_metal_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_metal_tensor *x,
-        uint64_t                n_tok) {
-    if (!g_initialized && !ds4_metal_init()) return 0;
-    if (!g_metal4_tensor_api_enabled) return 0;
-    if ((in_dim % 32u) != 0 || n_tok <= 8 ||
-        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
-        return 0;
-    }
-
-    @autoreleasepool {
-        id<MTLBuffer> xbuf = ds4_metal_tensor_buffer(x);
-        id<MTLBuffer> outbuf = ds4_metal_tensor_buffer(out);
-        const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
-        const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
-        if (!xbuf || !outbuf ||
-            ds4_metal_tensor_bytes(x) < x_bytes ||
-            ds4_metal_tensor_bytes(out) < out_bytes) {
-            fprintf(stderr, "ds4: experimental Metal MPP F16 matmul received undersized activation buffers\n");
-            return 0;
-        }
-
-        const uint64_t row_bytes = in_dim * sizeof(uint16_t);
-        const uint64_t weight_bytes = row_bytes * out_dim;
-        if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
-            fprintf(stderr, "ds4: experimental Metal MPP F16 matmul range is outside the mapped model\n");
-            return 0;
-        }
-
-        uint64_t inner_offset = 0;
-        id<MTLBuffer> wbuf = ds4_metal_wrap_model_range(model_map, model_size, weight_offset, weight_bytes, &inner_offset);
-        if (!wbuf) return 0;
-
-        const bool bc_inp = (in_dim % 32u) != 0;
-        const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
-        id<MTLComputePipelineState> pipeline =
-            ds4_metal_get_mul_mm_pipeline("kernel_mul_mm_f16_f32_mpp_exp", bc_inp, bc_out);
-        if (!pipeline) return 0;
-
-        int owned = 0;
-        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
-        if (!cb) return 0;
-
-        ds4_metal_mul_mm_args args = ds4_metal_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
-
-        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
-        [enc setComputePipelineState:pipeline];
-        [enc setBytes:&args length:sizeof(args) atIndex:0];
-        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
-        [enc setBuffer:xbuf offset:ds4_metal_tensor_offset(x) atIndex:2];
-        [enc setBuffer:outbuf offset:ds4_metal_tensor_offset(out) atIndex:3];
-        [enc setThreadgroupMemoryLength:4096u atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
-                                              ((NSUInteger)out_dim + 63u) / 64u,
-                                              1)
-             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        ds4_metal_end_compute_encoder(cb, enc);
-
-        if (!ds4_metal_finish_command_buffer(cb, owned, "experimental Metal MPP F16 matmul")) return 0;
     }
 
     return 1;
@@ -8588,7 +8423,7 @@ int ds4_metal_attention_output_q8_batch_tensor(
                                                   n_groups,
                                                   n_tokens);
                 id<MTLComputePipelineState> mm_pipeline =
-                    ds4_metal_get_mul_mm_id_pipeline("kernel_attn_out_low_q8_0_mpp_exp", false, false);
+                    ds4_metal_get_mul_mm_id_pipeline("kernel_attn_out_low_q8_0_mpp", false, false);
                 ok = ds4_metal_encode_attn_out_low_q8_mpp(cb,
                                                           mm_pipeline,
                                                           &mm_args,
@@ -8599,7 +8434,7 @@ int ds4_metal_attention_output_q8_batch_tensor(
                                                           ds4_metal_tensor_buffer(low),
                                                           ds4_metal_tensor_offset(low)) != 0;
                 if (!ok) {
-                    ds4_metal_warn_mpp_experimental_fallback();
+                    ds4_metal_warn_mpp_fallback();
                     if (ds4_metal_mul_mm_id_map0_name(n_groups) != NULL) {
                         if (getenv("DS4_METAL_DISABLE_ATTN_OUT_IDS_CACHE") != NULL) {
                             group_ids_buffer =
