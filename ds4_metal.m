@@ -75,9 +75,6 @@ static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_pair_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_sum6_pipeline;
-static id<MTLComputePipelineState> g_moe_mul_mm_id_iq2_xxs_pipeline;
-static id<MTLComputePipelineState> g_moe_mul_mm_id_q2_k_pipeline;
-static id<MTLComputePipelineState> g_moe_mul_mm_id_q4_k_pipeline;
 static id<MTLComputePipelineState> g_rope_tail_batch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_fp8_kv_quantize_pipeline;
 static id<MTLComputePipelineState> g_dsv4_kv_fp8_store_pipeline;
@@ -728,19 +725,100 @@ static int ds4_metal_use_mpp_attn_out_low_matmul(void) {
     return enabled;
 }
 
-static int ds4_metal_use_mpp_routed_moe_matmul(void) {
+enum {
+    DS4_METAL_MOE_MPP_GATE = 1 << 0,
+    DS4_METAL_MOE_MPP_UP   = 1 << 1,
+    DS4_METAL_MOE_MPP_DOWN = 1 << 2,
+};
+
+static int ds4_metal_mpp_routed_moe_default_target(void) {
+    return ds4_metal_device_name_contains("M5");
+}
+
+static int ds4_metal_mpp_routed_moe_forced(void) {
+    return g_metal4_tensor_api_enabled &&
+           getenv("DS4_METAL_MPP_DISABLE") == NULL &&
+           getenv("DS4_METAL_MPP_EXPERIMENTAL_MOE") != NULL;
+}
+
+static int ds4_metal_mpp_routed_moe_default_policy(void) {
+    return g_metal4_tensor_api_enabled &&
+           getenv("DS4_METAL_MPP_DISABLE") == NULL &&
+           getenv("DS4_METAL_MPP_EXPERIMENTAL_MOE") == NULL &&
+           ds4_metal_mpp_routed_moe_default_target();
+}
+
+static int ds4_metal_mpp_routed_moe_stage_mask(void) {
     static int initialized;
-    static int enabled;
+    static int mask;
     if (!initialized) {
-        enabled = g_metal4_tensor_api_enabled &&
-                  getenv("DS4_METAL_MPP_DISABLE") == NULL &&
-                  getenv("DS4_METAL_MPP_EXPERIMENTAL_MOE") != NULL;
-        if (enabled) {
-            fprintf(stderr, "ds4: experimental Metal MPP routed MoE matmul enabled for profiling; this path is known to fail long-context graph tests\n");
+        const int forced = ds4_metal_mpp_routed_moe_forced();
+        const int default_policy = ds4_metal_mpp_routed_moe_default_policy();
+        if (forced) {
+            const char *stages = getenv("DS4_METAL_MPP_EXPERIMENTAL_MOE_STAGES");
+            if (!stages || !stages[0] || strstr(stages, "all") != NULL) {
+                mask = DS4_METAL_MOE_MPP_GATE | DS4_METAL_MOE_MPP_UP | DS4_METAL_MOE_MPP_DOWN;
+            } else {
+                if (strstr(stages, "gate") != NULL) mask |= DS4_METAL_MOE_MPP_GATE;
+                if (strstr(stages, "up") != NULL)   mask |= DS4_METAL_MOE_MPP_UP;
+                if (strstr(stages, "down") != NULL) mask |= DS4_METAL_MOE_MPP_DOWN;
+            }
+        } else if (default_policy) {
+            mask = DS4_METAL_MOE_MPP_DOWN;
+        }
+        if (mask && forced) {
+            fprintf(stderr,
+                    "ds4: experimental Metal MPP routed MoE matmul enabled for profiling stages=%s%s%s; this path is known to fail long-context graph tests\n",
+                    (mask & DS4_METAL_MOE_MPP_GATE) ? "gate" : "",
+                    (mask & DS4_METAL_MOE_MPP_UP) ? ((mask & DS4_METAL_MOE_MPP_GATE) ? ",up" : "up") : "",
+                    (mask & DS4_METAL_MOE_MPP_DOWN) ? ((mask & (DS4_METAL_MOE_MPP_GATE | DS4_METAL_MOE_MPP_UP)) ? ",down" : "down") : "");
+        } else if (mask) {
+            fprintf(stderr, "ds4: Metal MPP routed MoE down projection enabled by default for late prefill layers\n");
         }
         initialized = 1;
     }
-    return enabled;
+    return mask;
+}
+
+static uint32_t ds4_metal_env_u32_or(const char *name, uint32_t fallback) {
+    const char *value = getenv(name);
+    if (!value || !value[0]) return fallback;
+
+    char *end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (end == value || parsed > UINT32_MAX) return fallback;
+    return (uint32_t)parsed;
+}
+
+static int ds4_metal_mpp_routed_moe_layer_allowed(uint32_t layer_index) {
+    static int initialized;
+    static uint32_t min_layer;
+    static uint32_t max_layer;
+    if (!initialized) {
+        const int default_policy = ds4_metal_mpp_routed_moe_default_policy();
+        min_layer = ds4_metal_env_u32_or("DS4_METAL_MPP_EXPERIMENTAL_MOE_LAYER_MIN",
+                                         default_policy ? 32u : 0u);
+        max_layer = ds4_metal_env_u32_or("DS4_METAL_MPP_EXPERIMENTAL_MOE_LAYER_MAX", UINT32_MAX);
+        if (min_layer > max_layer) {
+            uint32_t tmp = min_layer;
+            min_layer = max_layer;
+            max_layer = tmp;
+        }
+        if (min_layer != 0 || max_layer != UINT32_MAX) {
+            if (max_layer == UINT32_MAX) {
+                fprintf(stderr,
+                        "ds4: Metal MPP routed MoE layer range %u..end\n",
+                        min_layer);
+            } else {
+                fprintf(stderr,
+                        "ds4: Metal MPP routed MoE layer range %u..%u\n",
+                        min_layer,
+                        max_layer);
+            }
+        }
+        initialized = 1;
+    }
+    return layer_index >= min_layer && layer_index <= max_layer;
 }
 
 static void ds4_metal_warn_mpp_experimental_fallback(void) {
@@ -4214,9 +4292,6 @@ void ds4_metal_cleanup(void) {
         g_moe_mul_mv_id_q4_k_pair_pipeline = nil;
         g_moe_mul_mv_id_q4_k_pair_swiglu_pipeline = nil;
         g_moe_mul_mv_id_q4_k_sum6_pipeline = nil;
-        g_moe_mul_mm_id_iq2_xxs_pipeline = nil;
-        g_moe_mul_mm_id_q2_k_pipeline = nil;
-        g_moe_mul_mm_id_q4_k_pipeline = nil;
         g_rope_tail_batch_pipeline = nil;
         g_dsv4_fp8_kv_quantize_pipeline = nil;
         g_dsv4_kv_fp8_store_pipeline = nil;
@@ -11961,34 +12036,20 @@ static id<MTLComputePipelineState> ds4_metal_routed_mv_pipeline(uint32_t type) {
     }
 }
 
-static id<MTLComputePipelineState> ds4_metal_routed_mm_pipeline(uint32_t type) {
-    const bool use_mpp = ds4_metal_use_mpp_routed_moe_matmul() != 0;
+static id<MTLComputePipelineState> ds4_metal_routed_mm_pipeline(uint32_t type, bool use_mpp) {
     switch (type) {
     case DS4_METAL_TENSOR_IQ2_XXS:
-        if (!g_moe_mul_mm_id_iq2_xxs_pipeline) {
-            g_moe_mul_mm_id_iq2_xxs_pipeline =
-                ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32", false, use_mpp);
-        }
-        return g_moe_mul_mm_id_iq2_xxs_pipeline;
+        return ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32", false, use_mpp);
     case DS4_METAL_TENSOR_Q2_K:
-        if (!g_moe_mul_mm_id_q2_k_pipeline) {
-            g_moe_mul_mm_id_q2_k_pipeline =
-                ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false, use_mpp);
-        }
-        return g_moe_mul_mm_id_q2_k_pipeline;
+        return ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false, use_mpp);
     case DS4_METAL_TENSOR_Q4_K:
-        if (!g_moe_mul_mm_id_q4_k_pipeline) {
-            g_moe_mul_mm_id_q4_k_pipeline =
-                ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32", false, use_mpp);
-        }
-        return g_moe_mul_mm_id_q4_k_pipeline;
+        return ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32", false, use_mpp);
     default:
         return nil;
     }
 }
 
-static id<MTLComputePipelineState> ds4_metal_routed_mm_f16_rhs_pipeline(uint32_t type) {
-    const bool use_mpp = ds4_metal_use_mpp_routed_moe_matmul() != 0;
+static id<MTLComputePipelineState> ds4_metal_routed_mm_f16_rhs_pipeline(uint32_t type, bool use_mpp) {
     switch (type) {
     case DS4_METAL_TENSOR_IQ2_XXS:
         return ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f16", false, use_mpp);
@@ -13468,6 +13529,7 @@ int ds4_metal_routed_moe_batch_tensor(
         uint32_t                n_expert,
         float                   clamp,
         const ds4_metal_tensor *x,
+        uint32_t                layer_index,
         uint32_t                n_tokens) {
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !gate || !up || !mid || !x || !model_map || !selected || !weights ||
@@ -13533,6 +13595,7 @@ int ds4_metal_routed_moe_batch_tensor(
         id<MTLComputePipelineState> gate_mv_pipeline = ds4_metal_routed_mv_pipeline(gate_type);
         id<MTLComputePipelineState> down_mv_pipeline = ds4_metal_routed_mv_pipeline(down_type);
         id<MTLComputePipelineState> gate_mm_pipeline = nil;
+        id<MTLComputePipelineState> up_mm_pipeline = nil;
         id<MTLComputePipelineState> down_mm_pipeline = nil;
         if (gate_nr0 == 0 || down_nr0 == 0 || !gate_mv_pipeline || !down_mv_pipeline) {
             fprintf(stderr, "ds4: unsupported Metal routed batch MoE quant types gate=%u down=%u\n",
@@ -13569,6 +13632,9 @@ int ds4_metal_routed_moe_batch_tensor(
         ds4_metal_mul_mm_id_args gate_mm_args = { 0 };
         ds4_metal_mul_mm_id_args down_mm_args = { 0 };
         id<MTLComputePipelineState> map_pipeline = nil;
+        const int requested_mpp_mask = ds4_metal_mpp_routed_moe_stage_mask();
+        const int moe_mpp_mask =
+            ds4_metal_mpp_routed_moe_layer_allowed(layer_index) ? requested_mpp_mask : 0;
         /*
          * The grouped routed-MoE matmul loads activation tiles as half before
          * using SIMD-group MMA.  Store the SwiGLU/route-weight intermediate in
@@ -13592,11 +13658,16 @@ int ds4_metal_routed_moe_batch_tensor(
                                                         request_mid_f16 ? sizeof(uint16_t) : sizeof(float));
 
             map_pipeline = ds4_metal_get_pipeline(ds4_metal_mul_mm_id_map0_name(n_expert));
-            gate_mm_pipeline = ds4_metal_routed_mm_pipeline(gate_type);
+            gate_mm_pipeline = ds4_metal_routed_mm_pipeline(
+                    gate_type,
+                    (moe_mpp_mask & DS4_METAL_MOE_MPP_GATE) != 0);
+            up_mm_pipeline = ds4_metal_routed_mm_pipeline(
+                    gate_type,
+                    (moe_mpp_mask & DS4_METAL_MOE_MPP_UP) != 0);
             down_mm_pipeline = request_mid_f16 ?
-                ds4_metal_routed_mm_f16_rhs_pipeline(down_type) :
-                ds4_metal_routed_mm_pipeline(down_type);
-            if (!map_pipeline || !gate_mm_pipeline || !down_mm_pipeline) {
+                ds4_metal_routed_mm_f16_rhs_pipeline(down_type, (moe_mpp_mask & DS4_METAL_MOE_MPP_DOWN) != 0) :
+                ds4_metal_routed_mm_pipeline(down_type, (moe_mpp_mask & DS4_METAL_MOE_MPP_DOWN) != 0);
+            if (!map_pipeline || !gate_mm_pipeline || !up_mm_pipeline || !down_mm_pipeline) {
                 return 0;
             }
         }
@@ -13677,7 +13748,7 @@ int ds4_metal_routed_moe_batch_tensor(
             }
             if (ok) {
                 ok = ds4_metal_encode_mul_mm_id_mapped(cb,
-                                                   gate_mm_pipeline,
+                                                   up_mm_pipeline,
                                                    &gate_mm_args,
                                                    up_buf,
                                                    (NSUInteger)up_inner,

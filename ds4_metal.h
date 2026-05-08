@@ -673,6 +673,7 @@ int ds4_metal_routed_moe_batch_tensor(
         uint32_t                n_expert,
         float                   clamp,
         const ds4_metal_tensor *x,
+        uint32_t                layer_index,
         uint32_t                n_tokens);
 
 /* =========================================================================
