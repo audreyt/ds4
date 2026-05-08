@@ -711,6 +711,21 @@ static int ds4_metal_use_mpp_q8_0_matmul(void) {
     return enabled;
 }
 
+static int ds4_metal_use_mpp_attn_out_low_matmul(void) {
+    static int initialized;
+    static int enabled;
+    if (!initialized) {
+        enabled = g_metal4_tensor_api_enabled &&
+                  getenv("DS4_METAL_MPP_DISABLE") == NULL &&
+                  getenv("DS4_METAL_MPP_ATTN_OUT_ENABLE") != NULL;
+        if (enabled) {
+            fprintf(stderr, "ds4: experimental Metal MPP attention-output low projection enabled\n");
+        }
+        initialized = 1;
+    }
+    return enabled;
+}
+
 static void ds4_metal_warn_mpp_experimental_fallback(void) {
     static int warned;
     if (!warned) {
@@ -2366,6 +2381,17 @@ static int ds4_metal_encode_attn_out_low_q8_direct(
         NSUInteger                  dst_off,
         NSUInteger                  threadgroup_bytes,
         NSUInteger                  nsg);
+
+static int ds4_metal_encode_attn_out_low_q8_mpp(
+        id<MTLCommandBuffer>           cb,
+        id<MTLComputePipelineState>    pipeline,
+        const ds4_metal_mul_mm_id_args *mm_args,
+        id<MTLBuffer>                  src0,
+        NSUInteger                     src0_off,
+        id<MTLBuffer>                  src1,
+        NSUInteger                     src1_off,
+        id<MTLBuffer>                  dst,
+        NSUInteger                     dst_off);
 
 static ds4_metal_mul_mm_id_map_args ds4_metal_make_mul_mm_id_map_args(
         uint32_t src0_cols,
@@ -8325,9 +8351,14 @@ int ds4_metal_attention_output_q8_batch_tensor(
 
         const bool use_direct_low =
             n_tokens < 32u && getenv("DS4_METAL_DISABLE_ATTN_OUT_LOW_DIRECT") == NULL;
+        /* The tensor tile store is only used on full token tiles; partial tails use the legacy path. */
+        const bool use_mpp_low =
+            n_tokens >= 32u &&
+            (n_tokens % 32u) == 0 &&
+            ds4_metal_use_mpp_attn_out_low_matmul();
         const NSUInteger ids_bytes = (NSUInteger)n_tokens * (NSUInteger)n_groups * sizeof(int32_t);
         id<MTLBuffer> group_ids_buffer = nil;
-        if (!use_direct_low) {
+        if (!use_direct_low && !use_mpp_low) {
             if (getenv("DS4_METAL_DISABLE_ATTN_OUT_IDS_CACHE") != NULL) {
                 group_ids_buffer =
                     ds4_metal_new_transient_buffer(ids_bytes, "attention output group ids");
@@ -8397,7 +8428,73 @@ int ds4_metal_attention_output_q8_batch_tensor(
              * tokens.  This preserves the single-token generation path while
              * keeping prefill accumulation stable.
              */
-            if (n_tokens >= 32u && ds4_metal_mul_mm_id_map0_name(n_groups) != NULL) {
+            if (use_mpp_low) {
+                ds4_metal_mul_mm_id_args mm_args =
+                    ds4_metal_make_mul_mm_id_args((uint32_t)group_dim,
+                                                  (uint32_t)rank,
+                                                  n_groups,
+                                                  row_a_bytes,
+                                                  (uint64_t)rank * row_a_bytes,
+                                                  n_groups,
+                                                  n_groups,
+                                                  n_tokens);
+                id<MTLComputePipelineState> mm_pipeline =
+                    ds4_metal_get_mul_mm_id_pipeline("kernel_attn_out_low_q8_0_mpp_exp", false);
+                ok = ds4_metal_encode_attn_out_low_q8_mpp(cb,
+                                                          mm_pipeline,
+                                                          &mm_args,
+                                                          out_a_buf,
+                                                          (NSUInteger)out_a_inner,
+                                                          ds4_metal_tensor_buffer(heads),
+                                                          ds4_metal_tensor_offset(heads),
+                                                          ds4_metal_tensor_buffer(low),
+                                                          ds4_metal_tensor_offset(low)) != 0;
+                if (!ok) {
+                    ds4_metal_warn_mpp_experimental_fallback();
+                    if (ds4_metal_mul_mm_id_map0_name(n_groups) != NULL) {
+                        if (getenv("DS4_METAL_DISABLE_ATTN_OUT_IDS_CACHE") != NULL) {
+                            group_ids_buffer =
+                                ds4_metal_new_transient_buffer(ids_bytes, "attention output group ids");
+                        } else if (ds4_metal_ensure_scratch_buffer(&g_attn_out_group_ids_buffer,
+                                                                   &g_attn_out_group_ids_bytes,
+                                                                   ids_bytes,
+                                                                   "ds4_attention_output_group_ids")) {
+                            group_ids_buffer = g_attn_out_group_ids_buffer;
+                        }
+                        if (group_ids_buffer) {
+                            int32_t *ids = (int32_t *)[group_ids_buffer contents];
+                            for (uint32_t t = 0; t < n_tokens; t++) {
+                                for (uint32_t group = 0; group < n_groups; group++) {
+                                    ids[(uint64_t)t * n_groups + group] = (int32_t)group;
+                                }
+                            }
+                            ds4_metal_mul_mm_id_map_args map_args =
+                                ds4_metal_make_mul_mm_id_map_args((uint32_t)group_dim,
+                                                                  n_groups,
+                                                                  n_groups,
+                                                                  n_groups,
+                                                                  n_tokens);
+                            id<MTLComputePipelineState> map_pipeline =
+                                ds4_metal_get_pipeline(ds4_metal_mul_mm_id_map0_name(n_groups));
+                            id<MTLComputePipelineState> fallback_pipeline =
+                                ds4_metal_get_mul_mm_id_pipeline("kernel_mul_mm_id_q8_0_f32", false);
+                            ok = ds4_metal_encode_mul_mm_id(cb,
+                                                            map_pipeline,
+                                                            fallback_pipeline,
+                                                            &map_args,
+                                                            &mm_args,
+                                                            out_a_buf,
+                                                            (NSUInteger)out_a_inner,
+                                                            ds4_metal_tensor_buffer(heads),
+                                                            ds4_metal_tensor_offset(heads),
+                                                            ds4_metal_tensor_buffer(low),
+                                                            ds4_metal_tensor_offset(low),
+                                                            group_ids_buffer,
+                                                            0) != 0;
+                        }
+                    }
+                }
+            } else if (n_tokens >= 32u && ds4_metal_mul_mm_id_map0_name(n_groups) != NULL) {
                 ds4_metal_mul_mm_id_map_args map_args =
                     ds4_metal_make_mul_mm_id_map_args((uint32_t)group_dim,
                                                       n_groups,
@@ -12209,6 +12306,37 @@ static int ds4_metal_encode_mul_mm_id_mapped(
     [enc setBuffer:g_moe_id_map_buffer offset:tpe_bytes atIndex:4];
     [enc setBuffer:dst offset:dst_off atIndex:5];
     [enc setThreadgroupMemoryLength:8192u atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)mm_args->ne21 + 31u) / 32u,
+                                          ((NSUInteger)mm_args->ne0 + 63u) / 64u,
+                                          (NSUInteger)mm_args->ne02)
+         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    ds4_metal_end_compute_encoder(cb, enc);
+    return 1;
+}
+
+static int ds4_metal_encode_attn_out_low_q8_mpp(
+        id<MTLCommandBuffer>           cb,
+        id<MTLComputePipelineState>    pipeline,
+        const ds4_metal_mul_mm_id_args *mm_args,
+        id<MTLBuffer>                  src0,
+        NSUInteger                     src0_off,
+        id<MTLBuffer>                  src1,
+        NSUInteger                     src1_off,
+        id<MTLBuffer>                  dst,
+        NSUInteger                     dst_off) {
+    if (!cb || !pipeline || !mm_args || !src0 || !src1 || !dst ||
+        mm_args->ne00 <= 0 || mm_args->ne0 <= 0 ||
+        mm_args->ne02 <= 0 || mm_args->ne1 <= 0 || mm_args->ne21 <= 0) {
+        return 0;
+    }
+
+    id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:mm_args length:sizeof(*mm_args) atIndex:0];
+    [enc setBuffer:src0 offset:src0_off atIndex:1];
+    [enc setBuffer:src1 offset:src1_off atIndex:2];
+    [enc setBuffer:dst offset:dst_off atIndex:3];
+    [enc setThreadgroupMemoryLength:4096u atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)mm_args->ne21 + 31u) / 32u,
                                           ((NSUInteger)mm_args->ne0 + 63u) / 64u,
                                           (NSUInteger)mm_args->ne02)

@@ -12,6 +12,7 @@ MODEL=""
 OUT_DIR=""
 BUILD=1
 INCLUDE_F16=0
+INCLUDE_ATTN_OUT=0
 CHARS_PER_TOKEN=4
 
 usage() {
@@ -31,6 +32,7 @@ Options:
   --out DIR             Output directory for prompts, logs, and results.csv. Default: /tmp
   --no-build            Do not run make ds4 before benchmarking.
   --include-f16         Also run DS4_METAL_MPP_EXPERIMENTAL_F16=1. Known graph-test unsafe.
+  --include-attn-out    Also run DS4_METAL_MPP_ATTN_OUT_ENABLE=1.
   -h, --help            Show this help.
 EOF
 }
@@ -83,6 +85,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --include-f16)
             INCLUDE_F16=1
+            shift
+            ;;
+        --include-attn-out)
+            INCLUDE_ATTN_OUT=1
             shift
             ;;
         -h|--help)
@@ -152,6 +158,9 @@ run_one() {
         q8_mpp)
             if ! env DS4_METAL_MPP_ENABLE=1 "${cmd[@]}" >"$log" 2>&1; then status="fail"; fi
             ;;
+        q8_mpp_attn_out)
+            if ! env DS4_METAL_MPP_ENABLE=1 DS4_METAL_MPP_ATTN_OUT_ENABLE=1 "${cmd[@]}" >"$log" 2>&1; then status="fail"; fi
+            ;;
         f16_mpp_unsafe)
             if ! env DS4_METAL_MPP_EXPERIMENTAL_F16=1 "${cmd[@]}" >"$log" 2>&1; then status="fail"; fi
             ;;
@@ -183,6 +192,9 @@ for target in "${SIZE_LIST[@]}"; do
     for run in $(seq 1 "$REPEATS"); do
         run_one legacy "$target" "$run" "$prompt"
         run_one q8_mpp "$target" "$run" "$prompt"
+        if [[ "$INCLUDE_ATTN_OUT" -eq 1 ]]; then
+            run_one q8_mpp_attn_out "$target" "$run" "$prompt"
+        fi
         if [[ "$INCLUDE_F16" -eq 1 ]]; then
             run_one f16_mpp_unsafe "$target" "$run" "$prompt"
         fi

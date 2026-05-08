@@ -1727,6 +1727,87 @@ template [[host_name("kernel_mul_mm_id_q2_K_f16")]]    kernel mul_mm_id_f16_rhs 
 template [[host_name("kernel_mul_mm_id_q4_K_f16")]]    kernel mul_mm_id_f16_rhs kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K,    QK_NL, dequantize_q4_K,    half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_iq2_xxs_f16")]] kernel mul_mm_id_f16_rhs kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4>;
 
+#ifdef DS4_METAL_HAS_TENSOR
+kernel void kernel_attn_out_low_q8_0_mpp_exp(
+        constant ds4_metal_args_mul_mm_id & args,
+        device const char * srcA,
+        device const char * srcB,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    (void) sgitg;
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL  = NK/16;
+    constexpr int NUM_THREADS = 128;
+
+    const int K = args.ne00;
+    const int M = args.ne0;
+    const int N = args.ne21;
+    const int G = args.ne1;
+    const int group = tgpig.z;
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*NR1;
+
+    threadgroup half *sa = (threadgroup half *)shmem;
+    auto tA = tensor(sa, dextents<int32_t, 2>(NK, NR0));
+
+    device float *ptrB = (device float *)(srcB + args.nb11*group);
+    const int strideB = args.nb12/sizeof(float);
+    auto tB = tensor(ptrB, dextents<int32_t, 2>(K, N), array<int, 2>({1, strideB}));
+
+    matmul2d<
+        matmul2d_descriptor(NR1, NR0, NK, false, true, true,
+            matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+
+    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+        for (int work = tiitg; work < NR0*NL; work += NUM_THREADS) {
+            const int row = work/NL;
+            const int k_chunk = work%NL;
+            const int k_pos = loop_k + k_chunk*16;
+            const short k_base = k_chunk*16;
+
+            if (r0 + row < M) {
+                const int block_idx = k_pos/32;
+                const short il = (k_pos/16)%2;
+                device const block_q8_0 *row_ptr =
+                    (device const block_q8_0 *)(srcA + args.nb01*(r0 + row) + group*args.nb02);
+
+                half4x4 temp_a;
+                dequantize_q8_0(row_ptr + block_idx, il, temp_a);
+                FOR_UNROLL (short i = 0; i < 16; i++) {
+                    sa[row*NK + k_base + i] = (k_pos + i < K) ? temp_a[i/4][i%4] : (half)0;
+                }
+            } else {
+                FOR_UNROLL (short i = 0; i < 16; i++) {
+                    sa[row*NK + k_base + i] = (half)0;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto mA = tA.slice(0, 0);
+        auto mB = tB.slice(loop_k, r1);
+        mm.run(mB, mA, cT);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device float *dst_group = (device float *)dst + group*M;
+    auto tD = tensor(dst_group, dextents<int32_t, 2>(M, N), array<int, 2>({1, G*M}));
+    auto mD = tD.slice(r0, r1);
+    cT.store(mD);
+}
+#endif
+
 #undef QK_NL
 #undef kmask_iq2xs
 #undef ksigns_iq2xs
