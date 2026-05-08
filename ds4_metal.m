@@ -729,6 +729,10 @@ enum {
     DS4_METAL_MOE_MPP_GATE = 1 << 0,
     DS4_METAL_MOE_MPP_UP   = 1 << 1,
     DS4_METAL_MOE_MPP_DOWN = 1 << 2,
+
+    DS4_METAL_MOE_MPP_DEFAULT_GATE_LAYER = 13,
+    DS4_METAL_MOE_MPP_DEFAULT_UP_LAYER   = 13,
+    DS4_METAL_MOE_MPP_DEFAULT_DOWN_LAYER = 2,
 };
 
 static int ds4_metal_mpp_routed_moe_default_target(void) {
@@ -831,12 +835,17 @@ static int ds4_metal_mpp_routed_moe_mask_for_layer(uint32_t layer_index) {
     if (ds4_metal_mpp_routed_moe_default_policy()) {
         static int initialized;
         if (!initialized) {
-            fprintf(stderr, "ds4: Metal MPP routed MoE default ranges down=2..end gate/up=27..end\n");
+            fprintf(stderr,
+                    "ds4: Metal MPP routed MoE default ranges down=%d..end up=%d..end gate=%d..end\n",
+                    DS4_METAL_MOE_MPP_DEFAULT_DOWN_LAYER,
+                    DS4_METAL_MOE_MPP_DEFAULT_UP_LAYER,
+                    DS4_METAL_MOE_MPP_DEFAULT_GATE_LAYER);
             initialized = 1;
         }
         int mask = 0;
-        if (layer_index >= 2u)  mask |= DS4_METAL_MOE_MPP_DOWN;
-        if (layer_index >= 27u) mask |= DS4_METAL_MOE_MPP_GATE | DS4_METAL_MOE_MPP_UP;
+        if (layer_index >= DS4_METAL_MOE_MPP_DEFAULT_DOWN_LAYER) mask |= DS4_METAL_MOE_MPP_DOWN;
+        if (layer_index >= DS4_METAL_MOE_MPP_DEFAULT_UP_LAYER)   mask |= DS4_METAL_MOE_MPP_UP;
+        if (layer_index >= DS4_METAL_MOE_MPP_DEFAULT_GATE_LAYER) mask |= DS4_METAL_MOE_MPP_GATE;
         return mask & requested_mask;
     }
 

@@ -141,11 +141,11 @@ The F16 prefill MPP variant remains available for low-level investigation via
 should not be used for quality comparisons.
 
 The routed-MoE projections also use MPP by default on M5-class Metal 4 tensor
-targets for staged prefill layers: the down projection starts at layer 2, while
-gate/up start at layer 27. This constrained route has passed the long-context
-and official logprob-vector regressions. Starting down at layer 1, or
-gate/up/down together at layer 26, fails the long-context regression, so the
-boundaries are intentionally conservative. The full-layer routed-MoE MPP
+targets for staged prefill layers: the down projection starts at layer 2, the
+gate and up projections start at layer 13. This constrained route has passed
+the long-context and official logprob-vector regressions. Starting down at
+layer 1, or gate/up together at layer 12, fails the long-context regression,
+so the boundaries are intentionally conservative. The full-layer routed-MoE MPP
 experiment remains available via `DS4_METAL_MPP_EXPERIMENTAL_MOE=1`; it is
 useful for profiling but currently fails the long-context graph test and should
 not be used for quality comparisons. Use
