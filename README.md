@@ -139,6 +139,17 @@ The F16 prefill MPP variant remains available for low-level investigation via
 `DS4_METAL_MPP_EXPERIMENTAL_F16=1`, but it currently fails graph-level tests and
 should not be used for quality comparisons.
 
+For repeatable measurements, run the benchmark harness:
+
+```
+make bench-mpp BENCH_ARGS="--sizes 512,2048,4096,8192 --repeats 3"
+```
+
+The harness synthesizes prompt files from `README.md`, runs default Metal and
+`DS4_METAL_MPP_EXPERIMENTAL=1`, records logs and `results.csv` under `/tmp`, and
+prints a prefill throughput summary grouped by encoded input tokens when the CLI
+emits progress, or by the requested prompt size for very short prompts.
+
 The practical implementation plan is:
 
 1. Keep the existing kernels as the correctness path.
