@@ -127,13 +127,17 @@ tensor matmul probe before it lets the main Metal shader source see
 `DS4_METAL_HAS_TENSOR`, so unsupported SDK/device combinations fall back to the
 legacy kernels.
 
-There is also an opt-in experimental F16 prefill route for speed testing:
+There is also an opt-in experimental Q8_0 prefill route for speed testing:
 `DS4_METAL_MPP_EXPERIMENTAL=1 ./ds4 --prompt-file README.md`. It only affects
 prompt batches larger than eight tokens, falls back to the legacy kernel if the
 Metal 4 tensor path is unavailable, and is covered by the isolated
-`./ds4_test --metal-kernels` numeric regression. This is a benchmark path, not
-a production-quality path yet; long-context continuation still needs promotion
-work before it can replace the legacy kernel by default.
+`./ds4_test --metal-kernels` numeric regression. It has also passed the
+long-context and official logprob-vector regressions on M5, but remains opt-in
+until broader benchmarking promotes it.
+
+The F16 prefill MPP variant remains available for low-level investigation via
+`DS4_METAL_MPP_EXPERIMENTAL_F16=1`, but it currently fails graph-level tests and
+should not be used for quality comparisons.
 
 The practical implementation plan is:
 

@@ -661,13 +661,27 @@ static int ds4_metal_use_compressor_pair_nr4(void) {
     return enabled;
 }
 
-static int ds4_metal_use_mpp_experimental_matmul(void) {
+static int ds4_metal_use_mpp_experimental_f16_matmul(void) {
     static int initialized;
     static int enabled;
     if (!initialized) {
-        enabled = getenv("DS4_METAL_MPP_EXPERIMENTAL") != NULL;
+        enabled = getenv("DS4_METAL_MPP_EXPERIMENTAL_F16") != NULL;
         if (enabled) {
-            fprintf(stderr, "ds4: experimental Metal MPP F16 matmul enabled for benchmarking; output quality is not yet promotion-safe\n");
+            fprintf(stderr, "ds4: experimental Metal MPP F16 prefill matmul enabled for benchmarking; this path is known to fail graph-level tests\n");
+        }
+        initialized = 1;
+    }
+    return enabled;
+}
+
+static int ds4_metal_use_mpp_experimental_q8_0_matmul(void) {
+    static int initialized;
+    static int enabled;
+    if (!initialized) {
+        enabled = getenv("DS4_METAL_MPP_EXPERIMENTAL") != NULL ||
+                  getenv("DS4_METAL_MPP_EXPERIMENTAL_Q8_0") != NULL;
+        if (enabled) {
+            fprintf(stderr, "ds4: experimental Metal MPP Q8_0 prefill matmul enabled for benchmarking\n");
         }
         initialized = 1;
     }
@@ -677,7 +691,7 @@ static int ds4_metal_use_mpp_experimental_matmul(void) {
 static void ds4_metal_warn_mpp_experimental_fallback(void) {
     static int warned;
     if (!warned) {
-        fprintf(stderr, "ds4: experimental Metal MPP F16 matmul requested but unavailable; falling back to legacy kernel\n");
+        fprintf(stderr, "ds4: experimental Metal MPP prefill matmul requested but unavailable; falling back to legacy kernel\n");
         warned = 1;
     }
 }
@@ -5057,6 +5071,14 @@ int ds4_metal_matmul_q8_0_tensor(
         return 0;
     }
 
+    if (n_tok > 8 && ds4_metal_use_mpp_experimental_q8_0_matmul()) {
+        if (ds4_metal_matmul_q8_0_mpp_experimental_tensor(out, model_map, model_size, weight_offset,
+                                                          in_dim, out_dim, x, n_tok)) {
+            return 1;
+        }
+        ds4_metal_warn_mpp_experimental_fallback();
+    }
+
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_metal_tensor_buffer(x);
         id<MTLBuffer> outbuf = ds4_metal_tensor_buffer(out);
@@ -5176,6 +5198,77 @@ int ds4_metal_matmul_q8_0_tensor(
     return 1;
 }
 
+int ds4_metal_matmul_q8_0_mpp_experimental_tensor(
+        ds4_metal_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_metal_tensor *x,
+        uint64_t                n_tok) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!g_metal4_tensor_api_enabled) return 0;
+    if ((in_dim & 31u) != 0 || n_tok <= 8 ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_metal_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_metal_tensor_buffer(out);
+        const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+        const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
+        if (!xbuf || !outbuf ||
+            ds4_metal_tensor_bytes(x) < x_bytes ||
+            ds4_metal_tensor_bytes(out) < out_bytes) {
+            fprintf(stderr, "ds4: experimental Metal MPP Q8_0 matmul received undersized activation buffers\n");
+            return 0;
+        }
+
+        const uint64_t blocks = in_dim / 32;
+        const uint64_t row_bytes = blocks * 34;
+        const uint64_t weight_bytes = out_dim * row_bytes;
+        if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+            fprintf(stderr, "ds4: experimental Metal MPP Q8_0 matmul range is outside the mapped model\n");
+            return 0;
+        }
+
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_metal_wrap_model_range(model_map, model_size, weight_offset, weight_bytes, &inner_offset);
+        if (!wbuf) return 0;
+
+        const bool bc_inp = (in_dim % 32u) != 0;
+        const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
+        id<MTLComputePipelineState> pipeline =
+            ds4_metal_get_mul_mm_pipeline("kernel_mul_mm_q8_0_f32_mpp_exp", bc_inp, bc_out);
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+
+        ds4_metal_mul_mm_args args = ds4_metal_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_metal_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_metal_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:4096u atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
+                                              ((NSUInteger)out_dim + 63u) / 64u,
+                                              1)
+             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        if (!ds4_metal_finish_command_buffer(cb, owned, "experimental Metal MPP Q8_0 matmul")) return 0;
+    }
+
+    return 1;
+}
+
 int ds4_metal_shared_gate_up_swiglu_q8_0_tensor(
         ds4_metal_tensor       *gate,
         ds4_metal_tensor       *up,
@@ -5276,7 +5369,7 @@ int ds4_metal_matmul_f16_tensor(
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
 
-    if (n_tok > 8 && ds4_metal_use_mpp_experimental_matmul()) {
+    if (n_tok > 8 && ds4_metal_use_mpp_experimental_f16_matmul()) {
         if (ds4_metal_matmul_f16_mpp_experimental_tensor(out, model_map, model_size, weight_offset,
                                                          in_dim, out_dim, x, n_tok)) {
             return 1;

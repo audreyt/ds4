@@ -1006,6 +1006,7 @@ kernel void kernel_mul_mm_mpp_exp(
 typedef decltype(kernel_mul_mm_mpp_exp<half, half4x4, float4x4, 1, dequantize_f32, float, float4x4, float>) mul_mm_mpp_exp_t;
 
 template [[host_name("kernel_mul_mm_f16_f32_mpp_exp")]] kernel mul_mm_mpp_exp_t kernel_mul_mm_mpp_exp<half, half4x4, half4x4, 1, dequantize_f16, half, half4x4, float>;
+template [[host_name("kernel_mul_mm_q8_0_f32_mpp_exp")]] kernel mul_mm_mpp_exp_t kernel_mul_mm_mpp_exp<half, half4x4, block_q8_0, 2, dequantize_q8_0, float, float4x4, float>;
 #endif
 
 // Tiled matrix-matrix kernel used for prompt batches larger than 8. DS4 uses
