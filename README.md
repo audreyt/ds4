@@ -127,13 +127,14 @@ tensor matmul probe before it lets the main Metal shader source see
 `DS4_METAL_HAS_TENSOR`, so unsupported SDK/device combinations fall back to the
 legacy kernels.
 
-There is also an opt-in experimental Q8_0 prefill route for speed testing:
-`DS4_METAL_MPP_EXPERIMENTAL=1 ./ds4 --prompt-file README.md`. It only affects
-prompt batches larger than eight tokens, falls back to the legacy kernel if the
-Metal 4 tensor path is unavailable, and is covered by the isolated
+The Q8_0 prefill MPP route is enabled automatically on M5/M6/A19/A20-class
+Metal 4 tensor targets and can be forced with
+`DS4_METAL_MPP_ENABLE=1 ./ds4 --prompt-file README.md`. It only affects prompt
+batches larger than eight tokens, falls back to the legacy kernel if the Metal 4
+tensor path is unavailable, and is covered by the isolated
 `./ds4_test --metal-kernels` numeric regression. It has also passed the
-long-context and official logprob-vector regressions on M5, but remains opt-in
-until broader benchmarking promotes it.
+long-context and official logprob-vector regressions on M5. Set
+`DS4_METAL_MPP_DISABLE=1` to compare or temporarily disable the MPP route.
 
 The F16 prefill MPP variant remains available for low-level investigation via
 `DS4_METAL_MPP_EXPERIMENTAL_F16=1`, but it currently fails graph-level tests and
@@ -145,10 +146,11 @@ For repeatable measurements, run the benchmark harness:
 make bench-mpp BENCH_ARGS="--sizes 512,2048,4096,8192 --repeats 3"
 ```
 
-The harness synthesizes prompt files from `README.md`, runs default Metal and
-`DS4_METAL_MPP_EXPERIMENTAL=1`, records logs and `results.csv` under `/tmp`, and
-prints a prefill throughput summary grouped by encoded input tokens when the CLI
-emits progress, or by the requested prompt size for very short prompts.
+The harness synthesizes prompt files from `README.md`, runs legacy Metal
+(`DS4_METAL_MPP_DISABLE=1`) and forced Q8_0 MPP (`DS4_METAL_MPP_ENABLE=1`),
+records logs and `results.csv` under `/tmp`, and prints a prefill throughput
+summary grouped by encoded input tokens when the CLI emits progress, or by the
+requested prompt size for very short prompts.
 
 The practical implementation plan is:
 

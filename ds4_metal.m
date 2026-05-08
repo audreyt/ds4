@@ -661,6 +661,8 @@ static int ds4_metal_use_compressor_pair_nr4(void) {
     return enabled;
 }
 
+static int ds4_metal_device_name_contains(const char *needle);
+
 static int ds4_metal_use_mpp_experimental_f16_matmul(void) {
     static int initialized;
     static int enabled;
@@ -674,14 +676,35 @@ static int ds4_metal_use_mpp_experimental_f16_matmul(void) {
     return enabled;
 }
 
-static int ds4_metal_use_mpp_experimental_q8_0_matmul(void) {
+static int ds4_metal_mpp_q8_0_default_target(void) {
+    return ds4_metal_device_name_contains("M5") ||
+           ds4_metal_device_name_contains("M6") ||
+           ds4_metal_device_name_contains("A19") ||
+           ds4_metal_device_name_contains("A20");
+}
+
+static int ds4_metal_mpp_q8_0_policy_enabled(void) {
+    if (!g_metal4_tensor_api_enabled) return 0;
+    if (getenv("DS4_METAL_MPP_DISABLE") != NULL) return 0;
+    if (getenv("DS4_METAL_MPP_ENABLE") != NULL ||
+        getenv("DS4_METAL_MPP_EXPERIMENTAL") != NULL ||
+        getenv("DS4_METAL_MPP_EXPERIMENTAL_Q8_0") != NULL) {
+        return 1;
+    }
+    return ds4_metal_mpp_q8_0_default_target();
+}
+
+static int ds4_metal_use_mpp_q8_0_matmul(void) {
     static int initialized;
     static int enabled;
     if (!initialized) {
-        enabled = getenv("DS4_METAL_MPP_EXPERIMENTAL") != NULL ||
-                  getenv("DS4_METAL_MPP_EXPERIMENTAL_Q8_0") != NULL;
+        enabled = ds4_metal_mpp_q8_0_policy_enabled();
         if (enabled) {
-            fprintf(stderr, "ds4: experimental Metal MPP Q8_0 prefill matmul enabled for benchmarking\n");
+            const int forced = getenv("DS4_METAL_MPP_ENABLE") != NULL ||
+                               getenv("DS4_METAL_MPP_EXPERIMENTAL") != NULL ||
+                               getenv("DS4_METAL_MPP_EXPERIMENTAL_Q8_0") != NULL;
+            fprintf(stderr, "ds4: Metal MPP Q8_0 prefill matmul enabled%s\n",
+                    forced ? " by environment" : " by default");
         }
         initialized = 1;
     }
@@ -1254,6 +1277,10 @@ void ds4_metal_print_memory_report(const char *label) {
             g_metal4_tensor_api_enabled ? "enabled" :
                 (g_metal4_tensor_api_compile_supported ? "available" : "disabled"),
             g_metal4_m5_neural_accelerators_hint ? "likely" : "not detected");
+    fprintf(stderr,
+            "ds4:   MPP Q8_0 prefill %s%s\n",
+            ds4_metal_mpp_q8_0_policy_enabled() ? "enabled" : "disabled",
+            getenv("DS4_METAL_MPP_DISABLE") != NULL ? " (disabled by DS4_METAL_MPP_DISABLE)" : "");
     fprintf(stderr,
             "ds4:   scratch %.2f MiB (flash mask %.2f, pad %.2f, tmp %.2f, blk %.2f, ring %.2f, kv %.2f, compressor %.2f, router %.2f, indexer %.2f, moe %.2f, f16 %.2f, raw-store %.2f)\n",
             ds4_metal_mib(scratch),
@@ -5071,7 +5098,7 @@ int ds4_metal_matmul_q8_0_tensor(
         return 0;
     }
 
-    if (n_tok > 8 && ds4_metal_use_mpp_experimental_q8_0_matmul()) {
+    if (n_tok > 8 && ds4_metal_use_mpp_q8_0_matmul()) {
         if (ds4_metal_matmul_q8_0_mpp_experimental_tensor(out, model_map, model_size, weight_offset,
                                                           in_dim, out_dim, x, n_tok)) {
             return 1;

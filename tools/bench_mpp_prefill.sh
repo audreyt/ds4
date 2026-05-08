@@ -18,8 +18,8 @@ usage() {
     cat <<'EOF'
 Usage: tools/bench_mpp_prefill.sh [options]
 
-Runs repeatable ds4 prefill benchmarks for default Metal and experimental
-Metal 4 / MPP Q8_0 prefill.
+Runs repeatable ds4 prefill benchmarks for legacy Metal and Metal 4 / MPP Q8_0
+prefill.
 
 Options:
   --prompt-source FILE   Source text used to synthesize prompts. Default: README.md
@@ -146,11 +146,11 @@ run_one() {
     fi
 
     case "$variant" in
-        default)
-            if ! "${cmd[@]}" >"$log" 2>&1; then status="fail"; fi
+        legacy)
+            if ! env DS4_METAL_MPP_DISABLE=1 "${cmd[@]}" >"$log" 2>&1; then status="fail"; fi
             ;;
         q8_mpp)
-            if ! env DS4_METAL_MPP_EXPERIMENTAL=1 "${cmd[@]}" >"$log" 2>&1; then status="fail"; fi
+            if ! env DS4_METAL_MPP_ENABLE=1 "${cmd[@]}" >"$log" 2>&1; then status="fail"; fi
             ;;
         f16_mpp_unsafe)
             if ! env DS4_METAL_MPP_EXPERIMENTAL_F16=1 "${cmd[@]}" >"$log" 2>&1; then status="fail"; fi
@@ -181,7 +181,7 @@ for target in "${SIZE_LIST[@]}"; do
     prompt="$OUT_DIR/prompt_target${target}.txt"
     make_prompt "$target" "$prompt"
     for run in $(seq 1 "$REPEATS"); do
-        run_one default "$target" "$run" "$prompt"
+        run_one legacy "$target" "$run" "$prompt"
         run_one q8_mpp "$target" "$run" "$prompt"
         if [[ "$INCLUDE_F16" -eq 1 ]]; then
             run_one f16_mpp_unsafe "$target" "$run" "$prompt"
