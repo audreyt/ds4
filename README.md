@@ -140,16 +140,15 @@ The F16 prefill MPP variant remains available for low-level investigation via
 `DS4_METAL_MPP_EXPERIMENTAL_F16=1`, but it currently fails graph-level tests and
 should not be used for quality comparisons.
 
-The routed-MoE gate/up/down projections also use MPP by default on M5-class
-Metal 4 tensor targets for late prefill layers, starting at layer 27. This
-constrained route has passed the long-context and official logprob-vector
-regressions while lifting a 2k-token README prefill sample from roughly
-393 tok/s to 437 tok/s in a profiled run on M5. Starting the same route at
-layer 26 fails the long-context regression, so the boundary is intentionally
-conservative. The full-layer routed-MoE MPP experiment remains available via
-`DS4_METAL_MPP_EXPERIMENTAL_MOE=1`; it is useful for profiling but currently
-fails the long-context graph test and should not be used for quality
-comparisons. Use
+The routed-MoE projections also use MPP by default on M5-class Metal 4 tensor
+targets for staged prefill layers: the down projection starts at layer 2, while
+gate/up start at layer 27. This constrained route has passed the long-context
+and official logprob-vector regressions. Starting down at layer 1, or
+gate/up/down together at layer 26, fails the long-context regression, so the
+boundaries are intentionally conservative. The full-layer routed-MoE MPP
+experiment remains available via `DS4_METAL_MPP_EXPERIMENTAL_MOE=1`; it is
+useful for profiling but currently fails the long-context graph test and should
+not be used for quality comparisons. Use
 `DS4_METAL_MPP_EXPERIMENTAL_MOE_STAGES=gate,up,down` plus
 `DS4_METAL_MPP_EXPERIMENTAL_MOE_LAYER_MIN` and
 `DS4_METAL_MPP_EXPERIMENTAL_MOE_LAYER_MAX` to isolate projections or layer

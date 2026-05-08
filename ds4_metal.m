@@ -753,7 +753,6 @@ static int ds4_metal_mpp_routed_moe_stage_mask(void) {
     static int mask;
     if (!initialized) {
         const int forced = ds4_metal_mpp_routed_moe_forced();
-        const int default_policy = ds4_metal_mpp_routed_moe_default_policy();
         if (forced) {
             const char *stages = getenv("DS4_METAL_MPP_EXPERIMENTAL_MOE_STAGES");
             if (!stages || !stages[0] || strstr(stages, "all") != NULL) {
@@ -763,7 +762,7 @@ static int ds4_metal_mpp_routed_moe_stage_mask(void) {
                 if (strstr(stages, "up") != NULL)   mask |= DS4_METAL_MOE_MPP_UP;
                 if (strstr(stages, "down") != NULL) mask |= DS4_METAL_MOE_MPP_DOWN;
             }
-        } else if (default_policy) {
+        } else if (ds4_metal_mpp_routed_moe_default_policy()) {
             mask = DS4_METAL_MOE_MPP_GATE | DS4_METAL_MOE_MPP_UP | DS4_METAL_MOE_MPP_DOWN;
         }
         if (mask && forced) {
@@ -773,7 +772,7 @@ static int ds4_metal_mpp_routed_moe_stage_mask(void) {
                     (mask & DS4_METAL_MOE_MPP_UP) ? ((mask & DS4_METAL_MOE_MPP_GATE) ? ",up" : "up") : "",
                     (mask & DS4_METAL_MOE_MPP_DOWN) ? ((mask & (DS4_METAL_MOE_MPP_GATE | DS4_METAL_MOE_MPP_UP)) ? ",down" : "down") : "");
         } else if (mask) {
-            fprintf(stderr, "ds4: Metal MPP routed MoE projections enabled by default for late prefill layers\n");
+            fprintf(stderr, "ds4: Metal MPP routed MoE projections enabled by default for staged prefill layers\n");
         }
         initialized = 1;
     }
@@ -819,6 +818,29 @@ static int ds4_metal_mpp_routed_moe_layer_allowed(uint32_t layer_index) {
         initialized = 1;
     }
     return layer_index >= min_layer && layer_index <= max_layer;
+}
+
+static int ds4_metal_mpp_routed_moe_mask_for_layer(uint32_t layer_index) {
+    const int requested_mask = ds4_metal_mpp_routed_moe_stage_mask();
+    if (!requested_mask) return 0;
+
+    if (ds4_metal_mpp_routed_moe_forced()) {
+        return ds4_metal_mpp_routed_moe_layer_allowed(layer_index) ? requested_mask : 0;
+    }
+
+    if (ds4_metal_mpp_routed_moe_default_policy()) {
+        static int initialized;
+        if (!initialized) {
+            fprintf(stderr, "ds4: Metal MPP routed MoE default ranges down=2..end gate/up=27..end\n");
+            initialized = 1;
+        }
+        int mask = 0;
+        if (layer_index >= 2u)  mask |= DS4_METAL_MOE_MPP_DOWN;
+        if (layer_index >= 27u) mask |= DS4_METAL_MOE_MPP_GATE | DS4_METAL_MOE_MPP_UP;
+        return mask & requested_mask;
+    }
+
+    return 0;
 }
 
 static void ds4_metal_warn_mpp_experimental_fallback(void) {
@@ -13690,9 +13712,7 @@ int ds4_metal_routed_moe_batch_tensor(
         ds4_metal_mul_mm_id_args gate_mm_args = { 0 };
         ds4_metal_mul_mm_id_args down_mm_args = { 0 };
         id<MTLComputePipelineState> map_pipeline = nil;
-        const int requested_mpp_mask = ds4_metal_mpp_routed_moe_stage_mask();
-        const int moe_mpp_mask =
-            ds4_metal_mpp_routed_moe_layer_allowed(layer_index) ? requested_mpp_mask : 0;
+        const int moe_mpp_mask = ds4_metal_mpp_routed_moe_mask_for_layer(layer_index);
         /*
          * The grouped routed-MoE matmul loads activation tiles as half before
          * using SIMD-group MMA.  Store the SwiGLU/route-weight intermediate in
