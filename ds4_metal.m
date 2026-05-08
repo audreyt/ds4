@@ -1524,7 +1524,6 @@ static NSString *ds4_metal_full_source(void) {
     NSArray<NSArray<NSString *> *> *required_sources = @[
         @[@"DS4_METAL_FLASH_ATTN_SOURCE", @"metal/flash_attn.metal"],
         @[@"DS4_METAL_DENSE_SOURCE",      @"metal/dense.metal"],
-        @[@"DS4_METAL_INT8_SOURCE",       @"metal/int8.metal"],
         @[@"DS4_METAL_MOE_SOURCE",        @"metal/moe.metal"],
         @[@"DS4_METAL_DSV4_HC_SOURCE",    @"metal/dsv4_hc.metal"],
         @[@"DS4_METAL_UNARY_SOURCE",      @"metal/unary.metal"],
@@ -5467,63 +5466,6 @@ int ds4_metal_matmul_q8_0_mpp_experimental_tensor(
         ds4_metal_end_compute_encoder(cb, enc);
 
         if (!ds4_metal_finish_command_buffer(cb, owned, "experimental Metal MPP Q8_0 matmul")) return 0;
-    }
-
-    return 1;
-}
-
-int ds4_metal_int8_matmul_i32_mpp_probe_tensor(
-        ds4_metal_tensor       *out,
-        const ds4_metal_tensor *a,
-        const ds4_metal_tensor *b,
-        uint32_t                m,
-        uint32_t                n,
-        uint32_t                k) {
-    if (!g_initialized && !ds4_metal_init()) return 0;
-    if (!g_metal4_tensor_api_enabled) return 0;
-    if (!out || !a || !b || m == 0 || n == 0 || k == 0 ||
-        (m % 32u) != 0 || (n % 128u) != 0 || (k % 32u) != 0) {
-        return 0;
-    }
-
-    @autoreleasepool {
-        id<MTLBuffer> abuf = ds4_metal_tensor_buffer(a);
-        id<MTLBuffer> bbuf = ds4_metal_tensor_buffer(b);
-        id<MTLBuffer> outbuf = ds4_metal_tensor_buffer(out);
-        const uint64_t a_bytes = (uint64_t)m * k;
-        const uint64_t b_bytes = (uint64_t)n * k;
-        const uint64_t out_bytes = (uint64_t)m * n * sizeof(int32_t);
-        if (!abuf || !bbuf || !outbuf ||
-            ds4_metal_tensor_bytes(a) < a_bytes ||
-            ds4_metal_tensor_bytes(b) < b_bytes ||
-            ds4_metal_tensor_bytes(out) < out_bytes) {
-            fprintf(stderr, "ds4: Metal INT8 MPP probe received undersized buffers\n");
-            return 0;
-        }
-
-        id<MTLComputePipelineState> pipeline =
-            ds4_metal_get_pipeline("kernel_int8_matmul_i32_mpp_probe");
-        if (!pipeline) return 0;
-
-        int owned = 0;
-        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
-        if (!cb) return 0;
-
-        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
-        [enc setComputePipelineState:pipeline];
-        [enc setBuffer:abuf offset:ds4_metal_tensor_offset(a) atIndex:0];
-        [enc setBuffer:bbuf offset:ds4_metal_tensor_offset(b) atIndex:1];
-        [enc setBuffer:outbuf offset:ds4_metal_tensor_offset(out) atIndex:2];
-        [enc setBytes:&m length:sizeof(m) atIndex:3];
-        [enc setBytes:&n length:sizeof(n) atIndex:4];
-        [enc setBytes:&k length:sizeof(k) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + 127u) / 128u,
-                                              ((NSUInteger)m + 31u) / 32u,
-                                              1)
-             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        ds4_metal_end_compute_encoder(cb, enc);
-
-        if (!ds4_metal_finish_command_buffer(cb, owned, "Metal INT8 MPP probe")) return 0;
     }
 
     return 1;

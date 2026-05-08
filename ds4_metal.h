@@ -145,14 +145,6 @@ int ds4_metal_matmul_q8_0_mpp_experimental_tensor(
         const ds4_metal_tensor *x,
         uint64_t                n_tok);
 
-int ds4_metal_int8_matmul_i32_mpp_probe_tensor(
-        ds4_metal_tensor       *out,
-        const ds4_metal_tensor *a,
-        const ds4_metal_tensor *b,
-        uint32_t                m,
-        uint32_t                n,
-        uint32_t                k);
-
 int ds4_metal_shared_gate_up_swiglu_q8_0_tensor(
         ds4_metal_tensor       *gate,
         ds4_metal_tensor       *up,
