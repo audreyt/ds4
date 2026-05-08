@@ -47,6 +47,7 @@ static id<MTLComputePipelineState> g_cpy_f32_f16_pipeline;
 static id<MTLComputePipelineState> g_cpy_f16_f32_pipeline;
 static id<MTLComputePipelineState> g_swiglu_pipeline;
 static id<MTLComputePipelineState> g_add_pipeline;
+static id<MTLComputePipelineState> g_moe_sum6_pipeline;
 static id<MTLComputePipelineState> g_mul_pipeline;
 static id<MTLComputePipelineState> g_rms_norm_pipeline;
 static id<MTLComputePipelineState> g_rms_norm_plain_pipeline;
@@ -2983,6 +2984,13 @@ typedef struct {
     float    clamp_value;
 } ds4_metal_dsv4_moe_swiglu_weight_args;
 
+typedef struct {
+    uint32_t width;
+    uint32_t tokens;
+    uint64_t src_token_stride;
+    uint64_t dst_token_stride;
+} ds4_metal_dsv4_moe_sum6_args;
+
 /* Compile the single in-repo Metal source and create the pipelines that every
  * session uses. Shape-dependent kernels with function constants are built
  * lazily by the small ds4_metal_get_* caches, so startup stays predictable
@@ -3253,6 +3261,23 @@ int ds4_metal_init(void) {
         g_swiglu_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
         if (!g_swiglu_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_swiglu_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        fn = [library newFunctionWithName:@"kernel_dsv4_moe_sum6_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_moe_sum6_f32 function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        g_moe_sum6_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_moe_sum6_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_moe_sum6_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -4296,6 +4321,7 @@ void ds4_metal_cleanup(void) {
         g_cpy_f16_f32_pipeline = nil;
         g_swiglu_pipeline = nil;
         g_add_pipeline = nil;
+        g_moe_sum6_pipeline = nil;
         g_mul_pipeline = nil;
         g_bin_mul_scalar_pipeline = nil;
         g_bin_div_row_pipeline = nil;
@@ -12604,6 +12630,42 @@ static int ds4_metal_encode_moe_swiglu_weight(
     return 1;
 }
 
+static int ds4_metal_encode_moe_sum6(
+        id<MTLCommandBuffer> cb,
+        id<MTLBuffer>        experts,
+        NSUInteger           experts_off,
+        id<MTLBuffer>        out,
+        NSUInteger           out_off,
+        uint32_t             out_dim,
+        uint32_t             n_tokens) {
+    if (!cb || !experts || !out || out_dim == 0 || n_tokens == 0) return 0;
+
+    if (!g_moe_sum6_pipeline) return 0;
+
+    const uint64_t out_row_bytes = (uint64_t)out_dim * sizeof(float);
+    ds4_metal_dsv4_moe_sum6_args args = {
+        .width = out_dim,
+        .tokens = n_tokens,
+        .src_token_stride = 6u * out_row_bytes,
+        .dst_token_stride = out_row_bytes,
+    };
+
+    NSUInteger nth = g_moe_sum6_pipeline.maxTotalThreadsPerThreadgroup;
+    if (nth > 256u) nth = 256u;
+    if (nth > out_dim) nth = out_dim;
+    if (nth == 0) nth = 1u;
+
+    id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+    [enc setComputePipelineState:g_moe_sum6_pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:experts offset:experts_off atIndex:1];
+    [enc setBuffer:out     offset:out_off     atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+    ds4_metal_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 static ds4_metal_bin_args ds4_metal_make_moe_add_args(
         uint32_t out_dim,
         uint32_t n_tokens,
@@ -12653,6 +12715,18 @@ static int ds4_metal_encode_moe_sum_experts(
 
     const uint64_t out_row_bytes = (uint64_t)out_dim * sizeof(float);
     const uint64_t expert_token_stride = (uint64_t)n_expert * out_row_bytes;
+
+    if (n_expert == 6 &&
+        getenv("DS4_METAL_MOE_SUM6_DISABLE") == NULL &&
+        ds4_metal_encode_moe_sum6(cb,
+                                  experts,
+                                  experts_off,
+                                  out,
+                                  out_off,
+                                  out_dim,
+                                  n_tokens)) {
+        return 1;
+    }
 
     ds4_metal_bin_args first =
         ds4_metal_make_moe_add_args(out_dim, n_tokens, expert_token_stride, expert_token_stride, out_row_bytes);

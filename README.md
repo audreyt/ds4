@@ -154,6 +154,11 @@ not be used for quality comparisons. Use
 `DS4_METAL_MPP_EXPERIMENTAL_MOE_LAYER_MAX` to isolate projections or layer
 ranges while investigating numerical drift.
 
+For the common six-routed-expert prefill shape, the down-projection expert
+outputs are summed with a single Metal kernel instead of five chained add
+passes. Set `DS4_METAL_MOE_SUM6_DISABLE=1` to compare or temporarily disable
+that fused sum route.
+
 The attention-output low-projection also uses MPP by default on Metal 4 tensor
 targets for full 32-token tiles, falling back to the existing indexed simdgroup
 kernel for partial tiles. Set `DS4_METAL_MPP_ATTN_OUT_DISABLE=1` to isolate or

@@ -123,6 +123,13 @@ struct ds4_metal_dsv4_moe_swiglu_weight_args {
     float clamp_value;
 };
 
+struct ds4_metal_dsv4_moe_sum6_args {
+    uint32_t width;
+    uint32_t tokens;
+    uint64_t src_token_stride;
+    uint64_t dst_token_stride;
+};
+
 // Routed-MoE activation for the selected experts:
 // clamp(gate), clamp(up), silu(gate) * up * route_weight.  Normal inference
 // does not consume gate/up after this point, so the fast path avoids writing the
@@ -197,6 +204,31 @@ kernel void kernel_dsv4_moe_swiglu_weight_f16(
         }
         const float silu = g / (1.0f + exp(-g));
         mid_row[i] = (half)(silu * u * route_weight);
+    }
+}
+
+kernel void kernel_dsv4_moe_sum6_f32(
+        constant ds4_metal_dsv4_moe_sum6_args &args,
+        device const char *src,
+        device       char *dst,
+        uint token[[threadgroup_position_in_grid]],
+        uint tid[[thread_position_in_threadgroup]],
+        uint ntg[[threads_per_threadgroup]]) {
+    if (token >= args.tokens) return;
+
+    device const float *s =
+        (device const float *)(src + (uint64_t)token * args.src_token_stride);
+    device float *d =
+        (device float *)(dst + (uint64_t)token * args.dst_token_stride);
+
+    for (uint col = tid; col < args.width; col += ntg) {
+        float v = s[col];
+        v += s[args.width + col];
+        v += s[2u * args.width + col];
+        v += s[3u * args.width + col];
+        v += s[4u * args.width + col];
+        v += s[5u * args.width + col];
+        d[col] = v;
     }
 }
 
