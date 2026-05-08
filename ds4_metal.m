@@ -717,9 +717,9 @@ static int ds4_metal_use_mpp_attn_out_low_matmul(void) {
     if (!initialized) {
         enabled = g_metal4_tensor_api_enabled &&
                   getenv("DS4_METAL_MPP_DISABLE") == NULL &&
-                  getenv("DS4_METAL_MPP_ATTN_OUT_ENABLE") != NULL;
+                  getenv("DS4_METAL_MPP_ATTN_OUT_DISABLE") == NULL;
         if (enabled) {
-            fprintf(stderr, "ds4: experimental Metal MPP attention-output low projection enabled\n");
+            fprintf(stderr, "ds4: Metal MPP attention-output low projection enabled by default\n");
         }
         initialized = 1;
     }

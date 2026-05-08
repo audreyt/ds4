@@ -32,7 +32,7 @@ Options:
   --out DIR             Output directory for prompts, logs, and results.csv. Default: /tmp
   --no-build            Do not run make ds4 before benchmarking.
   --include-f16         Also run DS4_METAL_MPP_EXPERIMENTAL_F16=1. Known graph-test unsafe.
-  --include-attn-out    Also run DS4_METAL_MPP_ATTN_OUT_ENABLE=1.
+  --include-attn-out    Also run an attention-output MPP ablation with DS4_METAL_MPP_ATTN_OUT_DISABLE=1.
   -h, --help            Show this help.
 EOF
 }
@@ -158,8 +158,8 @@ run_one() {
         q8_mpp)
             if ! env DS4_METAL_MPP_ENABLE=1 "${cmd[@]}" >"$log" 2>&1; then status="fail"; fi
             ;;
-        q8_mpp_attn_out)
-            if ! env DS4_METAL_MPP_ENABLE=1 DS4_METAL_MPP_ATTN_OUT_ENABLE=1 "${cmd[@]}" >"$log" 2>&1; then status="fail"; fi
+        q8_mpp_no_attn_out)
+            if ! env DS4_METAL_MPP_ENABLE=1 DS4_METAL_MPP_ATTN_OUT_DISABLE=1 "${cmd[@]}" >"$log" 2>&1; then status="fail"; fi
             ;;
         f16_mpp_unsafe)
             if ! env DS4_METAL_MPP_EXPERIMENTAL_F16=1 "${cmd[@]}" >"$log" 2>&1; then status="fail"; fi
@@ -193,7 +193,7 @@ for target in "${SIZE_LIST[@]}"; do
         run_one legacy "$target" "$run" "$prompt"
         run_one q8_mpp "$target" "$run" "$prompt"
         if [[ "$INCLUDE_ATTN_OUT" -eq 1 ]]; then
-            run_one q8_mpp_attn_out "$target" "$run" "$prompt"
+            run_one q8_mpp_no_attn_out "$target" "$run" "$prompt"
         fi
         if [[ "$INCLUDE_F16" -eq 1 ]]; then
             run_one f16_mpp_unsafe "$target" "$run" "$prompt"

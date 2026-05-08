@@ -140,11 +140,10 @@ The F16 prefill MPP variant remains available for low-level investigation via
 `DS4_METAL_MPP_EXPERIMENTAL_F16=1`, but it currently fails graph-level tests and
 should not be used for quality comparisons.
 
-An attention-output low-projection MPP probe is available with
-`DS4_METAL_MPP_ATTN_OUT_ENABLE=1`. It passes the same logprob-vector and
-long-context checks on M5 for full 32-token tiles, falling back to the existing
-indexed simdgroup kernel for partial tiles. It remains disabled by default while
-its throughput is compared against the existing indexed simdgroup kernel.
+The attention-output low-projection also uses MPP by default on Metal 4 tensor
+targets for full 32-token tiles, falling back to the existing indexed simdgroup
+kernel for partial tiles. Set `DS4_METAL_MPP_ATTN_OUT_DISABLE=1` to isolate or
+temporarily disable this route.
 
 For repeatable measurements, run the benchmark harness:
 
@@ -157,7 +156,8 @@ The harness synthesizes prompt files from `README.md`, runs legacy Metal
 records logs and `results.csv` under `/tmp`, and prints a prefill throughput
 summary grouped by encoded input tokens when the CLI emits progress, or by the
 requested prompt size for very short prompts.
-Add `--include-attn-out` to include the attention-output MPP probe.
+Add `--include-attn-out` to include a Q8 MPP ablation with attention-output MPP
+disabled.
 
 The practical implementation plan is:
 
