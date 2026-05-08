@@ -797,7 +797,7 @@ static int ds4_metal_mpp_routed_moe_layer_allowed(uint32_t layer_index) {
     if (!initialized) {
         const int default_policy = ds4_metal_mpp_routed_moe_default_policy();
         min_layer = ds4_metal_env_u32_or("DS4_METAL_MPP_EXPERIMENTAL_MOE_LAYER_MIN",
-                                         default_policy ? 32u : 0u);
+                                         default_policy ? 27u : 0u);
         max_layer = ds4_metal_env_u32_or("DS4_METAL_MPP_EXPERIMENTAL_MOE_LAYER_MAX", UINT32_MAX);
         if (min_layer > max_layer) {
             uint32_t tmp = min_layer;
