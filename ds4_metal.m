@@ -692,6 +692,22 @@ static int ds4_metal_use_mpp_q8_0_matmul(void) {
     return enabled;
 }
 
+static int ds4_metal_use_mpp_f16_compressor_matmul(void) {
+    static int initialized;
+    static int enabled;
+    if (!initialized) {
+        enabled = ds4_metal_mpp_q8_0_policy_enabled() &&
+                  getenv("DS4_METAL_MPP_F16_DISABLE") == NULL;
+        if (enabled) {
+            const int forced = getenv("DS4_METAL_MPP_ENABLE") != NULL;
+            fprintf(stderr, "ds4: Metal MPP F16 compressor prefill matmul enabled%s\n",
+                    forced ? " by environment" : " by default");
+        }
+        initialized = 1;
+    }
+    return enabled;
+}
+
 static int ds4_metal_use_mpp_attn_out_low_matmul(void) {
     static int initialized;
     static int enabled;
@@ -5575,6 +5591,32 @@ int ds4_metal_matmul_f16_tensor(
 
         const bool bc_inp = (in_dim % 32u) != 0;
         const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
+        /* Keep MPP F16 limited to the exact-safe ratio-2 compressor shape. */
+        if (in_dim == 4096u && out_dim == 128u && !bc_inp &&
+            ds4_metal_use_mpp_f16_compressor_matmul()) {
+            id<MTLComputePipelineState> pipeline =
+                ds4_metal_get_mul_mm_pipeline("kernel_mul_mm_f16_f32_mpp", false, bc_out);
+            if (pipeline) {
+                ds4_metal_mul_mm_args args = ds4_metal_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+
+                id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+                [enc setComputePipelineState:pipeline];
+                [enc setBytes:&args length:sizeof(args) atIndex:0];
+                [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+                [enc setBuffer:xbuf offset:ds4_metal_tensor_offset(x) atIndex:2];
+                [enc setBuffer:outbuf offset:ds4_metal_tensor_offset(out) atIndex:3];
+                [enc setThreadgroupMemoryLength:4096u atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
+                                                      ((NSUInteger)out_dim + 63u) / 64u,
+                                                      1)
+                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                ds4_metal_end_compute_encoder(cb, enc);
+
+                if (!ds4_metal_finish_command_buffer(cb, owned, "Metal MPP F16 compressor matmul")) return 0;
+                return 1;
+            }
+        }
+
         id<MTLComputePipelineState> pipeline =
             ds4_metal_get_mul_mm_pipeline("kernel_mul_mm_f16_f32", bc_inp, bc_out);
         if (!pipeline) return 0;

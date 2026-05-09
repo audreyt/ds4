@@ -1005,6 +1005,7 @@ kernel void kernel_mul_mm_mpp(
 
 typedef decltype(kernel_mul_mm_mpp<half, half4x4, float4x4, 1, dequantize_f32, float, float4x4, float>) mul_mm_mpp_t;
 
+template [[host_name("kernel_mul_mm_f16_f32_mpp")]]  kernel mul_mm_mpp_t kernel_mul_mm_mpp<half, half4x4, half4x4, 1, dequantize_f16,  half,  half4x4,  float>;
 template [[host_name("kernel_mul_mm_q8_0_f32_mpp")]] kernel mul_mm_mpp_t kernel_mul_mm_mpp<half, half4x4, block_q8_0, 2, dequantize_q8_0, float, float4x4, float>;
 #endif
 
