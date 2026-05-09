@@ -130,10 +130,22 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
 
+typedef enum {
+    DS4_SESSION_REWRITE_ERROR = -1,
+    DS4_SESSION_REWRITE_OK = 0,
+    /* The live graph cannot be rewritten safely in place.  The caller should
+     * restore an older checkpoint if it has one, then sync to the prompt. */
+    DS4_SESSION_REWRITE_REBUILD_NEEDED = 1,
+} ds4_session_rewrite_result;
+
 /* Synchronize the live session to a full prompt token prefix.  If the current
  * checkpoint is a prefix, only the suffix is evaluated; otherwise the graph is
  * refilled from scratch. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
+ds4_session_rewrite_result ds4_session_rewrite_from_common(
+        ds4_session *s, const ds4_tokens *prompt, int common,
+        char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);

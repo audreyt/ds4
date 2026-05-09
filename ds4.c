@@ -15976,6 +15976,74 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
 #endif
 }
 
+/* Return true when canonicalization would replace already-sampled tokens.
+ *
+ * A DS4 session checkpoint is more than a token vector: the Metal graph also
+ * contains raw SWA rows, compressed KV rows, indexer rows, and compressor
+ * frontiers.  Replacing any part of the live tail requires restoring that whole
+ * graph frontier first.  Extending exactly at the live end is safe; rewriting
+ * behind it is not an in-place operation. */
+bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common) {
+    if (live_len < 0 || canonical_len < 0 || common < 0) return true;
+    if (common > live_len || common > canonical_len) return true;
+    return common < live_len;
+}
+
+/* Replace the live suffix after a shared prefix.
+ *
+ * This is used after parsing a generated tool call.  The model may have emitted
+ * DSML in an order that is semantically valid but not byte-for-byte equal to the
+ * canonical prompt we will see on the next request.  Rewriting only the token
+ * checkpoint is not enough: the Metal graph still contains raw and compressed
+ * rows for the old suffix.  Until we have a real graph frontier snapshot at the
+ * rewrite point, any replacement behind the live end reports that a rebuild is
+ * needed without mutating the graph.  The server may still find an older disk KV
+ * checkpoint before falling back to a full replay. */
+ds4_session_rewrite_result ds4_session_rewrite_from_common(
+        ds4_session *s, const ds4_tokens *prompt, int common,
+        char *err, size_t errlen) {
+#ifdef DS4_NO_METAL
+    (void)s;
+    (void)prompt;
+    (void)common;
+    snprintf(err, errlen, "Metal support is not compiled in");
+    return DS4_SESSION_REWRITE_ERROR;
+#else
+    if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
+        snprintf(err, errlen, "prompt exceeds context");
+        return DS4_SESSION_REWRITE_ERROR;
+    }
+    if (!s->checkpoint_valid) {
+        snprintf(err, errlen, "session has no valid checkpoint");
+        return DS4_SESSION_REWRITE_ERROR;
+    }
+    if (common < 0 || common > s->checkpoint.len || common > prompt->len) {
+        snprintf(err, errlen, "invalid rewrite prefix");
+        return DS4_SESSION_REWRITE_ERROR;
+    }
+    for (int i = 0; i < common; i++) {
+        if (s->checkpoint.v[i] != prompt->v[i]) {
+            snprintf(err, errlen, "rewrite prefix does not match live checkpoint");
+            return DS4_SESSION_REWRITE_ERROR;
+        }
+    }
+
+    if (common == s->checkpoint.len) {
+        return ds4_session_sync(s, prompt, err, errlen) == 0 ?
+            DS4_SESSION_REWRITE_OK : DS4_SESSION_REWRITE_ERROR;
+    }
+
+    if (ds4_session_rewrite_requires_rebuild(s->checkpoint.len, prompt->len, common)) {
+        snprintf(err, errlen, "rewrite needs rebuild: common=%d live=%d canonical=%d",
+                 common, s->checkpoint.len, prompt->len);
+        return DS4_SESSION_REWRITE_REBUILD_NEEDED;
+    }
+
+    snprintf(err, errlen, "unexpected canonical rewrite state");
+    return DS4_SESSION_REWRITE_ERROR;
+#endif
+}
+
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     if (!s->checkpoint_valid) return 0;
     int n = s->checkpoint.len < prompt->len ? s->checkpoint.len : prompt->len;

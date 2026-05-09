@@ -514,6 +514,8 @@ static void test_tool_call_quality_one(bool quality) {
     buf text = {0};
     uint64_t rng = 123;
     bool decode_ok = true;
+    bool saw_tool_start = false;
+    bool saw_tool_end = false;
     for (int i = 0; i < r.max_tokens; i++) {
         int token = ds4_session_sample(session, r.temperature, r.top_k,
                                        r.top_p, r.min_p, &rng);
@@ -521,7 +523,8 @@ static void test_tool_call_quality_one(bool quality) {
         char *piece = ds4_token_text(engine, token, &piece_len);
         buf_append(&text, piece, piece_len);
         free(piece);
-        if (tool_calls_finished(text.ptr ? text.ptr : "")) break;
+        observe_tool_markers(text.ptr ? text.ptr : "", &saw_tool_start, &saw_tool_end, NULL);
+        if (saw_tool_end) break;
         if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
             decode_ok = false;
             break;

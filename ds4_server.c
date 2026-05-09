@@ -2514,16 +2514,46 @@ static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
 #define DS4_PARAM_START_SHORT "<" DS4_DSML_SHORT "parameter"
 #define DS4_PARAM_END_SHORT "</" DS4_DSML_SHORT "parameter>"
 
-static bool tool_calls_started(const char *text) {
-    return text && (strstr(text, DS4_TOOL_CALLS_START) ||
-                    strstr(text, DS4_TOOL_CALLS_START_SHORT) ||
-                    strstr(text, "<tool_calls>"));
+static const char *find_any_tool_start(const char *s) {
+    const char *best = NULL;
+    const char *candidates[] = {
+        strstr(s, DS4_TOOL_CALLS_START),
+        strstr(s, DS4_TOOL_CALLS_START_SHORT),
+        strstr(s, "<tool_calls>"),
+    };
+    for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
+        if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
+    }
+    return best;
 }
 
-static bool tool_calls_finished(const char *text) {
-    return text && (strstr(text, DS4_TOOL_CALLS_END) ||
-                    strstr(text, DS4_TOOL_CALLS_END_SHORT) ||
-                    strstr(text, "</tool_calls>"));
+static const char *find_any_tool_end(const char *s) {
+    const char *best = NULL;
+    const char *candidates[] = {
+        strstr(s, DS4_TOOL_CALLS_END),
+        strstr(s, DS4_TOOL_CALLS_END_SHORT),
+        strstr(s, "</tool_calls>"),
+    };
+    for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
+        if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
+    }
+    return best;
+}
+
+static void observe_tool_markers(const char *scan, bool *saw_start,
+                                 bool *saw_end, bool *orphan_end) {
+    if (!scan) return;
+    bool had_start = *saw_start;
+    const char *start = find_any_tool_start(scan);
+    if (start) *saw_start = true;
+
+    const char *end_scan = had_start ? scan : (start ? start : NULL);
+    const char *end = end_scan ? find_any_tool_end(end_scan) : NULL;
+    if (end) {
+        *saw_end = true;
+    } else if (!had_start && !start && find_any_tool_end(scan)) {
+        if (orphan_end) *orphan_end = true;
+    }
 }
 
 static size_t trim_tool_separator_ws(const char *raw, size_t start, size_t limit) {
@@ -2976,7 +3006,6 @@ static void openai_stream_start(const request *r, openai_stream *st) {
     st->mode = ds4_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
 }
 
-static const char *find_any_tool_start(const char *s);
 static size_t text_stream_safe_limit(const char *raw, size_t start,
                                      size_t raw_len, bool has_tools,
                                      bool final);
@@ -3686,19 +3715,6 @@ static bool anthropic_sse_close_block_live(int fd, const char *id,
         st->next_index++;
     }
     return ok;
-}
-
-static const char *find_any_tool_start(const char *s) {
-    const char *best = NULL;
-    const char *candidates[] = {
-        strstr(s, DS4_TOOL_CALLS_START),
-        strstr(s, DS4_TOOL_CALLS_START_SHORT),
-        strstr(s, "<tool_calls>"),
-    };
-    for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
-        if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
-    }
-    return best;
 }
 
 static size_t text_stream_safe_limit(const char *raw, size_t start,
@@ -4675,13 +4691,13 @@ static int kv_cache_find_prefix(kv_disk_cache *kc, const ds4_tokens *prompt, int
     return best;
 }
 
-static int kv_cache_try_load(server *s, const request *req, char **loaded_path_out) {
+static int kv_cache_try_load_tokens(server *s, const ds4_tokens *prompt, char **loaded_path_out) {
     if (loaded_path_out) *loaded_path_out = NULL;
     kv_disk_cache *kc = &s->kv;
     if (!kc->enabled) return 0;
     const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
     if (quant_bits != 2 && quant_bits != 4) return 0;
-    int idx = kv_cache_find_prefix(kc, &req->prompt, quant_bits, ds4_session_ctx(s->session));
+    int idx = kv_cache_find_prefix(kc, prompt, quant_bits, ds4_session_ctx(s->session));
     if (idx < 0) return 0;
 
     kv_entry e = kc->entry[idx];
@@ -4696,12 +4712,12 @@ static int kv_cache_try_load(server *s, const request *req, char **loaded_path_o
     kv_entry hdr = {0};
     bool header_ok = kv_read_header(fp, &hdr, &text_bytes);
     if (header_ok && fseeko(fp, (off_t)text_bytes, SEEK_CUR) != 0) header_ok = false;
-    char err[160];
+    char err[160] = {0};
     int loaded = 0;
     if (header_ok && ds4_session_load_payload(s->session, fp, hdr.payload_bytes, err, sizeof(err)) == 0) {
         const ds4_tokens *loaded_tokens = ds4_session_tokens(s->session);
         if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens &&
-            ds4_tokens_starts_with(&req->prompt, loaded_tokens))
+            ds4_tokens_starts_with(prompt, loaded_tokens))
         {
             loaded = (int)hdr.tokens;
         } else {
@@ -4736,6 +4752,10 @@ static int kv_cache_try_load(server *s, const request *req, char **loaded_path_o
     }
     free(path);
     return loaded;
+}
+
+static int kv_cache_try_load(server *s, const request *req, char **loaded_path_out) {
+    return kv_cache_try_load_tokens(s, &req->prompt, loaded_path_out);
 }
 
 /* =========================================================================
@@ -5226,15 +5246,53 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
         goto done;
     }
 
-    char err[160];
-    ds4_session_rewind(s->session, common);
-    if (ds4_session_sync(s->session, &canonical, err, sizeof(err)) == 0) {
+    char err[160] = {0};
+    ds4_session_rewrite_result rr =
+        ds4_session_rewrite_from_common(s->session, &canonical, common,
+                                        err, sizeof(err));
+    if (rr == DS4_SESSION_REWRITE_OK) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d",
                    ctx, common, live_len, canonical.len);
         trace_event(s, trace_id,
                     "tool checkpoint canonicalized: common=%d live=%d canonical=%d",
                     common, live_len, canonical.len);
+    } else if (rr == DS4_SESSION_REWRITE_REBUILD_NEEDED) {
+        /* The generated DSML suffix and the canonical prompt share a prefix,
+         * but the generated tail is too large to overwrite safely inside the
+         * live raw-window ring.  Prefer an older disk checkpoint over replaying
+         * a very long conversation from token zero. */
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: tool checkpoint canonicalization needs rebuild ctx=%s common=%d live=%d canonical=%d reason=\"%s\"",
+                   ctx, common, live_len, canonical.len, err);
+        char *path = NULL;
+        int loaded = kv_cache_try_load_tokens(s, &canonical, &path);
+        if (loaded == 0) ds4_session_invalidate(s->session);
+
+        char sync_err[160] = {0};
+        if (ds4_session_sync(s->session, &canonical, sync_err, sizeof(sync_err)) == 0) {
+            if (loaded > 0) {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d via=disk cached=%d",
+                           ctx, common, live_len, canonical.len, loaded);
+                trace_event(s, trace_id,
+                            "tool checkpoint canonicalized via disk: common=%d live=%d canonical=%d cached=%d file=%s",
+                            common, live_len, canonical.len, loaded, path ? path : "");
+            } else {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d via=rebuild",
+                           ctx, common, live_len, canonical.len);
+                trace_event(s, trace_id,
+                            "tool checkpoint canonicalized via rebuild: common=%d live=%d canonical=%d reason=%s",
+                            common, live_len, canonical.len, err);
+            }
+        } else {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: tool checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
+                       ctx, common, live_len, canonical.len, sync_err);
+            trace_event(s, trace_id, "tool checkpoint canonicalization failed after rebuild request: %s", sync_err);
+        }
+        free(path);
     } else {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: tool checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
@@ -5393,6 +5451,7 @@ static void generate_job(server *s, job *j) {
     int room = ds4_session_ctx(s->session) - ds4_session_pos(s->session);
     bool saw_tool_start = false;
     bool saw_tool_end = false;
+    bool saw_orphan_tool_end = false;
     size_t tool_scan_from = 0;
     int next_tool_progress = 128;
     int next_decode_log = 50;
@@ -5522,14 +5581,24 @@ static void generate_job(server *s, job *j) {
 
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 const char *tool_scan = text.ptr ? text.ptr + tool_scan_from : "";
-                bool now_start = saw_tool_start || tool_calls_started(tool_scan);
-                bool now_end = saw_tool_end || tool_calls_finished(tool_scan);
-                if (now_start && !saw_tool_start) {
-                    saw_tool_start = true;
+                bool orphan_end = false;
+                bool old_start = saw_tool_start;
+                bool old_end = saw_tool_end;
+                observe_tool_markers(tool_scan, &saw_tool_start, &saw_tool_end, &orphan_end);
+                if (orphan_end && !saw_orphan_tool_end) {
+                    saw_orphan_tool_end = true;
+                    server_log(DS4_LOG_WARNING,
+                               "ds4-server: chat ctx=%s ignored orphan tool-call end marker after %d generated tokens",
+                               ctx_span,
+                               completion);
+                    trace_event(s, trace_id,
+                                "ignored orphan tool-call end marker after %d generated tokens",
+                                completion);
+                }
+                if (saw_tool_start && !old_start) {
                     trace_event(s, trace_id, "entered tool-call block after %d generated tokens", completion);
                 }
-                if (now_end && !saw_tool_end) {
-                    saw_tool_end = true;
+                if (saw_tool_end && !old_end) {
                     trace_event(s, trace_id, "closed tool-call block after %d generated tokens", completion);
                 }
                 const size_t marker_hold = 80;
@@ -7505,6 +7574,45 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request_free(&r);
 }
 
+static void test_tool_marker_state_ignores_orphan_end(void) {
+    bool saw_start = false;
+    bool saw_end = false;
+    bool orphan_end = false;
+
+    observe_tool_markers("reasoning\n" DS4_PARAM_END "\n" DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END,
+                         &saw_start, &saw_end, &orphan_end);
+    TEST_ASSERT(!saw_start);
+    TEST_ASSERT(!saw_end);
+    TEST_ASSERT(orphan_end);
+
+    orphan_end = false;
+    observe_tool_markers(DS4_TOOL_CALLS_START "\n" DS4_INVOKE_START " name=\"bash\">",
+                         &saw_start, &saw_end, &orphan_end);
+    TEST_ASSERT(saw_start);
+    TEST_ASSERT(!saw_end);
+    TEST_ASSERT(!orphan_end);
+
+    observe_tool_markers(DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END,
+                         &saw_start, &saw_end, &orphan_end);
+    TEST_ASSERT(saw_start);
+    TEST_ASSERT(saw_end);
+}
+
+static void test_canonical_rewrite_rebuilds_when_live_tail_changes(void) {
+    /* Regression for the first canonical-KV rewrite attempt: replacing a small
+     * live suffix looks tempting because the raw SWA ring may still contain the
+     * needed rows, but compressed KV counters and compressor/indexer frontiers
+     * are already past the shared prefix.  Until those graph frontiers can be
+     * restored exactly, every rewrite behind the live end must rebuild or load a
+     * disk checkpoint. */
+    TEST_ASSERT(ds4_session_rewrite_requires_rebuild(19296, 19290, 19081));
+    TEST_ASSERT(ds4_session_rewrite_requires_rebuild(1024, 1030, 1000));
+    TEST_ASSERT(ds4_session_rewrite_requires_rebuild(1024, 900, 900));
+
+    TEST_ASSERT(!ds4_session_rewrite_requires_rebuild(1024, 1024, 1024));
+    TEST_ASSERT(!ds4_session_rewrite_requires_rebuild(1024, 1100, 1024));
+}
+
 static void test_kv_cache_store_len_uses_configured_boundary(void) {
     kv_disk_cache kc = {0};
     kc.opt = kv_cache_default_options();
@@ -7652,6 +7760,8 @@ static void ds4_server_unit_tests_run(void) {
     test_model_metadata_clamps_completion_to_context();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
+    test_tool_marker_state_ignores_orphan_end();
+    test_canonical_rewrite_rebuilds_when_live_tail_changes();
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_penalizes_live_continued_prefixes();
