@@ -167,7 +167,12 @@ clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
 controls. Tool uses are returned as Anthropic `tool_use` blocks.
 
 Both APIs support SSE streaming. In thinking mode, reasoning is streamed in the
-native API shape instead of being mixed into final text.
+native API shape instead of being mixed into final text. OpenAI chat streaming
+also streams tool calls as soon as the DSML invocation is recognized: the tool
+header is sent first, then parameter bytes are forwarded as
+`tool_calls[].function.arguments` deltas while generation continues. The
+Anthropic endpoint streams thinking and text live, then emits structured
+`tool_use` blocks when the generated tool block is complete.
 
 Minimal OpenAI example:
 
