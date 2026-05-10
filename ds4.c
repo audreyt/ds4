@@ -12039,6 +12039,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                    DS4_N_EXPERT_USED,
                                                    DS4_SWIGLU_CLAMP_EXP,
                                                    g->batch_ffn_norm,
+                                                   il,
                                                    n_tokens) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->batch_routed_gate,
