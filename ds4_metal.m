@@ -1660,6 +1660,61 @@ static uint64_t ds4_metal_ape_bytes(uint32_t ape_type, uint64_t n_elems) {
     return n_elems * (ape_type == 1u ? 2u : 4u);
 }
 
+/* Convert IEEE-754 half (bits) to float on the CPU.  Used by the Q8_0 ape
+ * CPU-side dequant; the Metal-side `kernel_cpy_q8_0_f32` path turned out to
+ * produce silently wrong output on M5 Max for the compressor APE shapes we
+ * hit, so the pre-add scratch is filled from the host instead. */
+static float ds4_metal_half_bits_to_float(uint16_t bits) {
+    const uint32_t sign = (uint32_t)(bits >> 15) & 0x1u;
+    const uint32_t exph = (uint32_t)(bits >> 10) & 0x1fu;
+    const uint32_t mant = (uint32_t)bits & 0x3ffu;
+    uint32_t f32bits;
+    if (exph == 0u) {
+        if (mant == 0u) {
+            f32bits = sign << 31;
+        } else {
+            uint32_t e = 1u, m = mant;
+            while ((m & 0x400u) == 0u) { m <<= 1; e++; }
+            m &= 0x3ffu;
+            f32bits = (sign << 31) | ((127u - 15u - e + 1u) << 23) | (m << 13);
+        }
+    } else if (exph == 0x1fu) {
+        f32bits = (sign << 31) | (0xffu << 23) | (mant << 13);
+    } else {
+        f32bits = (sign << 31) | ((exph + 127u - 15u) << 23) | (mant << 13);
+    }
+    float v;
+    memcpy(&v, &f32bits, sizeof(v));
+    return v;
+}
+
+/* Dequantize `row_count` rows of `row_elems` Q8_0-stored values from `src`
+ * into contiguous F32 at `dst`.  `row_elems` must be a multiple of QK8_0=32.
+ * Source layout is contiguous block_q8_0 records (no per-row padding), so
+ * one row is `row_elems / 32` blocks of 34 bytes each. */
+static void ds4_metal_cpu_dequant_q8_0_rows(
+        float         *dst,
+        const uint8_t *src,
+        uint32_t       row_count,
+        uint32_t       row_elems) {
+    const uint32_t blocks_per_row = row_elems / 32u;
+    for (uint32_t r = 0; r < row_count; r++) {
+        const uint8_t *row = src + (uint64_t)r * (uint64_t)blocks_per_row * 34u;
+        float *out = dst + (uint64_t)r * row_elems;
+        for (uint32_t b = 0; b < blocks_per_row; b++) {
+            const uint8_t *blk = row + (uint64_t)b * 34u;
+            uint16_t scale_bits;
+            memcpy(&scale_bits, blk, sizeof(scale_bits));
+            const float scale = ds4_metal_half_bits_to_float(scale_bits);
+            const int8_t *qs = (const int8_t *)(blk + 2);
+            float *out_blk = out + (uint64_t)b * 32u;
+            for (uint32_t k = 0; k < 32u; k++) {
+                out_blk[k] = (float)qs[k] * scale;
+            }
+        }
+    }
+}
+
 static float ds4_metal_positive_infinity(void) {
     union { uint32_t u; float f; } v = { 0x7f800000u };
     return v.f;
@@ -6714,40 +6769,88 @@ static int ds4_metal_encode_compressor_score_with_ape(
     const uint64_t row_src_bytes = ape_type == 8u
         ? (uint64_t)(width / 32u) * 34u
         : (uint64_t)width * (ape_type == 1u ? 2u : 4u);
-    uint32_t copied_rows = 0;
-    uint32_t pos_mod = pos0 % ratio;
-    while (copied_rows < n_tokens) {
-        uint32_t seg_rows = ratio - pos_mod;
-        if (seg_rows > n_tokens - copied_rows) seg_rows = n_tokens - copied_rows;
-        const uint32_t seg_elems = seg_rows * width;
-        const NSUInteger src_off = ape_offset + (NSUInteger)pos_mod * row_src_bytes;
-        const NSUInteger dst_off = (NSUInteger)copied_rows * width * sizeof(float);
-        int ok;
-        if (ape_type == 1u) {
-            ok = ds4_metal_encode_cpy_f16_f32_1d(cb,
-                                                 apebuf,
-                                                 src_off,
-                                                 g_compressor_store_ape_buffer,
-                                                 dst_off,
-                                                 seg_elems);
-        } else if (ape_type == 8u) {
-            ok = ds4_metal_encode_cpy_q8_0_f32_1d(cb,
-                                                  apebuf,
-                                                  src_off,
-                                                  g_compressor_store_ape_buffer,
-                                                  dst_off,
-                                                  seg_elems);
-        } else {
-            ok = ds4_metal_encode_cpy_f32_f32_1d(cb,
-                                                 apebuf,
-                                                 src_off,
-                                                 g_compressor_store_ape_buffer,
-                                                 dst_off,
-                                                 seg_elems);
+
+    /* For Q8_0 ape, dequant on CPU into a *per-call* private buffer.  The
+     * Metal-side `kernel_cpy_q8_0_f32` path produced silently wrong output on
+     * M5 Max for compressor APE shapes; using the shared g_compressor_store_ape_buffer
+     * with CPU writes also produces wrong output because multiple CPU writes
+     * to the same scratch in one command buffer collapse to the last write
+     * at execute time (Metal kernels run in encode order, but CPU writes
+     * don't participate in that ordering when the same scratch is reused).
+     *
+     * The local buffer is retained until cb completes via addCompletedHandler
+     * because Metal does NOT strongly retain buffers bound to encoders. */
+    if (ape_type == 8u) {
+        const uint8_t *apebytes = (const uint8_t *) [apebuf contents];
+        if (!apebytes) {
+            fprintf(stderr, "ds4: Metal compressor APE Q8_0: source buffer has no CPU contents\n");
+            return 0;
         }
-        if (!ok) return 0;
-        copied_rows += seg_rows;
-        pos_mod = 0;
+        const NSUInteger ape_call_bytes = (NSUInteger)total_elems * sizeof(float);
+        id<MTLBuffer> ape_call_buf = [g_device newBufferWithLength:ape_call_bytes
+                                                            options:MTLResourceStorageModeShared];
+        if (!ape_call_buf) {
+            fprintf(stderr, "ds4: Metal compressor APE Q8_0: per-call scratch alloc failed\n");
+            return 0;
+        }
+        float *scratch = (float *) [ape_call_buf contents];
+        uint32_t copied_rows = 0;
+        uint32_t pos_mod = pos0 % ratio;
+        while (copied_rows < n_tokens) {
+            uint32_t seg_rows = ratio - pos_mod;
+            if (seg_rows > n_tokens - copied_rows) seg_rows = n_tokens - copied_rows;
+            const uint64_t src_off = (uint64_t)ape_offset + (uint64_t)pos_mod * row_src_bytes;
+            ds4_metal_cpu_dequant_q8_0_rows(scratch + (uint64_t)copied_rows * width,
+                                            apebytes + src_off,
+                                            seg_rows,
+                                            width);
+            copied_rows += seg_rows;
+            pos_mod = 0;
+        }
+        const int add_ok = ds4_metal_encode_add_f32_1d(cb,
+                                                       score_src,
+                                                       score_src_offset,
+                                                       ape_call_buf,
+                                                       0,
+                                                       score_dst,
+                                                       score_dst_offset,
+                                                       total_elems);
+        if (add_ok) {
+            /* Keep ape_call_buf alive until the GPU is done reading it. */
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull __unused done) {
+                (void) ape_call_buf;
+            }];
+        }
+        return add_ok;
+    } else {
+        uint32_t copied_rows = 0;
+        uint32_t pos_mod = pos0 % ratio;
+        while (copied_rows < n_tokens) {
+            uint32_t seg_rows = ratio - pos_mod;
+            if (seg_rows > n_tokens - copied_rows) seg_rows = n_tokens - copied_rows;
+            const uint32_t seg_elems = seg_rows * width;
+            const NSUInteger src_off = ape_offset + (NSUInteger)pos_mod * row_src_bytes;
+            const NSUInteger dst_off = (NSUInteger)copied_rows * width * sizeof(float);
+            int ok;
+            if (ape_type == 1u) {
+                ok = ds4_metal_encode_cpy_f16_f32_1d(cb,
+                                                     apebuf,
+                                                     src_off,
+                                                     g_compressor_store_ape_buffer,
+                                                     dst_off,
+                                                     seg_elems);
+            } else {
+                ok = ds4_metal_encode_cpy_f32_f32_1d(cb,
+                                                     apebuf,
+                                                     src_off,
+                                                     g_compressor_store_ape_buffer,
+                                                     dst_off,
+                                                     seg_elems);
+            }
+            if (!ok) return 0;
+            copied_rows += seg_rows;
+            pos_mod = 0;
+        }
     }
 
     return ds4_metal_encode_add_f32_1d(cb,
@@ -6979,51 +7082,82 @@ int ds4_metal_compressor_store_batch_tensor(
         }
 
         int ok = 1;
-        uint32_t copied_rows = 0;
-        uint32_t pos_mod = pos0 % ratio;
         const uint64_t row_src_bytes = ds4_metal_ape_bytes(ape_type, (uint64_t)width);
-        while (ok && copied_rows < n_tokens) {
-            uint32_t seg_rows = ratio - pos_mod;
-            if (seg_rows > n_tokens - copied_rows) seg_rows = n_tokens - copied_rows;
-            const uint32_t seg_elems = seg_rows * width;
-            const NSUInteger src_off = (NSUInteger)ape_inner +
-                                       (NSUInteger)pos_mod * row_src_bytes;
-            const NSUInteger dst_off = (NSUInteger)copied_rows * width * sizeof(float);
-            if (ape_type == 1u) {
-                ok = ds4_metal_encode_cpy_f16_f32_1d(cb,
-                                                     apebuf,
-                                                     src_off,
-                                                     g_compressor_store_ape_buffer,
-                                                     dst_off,
-                                                     seg_elems);
-            } else if (ape_type == 8u) {
-                ok = ds4_metal_encode_cpy_q8_0_f32_1d(cb,
-                                                      apebuf,
-                                                      src_off,
-                                                      g_compressor_store_ape_buffer,
-                                                      dst_off,
-                                                      seg_elems);
-            } else {
-                ok = ds4_metal_encode_cpy_f32_f32_1d(cb,
-                                                     apebuf,
-                                                     src_off,
-                                                     g_compressor_store_ape_buffer,
-                                                     dst_off,
-                                                     seg_elems);
+        id<MTLBuffer> ape_call_buf = nil;
+        id<MTLBuffer> ape_consume_buf = g_compressor_store_ape_buffer;
+        NSUInteger ape_consume_off = 0;
+        if (ape_type == 8u) {
+            /* CPU-side dequant for Q8_0: write to a fresh per-call shared
+             * buffer so the data survives encode-time race vs subsequent
+             * kernel reads (see ds4_metal_encode_compressor_score_with_ape). */
+            const uint8_t *apebytes = (const uint8_t *) [apebuf contents];
+            const NSUInteger ape_call_bytes = (NSUInteger)total_elems * sizeof(float);
+            ape_call_buf = [g_device newBufferWithLength:ape_call_bytes
+                                                  options:MTLResourceStorageModeShared];
+            float *scratch = ape_call_buf ? (float *) [ape_call_buf contents] : NULL;
+            if (!apebytes || !scratch) {
+                fprintf(stderr, "ds4: Metal compressor APE Q8_0: per-call scratch alloc failed\n");
+                ok = 0;
             }
-            copied_rows += seg_rows;
-            pos_mod = 0;
+            ape_consume_buf = ape_call_buf;
+            uint32_t copied_rows = 0;
+            uint32_t pos_mod = pos0 % ratio;
+            while (ok && copied_rows < n_tokens) {
+                uint32_t seg_rows = ratio - pos_mod;
+                if (seg_rows > n_tokens - copied_rows) seg_rows = n_tokens - copied_rows;
+                const uint64_t src_off = (uint64_t)ape_inner + (uint64_t)pos_mod * row_src_bytes;
+                ds4_metal_cpu_dequant_q8_0_rows(scratch + (uint64_t)copied_rows * width,
+                                                apebytes + src_off,
+                                                seg_rows,
+                                                width);
+                copied_rows += seg_rows;
+                pos_mod = 0;
+            }
+        } else {
+            uint32_t copied_rows = 0;
+            uint32_t pos_mod = pos0 % ratio;
+            while (ok && copied_rows < n_tokens) {
+                uint32_t seg_rows = ratio - pos_mod;
+                if (seg_rows > n_tokens - copied_rows) seg_rows = n_tokens - copied_rows;
+                const uint32_t seg_elems = seg_rows * width;
+                const NSUInteger src_off = (NSUInteger)ape_inner +
+                                           (NSUInteger)pos_mod * row_src_bytes;
+                const NSUInteger dst_off = (NSUInteger)copied_rows * width * sizeof(float);
+                if (ape_type == 1u) {
+                    ok = ds4_metal_encode_cpy_f16_f32_1d(cb,
+                                                         apebuf,
+                                                         src_off,
+                                                         g_compressor_store_ape_buffer,
+                                                         dst_off,
+                                                         seg_elems);
+                } else {
+                    ok = ds4_metal_encode_cpy_f32_f32_1d(cb,
+                                                         apebuf,
+                                                         src_off,
+                                                         g_compressor_store_ape_buffer,
+                                                         dst_off,
+                                                         seg_elems);
+                }
+                copied_rows += seg_rows;
+                pos_mod = 0;
+            }
         }
 
         if (ok) {
             ok = ds4_metal_encode_add_f32_1d(cb,
                                              scbuf,
                                              ds4_metal_tensor_offset(sc),
-                                             g_compressor_store_ape_buffer,
-                                             0,
+                                             ape_consume_buf,
+                                             ape_consume_off,
                                              g_compressor_store_score_buffer,
                                              0,
                                              total_elems);
+        }
+        if (ok && ape_call_buf) {
+            /* Retain the per-call ape buffer until the GPU is done. */
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull __unused done) {
+                (void) ape_call_buf;
+            }];
         }
         if (ok) {
             ok = ds4_metal_encode_set_rows_f32_i32(cb,

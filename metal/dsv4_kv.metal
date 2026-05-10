@@ -218,6 +218,15 @@ kernel void kernel_dsv4_compressor_store_one(
     float ape_v;
     if (args.ape_type == 1u) {
         ape_v = (float)(((device const half *)ape)[ape_i]);
+    } else if (args.ape_type == 8u) {
+        /* Q8_0: 32 elements per 34-byte block (uint16_t scale + 32 int8 quants). */
+        const uint blk = ape_i / 32u;
+        const uint idx = ape_i - blk * 32u;
+        device const uchar *bp = (device const uchar *)ape + (uint64_t)blk * 34u;
+        const ushort sb = (ushort)bp[0] | ((ushort)bp[1] << 8);
+        const half d = as_type<half>(sb);
+        const int q = (int)(int8_t)bp[2u + idx];
+        ape_v = (float)q * (float)d;
     } else {
         ape_v = ((device const float *)ape)[ape_i];
     }
