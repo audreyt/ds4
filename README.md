@@ -167,7 +167,44 @@ clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
 controls. Tool uses are returned as Anthropic `tool_use` blocks.
 
 Both APIs support SSE streaming. In thinking mode, reasoning is streamed in the
-native API shape instead of being mixed into final text.
+native API shape instead of being mixed into final text. OpenAI chat streaming
+also streams tool calls as soon as the DSML invocation is recognized: the tool
+header is sent first, then parameter bytes are forwarded as
+`tool_calls[].function.arguments` deltas while generation continues. The
+Anthropic endpoint streams thinking and text live, then emits structured
+`tool_use` blocks when the generated tool block is complete.
+
+### Tool call handling and canonicalization
+
+DeepSeek V4 Flash emits tool calls as [DSML text](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/encoding/README.md). Agent clients do not send that
+same text back on the next request: they send normalized OpenAI/Anthropic JSON
+tool-call objects. **If the server re-rendered those objects slightly
+differently, the token prefix would no longer match the live KV checkpoint** and
+the next turn would have to be rebuilt.
+
+The first line of defense is exact replay. Every tool call gets an unguessable
+API tool ID, and the server remembers `tool id -> exact sampled DSML block` in
+a bounded in-memory map backed by radix trees. When the client later sends that
+tool ID back, the prompt renderer uses the exact DSML bytes the model sampled,
+not a freshly formatted approximation. This map can also be saved inside KV
+cache files, so exact replay survives server restarts for cached histories.
+
+**Canonicalization is only the backup path**. If the exact DSML block is missing,
+or exact replay is disabled with `--disable-exact-dsml-tool-replay`, the server
+renders a deterministic DSML form from the JSON tool object. After a tool-call
+turn, it compares the live sampled token stream with the prompt that the next
+client request will render. If needed, it rewrites the live checkpoint, or
+falls back to an older disk KV snapshot and replays only the suffix. This keeps
+the model continuation aligned with the stateless API transcript.
+
+During generation, the server also treats DSML syntax differently from payload.
+When the model is emitting stable protocol structure such as DSML tags,
+parameter headers, JSON punctuation, or closing markers, sampling is forced to
+`temperature=0` so the tool call stays parseable. This greedy mode does **not**
+apply to argument payloads: `string=true` parameter bodies and JSON string
+values, including file contents and edit text, use the request's normal sampling
+settings. That separation is important: deterministic decoding is helpful for
+syntax, but can create repeated text when applied to long code or file bodies.
 
 Minimal OpenAI example:
 
@@ -364,10 +401,11 @@ The file is intentionally written with ordinary `read`/`write` I/O, not
 `mmap`, so restoring cache entries does not add more VM mappings to a process
 that already maps the model.
 
-Tool calls also keep a small exact-DSML replay map keyed by unguessable tool
-IDs, so client JSON history can be rendered back to the exact sampled text. Use
-`--disable-exact-dsml-tool-replay` to disable this and fall back to canonical
-JSON-to-DSML rendering.
+Tool calls also keep a bounded exact-DSML replay map keyed by unguessable tool
+IDs, so client JSON history can be rendered back to the exact sampled text. The
+RAM map keeps up to 100000 IDs by default; tune it with `--tool-memory-max-ids`.
+Use `--disable-exact-dsml-tool-replay` to disable this and fall back to
+canonical JSON-to-DSML rendering.
 
 On disk, a cache file is:
 
@@ -410,6 +448,27 @@ exact DSML block the model sampled. Only mappings whose DSML block is present
 in the rendered cached text are stored. This lets restarted servers render
 later client history byte-for-byte like the original model output, even if the
 client reorders JSON arguments.
+
+The current tool-id map section is:
+
+```text
+0   u8[3]  magic = "KTM"
+3   u8     version = 1
+4   u32    entry count
+
+For each entry:
+0   u32    tool id byte length
+4   u32    sampled DSML byte length
+8   bytes  tool id
+... bytes  exact sampled DSML block
+```
+
+The section is auxiliary replay memory, not model state. A cache hit restores
+the session payload first, then loads the map if present. Before rendering a
+request, the server can also scan cache files for the tool IDs present in the
+client history and load just those mappings, so an exact DSML replay can survive
+server restarts even when the matching KV snapshot is not the one ultimately
+used for the token-prefix hit.
 
 The DS4 session payload starts with thirteen little-endian `u32` fields:
 
@@ -471,6 +530,8 @@ trim 32 tail tokens, and align to 2048-token chunks. The important knobs are:
 - `--kv-cache-continued-interval-tokens`
 - `--kv-cache-boundary-trim-tokens`
 - `--kv-cache-boundary-align-tokens`
+- `--tool-memory-max-ids`
+- `--disable-exact-dsml-tool-replay`
 
 By default, checkpoints may be reused across the 2-bit and 4-bit routed-expert
 variants if the token prefix matches. Use `--kv-cache-reject-different-quant`

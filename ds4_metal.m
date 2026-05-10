@@ -9,6 +9,7 @@
 #include <float.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/sysctl.h>
 
 #include "ds4.h"
 #include "ds4_metal.h"
@@ -170,6 +171,24 @@ static NSUInteger g_moe_id_map_bytes;
 static NSUInteger g_attn_out_group_ids_bytes;
 static int g_initialized;
 static int g_quality_mode;
+
+static uint64_t ds4_metal_system_memory_bytes(void) {
+    uint64_t bytes = 0;
+    size_t len = sizeof(bytes);
+    if (sysctlbyname("hw.memsize", &bytes, &len, NULL, 0) != 0) return 0;
+    return len == sizeof(bytes) ? bytes : 0;
+}
+
+static void ds4_metal_print_device_summary(void) {
+    const char *name = g_device.name ? [g_device.name UTF8String] : "unknown Metal device";
+    uint64_t mem = ds4_metal_system_memory_bytes();
+    if (mem) {
+        double gib = (double)mem / 1024.0 / 1024.0 / 1024.0;
+        fprintf(stderr, "ds4: Metal device %s, %.2f GiB RAM\n", name, gib);
+    } else {
+        fprintf(stderr, "ds4: Metal device %s\n", name);
+    }
+}
 
 #define DS4_METAL_MAX_MODEL_VIEWS 16
 #define DS4_METAL_MODEL_MAX_TENSOR_BYTES 704643072ull
@@ -2723,6 +2742,7 @@ int ds4_metal_init(void) {
             fprintf(stderr, "ds4: Metal device not available\n");
             return 0;
         }
+        ds4_metal_print_device_summary();
 
         g_queue = [g_device newCommandQueue];
         if (!g_queue) {
