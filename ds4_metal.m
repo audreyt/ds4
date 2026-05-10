@@ -1537,14 +1537,6 @@ static int ds4_metal_encode_cpy_f16_f32_1d(
         NSUInteger           dst_off,
         uint32_t             n);
 
-static int ds4_metal_encode_cpy_q8_0_f32_1d(
-        id<MTLCommandBuffer> cb,
-        id<MTLBuffer>        src,
-        NSUInteger           src_off,
-        id<MTLBuffer>        dst,
-        NSUInteger           dst_off,
-        uint32_t             n);
-
 static int ds4_metal_encode_fill_f32_rows(
         id<MTLCommandBuffer> cb,
         id<MTLBuffer>        buf,
@@ -8786,34 +8778,6 @@ static int ds4_metal_encode_cpy_f16_f32_1d(
 
     id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
     [enc setComputePipelineState:g_cpy_f16_f32_pipeline];
-    [enc setBytes:&args length:sizeof(args) atIndex:0];
-    [enc setBuffer:src offset:src_off atIndex:1];
-    [enc setBuffer:dst offset:dst_off atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
-    ds4_metal_end_compute_encoder(cb, enc);
-
-    return 1;
-}
-
-/* Dequantize a contiguous Q8_0 region into F32.  `n` must be a multiple of
- * QK8_0 (32) and `src_off` must point at a block_q8_0 boundary in src. */
-static int ds4_metal_encode_cpy_q8_0_f32_1d(
-        id<MTLCommandBuffer> cb,
-        id<MTLBuffer>        src,
-        NSUInteger           src_off,
-        id<MTLBuffer>        dst,
-        NSUInteger           dst_off,
-        uint32_t             n) {
-    if (!cb || !src || !dst || n == 0 || (n % 32u) != 0) return 0;
-
-    ds4_metal_cpy_args args =
-        ds4_metal_make_cpy_1d_args(n, /*src_elem_bytes=*/0, sizeof(float));
-    const NSUInteger nth = ds4_metal_cpy_threads(n, g_cpy_q8_0_f32_pipeline);
-    const NSUInteger groups = ((NSUInteger)n + nth - 1u) / nth;
-
-    id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
-    [enc setComputePipelineState:g_cpy_q8_0_f32_pipeline];
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:src offset:src_off atIndex:1];
     [enc setBuffer:dst offset:dst_off atIndex:2];
