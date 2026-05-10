@@ -3234,6 +3234,390 @@ static const char *find_lit_bounded(const char *s, size_t n, const char *lit) {
     return NULL;
 }
 
+typedef enum {
+    DSML_DECODE_OUTSIDE,
+    DSML_DECODE_STRUCTURAL,
+    DSML_DECODE_STRING_BODY,
+    DSML_DECODE_JSON_STRUCTURAL,
+    DSML_DECODE_JSON_STRING,
+} dsml_decode_state;
+
+typedef enum {
+    DSML_TRACK_SEARCH,
+    DSML_TRACK_STRUCTURAL,
+    DSML_TRACK_STRING_BODY,
+    DSML_TRACK_JSON_PARAM,
+    DSML_TRACK_DONE,
+} dsml_track_mode;
+
+typedef struct {
+    const char *tool_calls_start;
+    const char *tool_calls_end;
+    const char *invoke_start;
+    const char *invoke_end;
+    const char *param_start;
+    const char *param_end;
+} dsml_syntax;
+
+static const dsml_syntax dsml_syntaxes[] = {
+    {
+        DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END,
+        DS4_INVOKE_START, DS4_INVOKE_END,
+        DS4_PARAM_START, DS4_PARAM_END,
+    },
+    {
+        DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT,
+        DS4_INVOKE_START_SHORT, DS4_INVOKE_END_SHORT,
+        DS4_PARAM_START_SHORT, DS4_PARAM_END_SHORT,
+    },
+    {
+        "<tool_calls>", "</tool_calls>",
+        "<invoke", "</invoke>",
+        "<parameter", "</parameter>",
+    },
+};
+
+typedef struct {
+    dsml_track_mode mode;
+    dsml_decode_state decode;
+    const dsml_syntax *syn;
+    size_t pos;
+    bool json_in_string;
+    bool json_escaped;
+} dsml_decode_tracker;
+
+static bool raw_partial_lit_min(const char *raw, size_t raw_len, size_t pos,
+                                const char *lit, size_t min_len) {
+    size_t lit_len = strlen(lit);
+    if (!raw || pos > raw_len || raw_len - pos >= lit_len) return false;
+    size_t avail = raw_len - pos;
+    return avail >= min_len && !memcmp(raw + pos, lit, avail);
+}
+
+static size_t dsml_max_tool_start_len(void) {
+    size_t max = 0;
+    for (size_t i = 0; i < sizeof(dsml_syntaxes) / sizeof(dsml_syntaxes[0]); i++) {
+        size_t n = strlen(dsml_syntaxes[i].tool_calls_start);
+        if (n > max) max = n;
+    }
+    return max;
+}
+
+static bool dsml_find_tool_start(const char *raw, size_t raw_len,
+                                 size_t *pos_out,
+                                 const dsml_syntax **syn_out) {
+    const char *best = NULL;
+    const dsml_syntax *best_syn = NULL;
+    for (size_t i = 0; i < sizeof(dsml_syntaxes) / sizeof(dsml_syntaxes[0]); i++) {
+        const char *p = find_lit_bounded(raw, raw_len, dsml_syntaxes[i].tool_calls_start);
+        if (p && (!best || p < best)) {
+            best = p;
+            best_syn = &dsml_syntaxes[i];
+        }
+    }
+    if (!best) return false;
+    *pos_out = (size_t)(best - raw) + strlen(best_syn->tool_calls_start);
+    *syn_out = best_syn;
+    return true;
+}
+
+static bool dsml_find_tool_start_from(const char *raw, size_t raw_len,
+                                      size_t start,
+                                      size_t *pos_out,
+                                      const dsml_syntax **syn_out) {
+    if (start > raw_len) return false;
+    size_t rel = 0;
+    if (!dsml_find_tool_start(raw + start, raw_len - start, &rel, syn_out)) {
+        return false;
+    }
+    *pos_out = start + rel;
+    return true;
+}
+
+static bool dsml_attr_is_string_true(const char *raw, size_t raw_len,
+                                     size_t tag_start, size_t tag_end) {
+    if (tag_end <= tag_start || tag_end > raw_len) return false;
+    char *tag = xstrndup(raw + tag_start, tag_end - tag_start);
+    char *is_string = dsml_attr(tag, "string");
+    bool result = is_string && !strcmp(is_string, "true");
+    free(is_string);
+    free(tag);
+    return result;
+}
+
+#ifdef DS4_SERVER_TEST
+static bool raw_suffix_partial_lit(const char *raw, size_t raw_len,
+                                   const char *lit, size_t min_len) {
+    size_t lit_len = strlen(lit);
+    if (!raw || raw_len == 0 || lit_len == 0) return false;
+    size_t max = raw_len < lit_len ? raw_len : lit_len - 1;
+    for (size_t n = min_len; n <= max; n++) {
+        if (!memcmp(raw + raw_len - n, lit, n)) return true;
+    }
+    return false;
+}
+
+static dsml_decode_state dsml_decode_scan_json_param(const char *raw,
+                                                     size_t raw_len,
+                                                     size_t pos,
+                                                     const dsml_syntax *syn) {
+    bool in_string = false;
+    bool escaped = false;
+    while (pos < raw_len) {
+        if (!in_string && raw_full_lit(raw, raw_len, pos, syn->param_end)) {
+            return DSML_DECODE_STRUCTURAL;
+        }
+        unsigned char c = (unsigned char)raw[pos++];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+        } else if (c == '"') {
+            in_string = true;
+        }
+    }
+    if (!in_string && raw_suffix_partial_lit(raw, raw_len, syn->param_end, 2)) {
+        return DSML_DECODE_STRUCTURAL;
+    }
+    return in_string ? DSML_DECODE_JSON_STRING : DSML_DECODE_JSON_STRUCTURAL;
+}
+
+/* Slow reference recognizer used by tests. */
+static dsml_decode_state dsml_decode_state_for_text(const char *raw, size_t raw_len) {
+    if (!raw || raw_len == 0) return DSML_DECODE_OUTSIDE;
+
+    size_t pos = 0;
+    const dsml_syntax *syn = NULL;
+    if (!dsml_find_tool_start(raw, raw_len, &pos, &syn)) {
+        return DSML_DECODE_OUTSIDE;
+    }
+
+    for (;;) {
+        while (pos < raw_len && isspace((unsigned char)raw[pos])) pos++;
+        if (pos >= raw_len) return DSML_DECODE_STRUCTURAL;
+
+        if (raw_full_lit(raw, raw_len, pos, syn->tool_calls_end)) {
+            return DSML_DECODE_OUTSIDE;
+        }
+        if (raw_full_lit(raw, raw_len, pos, syn->invoke_end)) {
+            pos += strlen(syn->invoke_end);
+            continue;
+        }
+        if (raw_full_lit(raw, raw_len, pos, syn->invoke_start)) {
+            const char *tag_end = memchr(raw + pos, '>', raw_len - pos);
+            if (!tag_end) return DSML_DECODE_STRUCTURAL;
+            pos = (size_t)(tag_end - raw) + 1;
+            continue;
+        }
+        if (raw_full_lit(raw, raw_len, pos, syn->param_start)) {
+            size_t tag_start = pos;
+            const char *tag_end_ptr = memchr(raw + pos, '>', raw_len - pos);
+            if (!tag_end_ptr) return DSML_DECODE_STRUCTURAL;
+            size_t tag_end = (size_t)(tag_end_ptr - raw) + 1;
+            bool string_value = dsml_attr_is_string_true(raw, raw_len, tag_start, tag_end);
+            pos = tag_end;
+
+            if (string_value) {
+                const char *end = find_lit_bounded(raw + pos, raw_len - pos, syn->param_end);
+                if (!end) {
+                    if (raw_suffix_partial_lit(raw, raw_len, syn->param_end, 2)) {
+                        return DSML_DECODE_STRUCTURAL;
+                    }
+                    return DSML_DECODE_STRING_BODY;
+                }
+                pos = (size_t)(end - raw) + strlen(syn->param_end);
+                continue;
+            }
+
+            dsml_decode_state json_state =
+                dsml_decode_scan_json_param(raw, raw_len, pos, syn);
+            if (json_state == DSML_DECODE_STRUCTURAL) {
+                const char *end = find_lit_bounded(raw + pos, raw_len - pos, syn->param_end);
+                if (!end) return DSML_DECODE_STRUCTURAL;
+                pos = (size_t)(end - raw) + strlen(syn->param_end);
+                continue;
+            }
+            return json_state;
+        }
+
+        for (size_t i = 0; i < sizeof(dsml_syntaxes) / sizeof(dsml_syntaxes[0]); i++) {
+            if (raw_partial_lit(raw, raw_len, pos, dsml_syntaxes[i].tool_calls_end) ||
+                raw_partial_lit(raw, raw_len, pos, dsml_syntaxes[i].invoke_start) ||
+                raw_partial_lit(raw, raw_len, pos, dsml_syntaxes[i].invoke_end) ||
+                raw_partial_lit(raw, raw_len, pos, dsml_syntaxes[i].param_start) ||
+                raw_partial_lit(raw, raw_len, pos, dsml_syntaxes[i].param_end))
+            {
+                return DSML_DECODE_STRUCTURAL;
+            }
+        }
+        return DSML_DECODE_STRUCTURAL;
+    }
+}
+#endif
+
+static bool dsml_decode_state_is_tool(dsml_decode_state state) {
+    return state != DSML_DECODE_OUTSIDE;
+}
+
+static bool dsml_decode_state_uses_payload_sampling(dsml_decode_state state) {
+    return state == DSML_DECODE_STRING_BODY || state == DSML_DECODE_JSON_STRING;
+}
+
+static void dsml_decode_tracker_init(dsml_decode_tracker *dt) {
+    memset(dt, 0, sizeof(*dt));
+    dt->mode = DSML_TRACK_SEARCH;
+    dt->decode = DSML_DECODE_OUTSIDE;
+}
+
+/* Track where generation is inside a DSML tool call.  This is intentionally a
+ * forgiving recognizer, not a validator: malformed DSML still gets parsed later
+ * by the normal tool-call parser.  Here we only need enough state to decide
+ * whether the next token belongs to protocol syntax or arbitrary payload. */
+static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
+                                       const char *raw, size_t raw_len) {
+    if (!dt || !raw) return;
+
+    for (;;) {
+        if (dt->mode == DSML_TRACK_DONE) {
+            dt->decode = DSML_DECODE_OUTSIDE;
+            return;
+        }
+
+        if (dt->mode == DSML_TRACK_SEARCH) {
+            size_t pos = 0;
+            const dsml_syntax *syn = NULL;
+            if (!dsml_find_tool_start_from(raw, raw_len, dt->pos, &pos, &syn)) {
+                size_t hold = dsml_max_tool_start_len();
+                dt->pos = raw_len > hold ? raw_len - hold : 0;
+                dt->decode = DSML_DECODE_OUTSIDE;
+                return;
+            }
+            dt->syn = syn;
+            dt->pos = pos;
+            dt->mode = DSML_TRACK_STRUCTURAL;
+            dt->decode = DSML_DECODE_STRUCTURAL;
+        }
+
+        if (dt->mode == DSML_TRACK_STRING_BODY) {
+            while (dt->pos < raw_len) {
+                if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->param_end)) {
+                    dt->pos += strlen(dt->syn->param_end);
+                    dt->mode = DSML_TRACK_STRUCTURAL;
+                    dt->decode = DSML_DECODE_STRUCTURAL;
+                    goto structural;
+                }
+                if (raw_partial_lit_min(raw, raw_len, dt->pos, dt->syn->param_end, 2)) {
+                    dt->decode = DSML_DECODE_STRUCTURAL;
+                    return;
+                }
+                dt->pos++;
+            }
+            dt->decode = DSML_DECODE_STRING_BODY;
+            return;
+        }
+
+        if (dt->mode == DSML_TRACK_JSON_PARAM) {
+            while (dt->pos < raw_len) {
+                if (!dt->json_in_string) {
+                    if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->param_end)) {
+                        dt->pos += strlen(dt->syn->param_end);
+                        dt->mode = DSML_TRACK_STRUCTURAL;
+                        dt->decode = DSML_DECODE_STRUCTURAL;
+                        goto structural;
+                    }
+                    if (raw_partial_lit_min(raw, raw_len, dt->pos, dt->syn->param_end, 2)) {
+                        dt->decode = DSML_DECODE_STRUCTURAL;
+                        return;
+                    }
+                }
+
+                unsigned char c = (unsigned char)raw[dt->pos++];
+                if (dt->json_in_string) {
+                    if (dt->json_escaped) {
+                        dt->json_escaped = false;
+                    } else if (c == '\\') {
+                        dt->json_escaped = true;
+                    } else if (c == '"') {
+                        dt->json_in_string = false;
+                    }
+                } else if (c == '"') {
+                    dt->json_in_string = true;
+                }
+            }
+            dt->decode = dt->json_in_string ?
+                DSML_DECODE_JSON_STRING : DSML_DECODE_JSON_STRUCTURAL;
+            return;
+        }
+
+structural:
+        while (dt->mode == DSML_TRACK_STRUCTURAL) {
+            while (dt->pos < raw_len && isspace((unsigned char)raw[dt->pos])) dt->pos++;
+            if (dt->pos >= raw_len) {
+                dt->decode = DSML_DECODE_STRUCTURAL;
+                return;
+            }
+
+            if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_end)) {
+                dt->mode = DSML_TRACK_DONE;
+                dt->pos += strlen(dt->syn->tool_calls_end);
+                dt->decode = DSML_DECODE_OUTSIDE;
+                return;
+            }
+            if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->invoke_end)) {
+                dt->pos += strlen(dt->syn->invoke_end);
+                continue;
+            }
+            if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->invoke_start)) {
+                const char *tag_end = memchr(raw + dt->pos, '>', raw_len - dt->pos);
+                if (!tag_end) {
+                    dt->decode = DSML_DECODE_STRUCTURAL;
+                    return;
+                }
+                dt->pos = (size_t)(tag_end - raw) + 1;
+                continue;
+            }
+            if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->param_start)) {
+                size_t tag_start = dt->pos;
+                const char *tag_end = memchr(raw + dt->pos, '>', raw_len - dt->pos);
+                if (!tag_end) {
+                    dt->decode = DSML_DECODE_STRUCTURAL;
+                    return;
+                }
+                size_t tag_after = (size_t)(tag_end - raw) + 1;
+                bool string_value = dsml_attr_is_string_true(raw, raw_len, tag_start, tag_after);
+                dt->pos = tag_after;
+                if (string_value) {
+                    dt->mode = DSML_TRACK_STRING_BODY;
+                    dt->decode = DSML_DECODE_STRING_BODY;
+                } else {
+                    dt->mode = DSML_TRACK_JSON_PARAM;
+                    dt->json_in_string = false;
+                    dt->json_escaped = false;
+                    dt->decode = DSML_DECODE_JSON_STRUCTURAL;
+                }
+                break;
+            }
+
+            if (raw_partial_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_end) ||
+                raw_partial_lit(raw, raw_len, dt->pos, dt->syn->invoke_start) ||
+                raw_partial_lit(raw, raw_len, dt->pos, dt->syn->invoke_end) ||
+                raw_partial_lit(raw, raw_len, dt->pos, dt->syn->param_start) ||
+                raw_partial_lit(raw, raw_len, dt->pos, dt->syn->param_end))
+            {
+                dt->decode = DSML_DECODE_STRUCTURAL;
+                return;
+            }
+
+            dt->decode = DSML_DECODE_STRUCTURAL;
+            return;
+        }
+    }
+}
+
 static size_t dsml_entity_stream_safe_len(const char *raw, size_t start, size_t limit) {
     static const char *ents[] = {"&amp;", "&lt;", "&gt;", "&quot;", "&apos;"};
     const size_t max_ent = 6;
@@ -6243,11 +6627,14 @@ static void generate_job(server *s, job *j) {
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
+    dsml_decode_tracker dsml_tracker;
+    dsml_decode_tracker_init(&dsml_tracker);
 
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
-        const bool in_tool_call = j->req.kind == REQ_CHAT && j->req.has_tools &&
-                                  saw_tool_start && !saw_tool_end;
+        dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
+            dsml_tracker.decode : DSML_DECODE_OUTSIDE;
+        const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
         float top_p = j->req.top_p;
@@ -6258,7 +6645,9 @@ static void generate_job(server *s, job *j) {
             top_p = 1.0f;
             min_p = 0.0f;
         }
-        if (in_tool_call) temperature = 0.0f;
+        if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
+            temperature = 0.0f;
+        }
         int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
         if (token == ds4_token_eos(s->engine)) {
             finish = "stop";
@@ -6308,6 +6697,9 @@ static void generate_job(server *s, job *j) {
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
             thinking_state_feed(&thinking, piece, piece_len);
+            if (j->req.kind == REQ_CHAT && j->req.has_tools) {
+                dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
+            }
 
             size_t stop_pos = 0, stop_len = 0;
             bool hit_stop = stop_list_find_from(&j->req.stops, text.ptr,
@@ -8368,6 +8760,69 @@ static void test_exact_dsml_tool_replay_can_be_disabled(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+static void test_dsml_decode_state_separates_structure_and_payload(void) {
+    dsml_decode_tracker tracker;
+    dsml_decode_tracker_init(&tracker);
+
+    const char *prefix =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"edit\">\n";
+    TEST_ASSERT(dsml_decode_state_for_text(prefix, strlen(prefix)) ==
+                DSML_DECODE_STRUCTURAL);
+    dsml_decode_tracker_update(&tracker, prefix, strlen(prefix));
+    TEST_ASSERT(tracker.decode == DSML_DECODE_STRUCTURAL);
+
+    const char *path_param =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"edit\">\n"
+        DS4_PARAM_START " name=\"path\" string=\"true\">/tmp/a.py";
+    TEST_ASSERT(dsml_decode_state_for_text(path_param, strlen(path_param)) ==
+                DSML_DECODE_STRING_BODY);
+    dsml_decode_tracker_update(&tracker, path_param, strlen(path_param));
+    TEST_ASSERT(tracker.decode == DSML_DECODE_STRING_BODY);
+
+    const char *path_closing =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"edit\">\n"
+        DS4_PARAM_START " name=\"path\" string=\"true\">/tmp/a.py</";
+    TEST_ASSERT(dsml_decode_state_for_text(path_closing, strlen(path_closing)) ==
+                DSML_DECODE_STRUCTURAL);
+    dsml_decode_tracker_update(&tracker, path_closing, strlen(path_closing));
+    TEST_ASSERT(tracker.decode == DSML_DECODE_STRUCTURAL);
+
+    const char *json_struct =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"edit\">\n"
+        DS4_PARAM_START " name=\"edits\" string=\"false\">[{";
+    TEST_ASSERT(dsml_decode_state_for_text(json_struct, strlen(json_struct)) ==
+                DSML_DECODE_JSON_STRUCTURAL);
+    dsml_decode_tracker_init(&tracker);
+    dsml_decode_tracker_update(&tracker, json_struct, strlen(json_struct));
+    TEST_ASSERT(tracker.decode == DSML_DECODE_JSON_STRUCTURAL);
+
+    const char *json_string =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"edit\">\n"
+        DS4_PARAM_START " name=\"edits\" string=\"false\">[{\"newText\":\"for i in";
+    TEST_ASSERT(dsml_decode_state_for_text(json_string, strlen(json_string)) ==
+                DSML_DECODE_JSON_STRING);
+    dsml_decode_tracker_update(&tracker, json_string, strlen(json_string));
+    TEST_ASSERT(tracker.decode == DSML_DECODE_JSON_STRING);
+
+    const char *done =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"edit\">\n"
+        DS4_PARAM_START " name=\"edits\" string=\"false\">[]"
+        DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    TEST_ASSERT(dsml_decode_state_for_text(done, strlen(done)) ==
+                DSML_DECODE_OUTSIDE);
+    dsml_decode_tracker_init(&tracker);
+    dsml_decode_tracker_update(&tracker, done, strlen(done));
+    TEST_ASSERT(tracker.decode == DSML_DECODE_OUTSIDE);
+}
+
 static void test_tool_memory_max_ids_prunes_oldest(void) {
     const char *a_dsml = "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n<｜DSML｜parameter name=\"command\" string=\"true\">a</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
     const char *b_dsml = "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n<｜DSML｜parameter name=\"command\" string=\"true\">b</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
@@ -8880,6 +9335,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
     test_exact_dsml_tool_replay_can_be_disabled();
+    test_dsml_decode_state_separates_structure_and_payload();
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
