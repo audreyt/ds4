@@ -579,6 +579,7 @@ typedef struct {
     bool stream_include_usage;
     ds4_think_mode think_mode;
     bool has_tools;
+    bool prompt_preserves_reasoning;
     tool_replay_stats tool_replay;
 } request;
 
@@ -1883,12 +1884,26 @@ static bool role_is_user_like(const char *role) {
     return !strcmp(role, "user") || !strcmp(role, "tool") || !strcmp(role, "function");
 }
 
+static bool chat_history_uses_tool_context(const chat_msgs *msgs,
+                                           const char *tool_schemas) {
+    if (tool_schemas && tool_schemas[0]) return true;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if ((!strcmp(m->role, "assistant") && m->calls.len > 0) ||
+            !strcmp(m->role, "tool") || !strcmp(m->role, "function"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                      const tool_schema_orders *tool_orders,
                                      ds4_think_mode think_mode) {
     (void)tool_orders;
     const bool think = ds4_think_mode_enabled(think_mode);
-    bool tool_context = tool_schemas && tool_schemas[0];
+    const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
     int last_user_idx = -1;
     buf system = {0};
     for (int i = 0; i < msgs->len; i++) {
@@ -1900,11 +1915,6 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_user_like(m->role)) last_user_idx = i;
-        if ((!strcmp(m->role, "assistant") && m->calls.len > 0) ||
-            !strcmp(m->role, "tool") || !strcmp(m->role, "function"))
-        {
-            tool_context = true;
-        }
     }
 
     if (tool_schemas && tool_schemas[0]) {
@@ -2124,7 +2134,10 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    r->prompt_text = render_chat_prompt_text(&msgs, r->has_tools ? tool_schemas : NULL,
+    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    r->prompt_preserves_reasoning =
+        chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
@@ -2319,7 +2332,10 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    r->prompt_text = render_chat_prompt_text(&msgs, r->has_tools ? tool_schemas : NULL,
+    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    r->prompt_preserves_reasoning =
+        chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
@@ -2712,6 +2728,86 @@ static void tool_call_json_args_add(buf *args, const char *name, const char *val
     }
 }
 
+/* DSML produced by the model is usually a flat list of typed parameters:
+ *
+ *   <parameter name="path" string="true">/tmp/x</parameter>
+ *   <parameter name="timeout" string="false">10</parameter>
+ *
+ * Long generations sometimes drift into a looser XML-ish shape, omitting the
+ * outer string attribute and putting child parameters inside it.  The server
+ * does not know client tool schemas, so it cannot make that semantically
+ * perfect.  Still, returning a structured JSON value lets the client/tool layer
+ * reject or repair the call, which is much better than aborting the assistant
+ * turn and losing the whole sampled continuation.
+ */
+static bool dsml_parse_leaf_param_json(const char **p_in, const char *param_start,
+                                       const char *param_end, buf *out) {
+    const char *p = *p_in;
+    if (strncmp(p, param_start, strlen(param_start)) != 0) return false;
+    const char *tag_end = strchr(p, '>');
+    if (!tag_end) return false;
+
+    char *tag = xstrndup(p, (size_t)(tag_end - p + 1));
+    char *name = dsml_attr(tag, "name");
+    char *is_string = dsml_attr(tag, "string");
+    free(tag);
+    if (!name) {
+        free(is_string);
+        return false;
+    }
+
+    const char *value_start = tag_end + 1;
+    const char *value_end = strstr(value_start, param_end);
+    if (!value_end) {
+        free(name);
+        free(is_string);
+        return false;
+    }
+
+    char *raw_value = xstrndup(value_start, (size_t)(value_end - value_start));
+    const char *type = is_string ? is_string : "true";
+    char *value = !strcmp(type, "true") ?
+        dsml_unescape_text(raw_value) : xstrdup(raw_value);
+    tool_call_json_args_add(out, name, value, type);
+
+    free(name);
+    free(is_string);
+    free(raw_value);
+    free(value);
+    *p_in = value_end + strlen(param_end);
+    return true;
+}
+
+static bool dsml_parse_nested_params_object(const char **p_in,
+                                            const char *param_start,
+                                            const char *param_end,
+                                            buf *out) {
+    const char *p = *p_in;
+    buf members = {0};
+    bool any = false;
+
+    for (;;) {
+        p = skip_ascii_ws(p);
+        if (strncmp(p, param_start, strlen(param_start)) != 0) break;
+        if (!dsml_parse_leaf_param_json(&p, param_start, param_end, &members)) {
+            buf_free(&members);
+            return false;
+        }
+        any = true;
+    }
+
+    if (!any) {
+        buf_free(&members);
+        return false;
+    }
+    buf_putc(out, '{');
+    buf_puts(out, members.ptr ? members.ptr : "");
+    buf_putc(out, '}');
+    buf_free(&members);
+    *p_in = p;
+    return true;
+}
+
 static void split_reasoning_content(const char *text, size_t n, char **content_out, char **reasoning_out) {
     char *s = xstrndup(text ? text : "", n);
     char *body = s;
@@ -2823,7 +2919,7 @@ static bool parse_generated_message(const char *text, char **content_out,
             char *param_name = dsml_attr(tag, "name");
             char *param_is_string = dsml_attr(tag, "string");
             free(tag);
-            if (!param_name || !param_is_string) {
+            if (!param_name) {
                 free(name);
                 free(param_name);
                 free(param_is_string);
@@ -2831,6 +2927,30 @@ static bool parse_generated_message(const char *text, char **content_out,
                 return false;
             }
             const char *value_start = tag_end + 1;
+            if (!param_is_string &&
+                !strncmp(skip_ascii_ws(value_start), param_start, strlen(param_start)))
+            {
+                buf nested = {0};
+                const char *nested_p = value_start;
+                if (!dsml_parse_nested_params_object(&nested_p, param_start,
+                                                     param_end, &nested)) {
+                    free(name);
+                    free(param_name);
+                    buf_free(&nested);
+                    buf_free(&args);
+                    return false;
+                }
+                tool_call_json_args_add(&args, param_name,
+                                        nested.ptr ? nested.ptr : "{}",
+                                        "false");
+                buf_free(&nested);
+                p = skip_ascii_ws(nested_p);
+                if (!strncmp(p, param_end, strlen(param_end))) {
+                    p += strlen(param_end);
+                }
+                free(param_name);
+                continue;
+            }
             const char *value_end = strstr(value_start, param_end);
             if (!value_end) {
                 free(name);
@@ -2840,9 +2960,10 @@ static bool parse_generated_message(const char *text, char **content_out,
                 return false;
             }
             char *raw_value = xstrndup(value_start, (size_t)(value_end - value_start));
-            char *value = param_is_string && !strcmp(param_is_string, "true") ?
+            const char *type = param_is_string ? param_is_string : "true";
+            char *value = !strcmp(type, "true") ?
                 dsml_unescape_text(raw_value) : xstrdup(raw_value);
-            tool_call_json_args_add(&args, param_name, value, param_is_string);
+            tool_call_json_args_add(&args, param_name, value, type);
             free(param_name);
             free(param_is_string);
             free(raw_value);
@@ -2860,6 +2981,51 @@ static bool parse_generated_message(const char *text, char **content_out,
         tool_calls_push(calls, tc);
         buf_free(&args);
     }
+}
+
+static const char *tool_parse_failure_recovery_finish(const char *finish) {
+    /* Once DSML failed to parse there is no executable tool call to report.
+     * Preserve a true length stop, because callers can distinguish truncation
+     * from a completed turn.  Every other non-error tool-parse failure becomes
+     * a normal assistant stop with the raw model text returned as content. */
+    if (finish && !strcmp(finish, "length")) return "length";
+    return "stop";
+}
+
+static bool parse_generated_message_for_response(const char *text,
+                                                 bool has_tools,
+                                                 bool saw_tool_start,
+                                                 const char **finish_io,
+                                                 char *err,
+                                                 size_t errlen,
+                                                 char **content_out,
+                                                 char **reasoning_out,
+                                                 tool_calls *calls,
+                                                 bool *recovered_out) {
+    if (recovered_out) *recovered_out = false;
+
+    bool parsed_ok = parse_generated_message(text ? text : "", content_out,
+                                             reasoning_out, calls);
+    if (parsed_ok) return true;
+
+    free(*content_out);
+    free(*reasoning_out);
+    *content_out = xstrdup(text ? text : "");
+    *reasoning_out = NULL;
+    tool_calls_free(calls);
+
+    /* A malformed tool block is model output, not a server failure.  Returning
+     * the sampled text as a regular assistant message keeps the API response
+     * valid and gives the caller enough transcript context to retry or recover
+     * on a later turn, instead of terminating the whole session on
+     * finish_reason="error". */
+    const char *finish = finish_io && *finish_io ? *finish_io : "stop";
+    if (has_tools && saw_tool_start && strcmp(finish, "error") != 0) {
+        if (finish_io) *finish_io = tool_parse_failure_recovery_finish(finish);
+        if (err && errlen) snprintf(err, errlen, "invalid tool call");
+        if (recovered_out) *recovered_out = true;
+    }
+    return false;
 }
 
 static void append_json_object_string(buf *b, const char *json) {
@@ -4469,6 +4635,10 @@ static void server_log(ds4_log_type type, const char *fmt, ...) {
 typedef struct job job;
 
 typedef struct {
+    /* The file name is the rendered byte prefix, not the token sequence.  The
+     * payload still carries the exact tokens and graph state; the hash only
+     * answers "does this checkpoint represent the bytes at the front of the
+     * incoming prompt?" */
     char sha[41];
     char *path;
     uint8_t quant_bits;
@@ -4904,8 +5074,9 @@ static void apply_openai_stream_tool_ids(tool_calls *calls,
  * The server has one live Metal session.  We persist reusable DS4 session
  * snapshots when a cold prompt reaches a useful prefix, when a long continued
  * conversation has grown far enough, and when a request evicts the live session.
- * The cache key is the SHA1 of the token IDs, not text: chat templates, JSON
- * formatting, and UTF-8 spelling are all irrelevant after tokenization.
+ * The cache key is the SHA1 of the rendered byte prefix.  The payload still
+ * stores exact token IDs and graph state; the filename only selects a checkpoint
+ * whose decoded transcript bytes are a prefix of the next rendered request.
  *
  * Files are loaded with plain read/write I/O into the existing graph tensors;
  * mmap is deliberately avoided here so cache restore cannot add more VM
@@ -4926,11 +5097,10 @@ static void apply_openai_stream_tool_ids(tool_calls *calls,
  *   DS4 engine payload written by ds4_session_save_payload()
  *   optional tool-id map section
  *
- * The filename is SHA1(token ids), not SHA1(text).  The text field is only for
- * observability when looking at a cache directory.  The optional tool-id map is
- * not part of model state, but it is needed to render future client JSON back
- * to the exact DSML sampled by the model.  We persist only mappings whose DSML
- * block appears in the saved rendered text.
+ * The filename is SHA1(rendered text bytes), not SHA1(token ids).  The optional
+ * tool-id map is not part of model state, but it is needed to render future
+ * client JSON back to the exact DSML sampled by the model.  We persist only
+ * mappings whose DSML block appears in the saved rendered text.
  */
 
 #define KV_CACHE_MAGIC0 'K'
@@ -4941,10 +5111,11 @@ static void apply_openai_stream_tool_ids(tool_calls *calls,
 #define KV_CACHE_DEFAULT_MIN_TOKENS 512
 #define KV_CACHE_DEFAULT_COLD_MAX_TOKENS 30000
 /* Tokenizers may merge text across the prompt boundary.  Trimming a small tail
- * makes the persisted prefix more likely to remain a token prefix after more
- * user text is appended.  The 2048 alignment also matches the Metal prefill
- * chunk schedule, which keeps compressor row finalization identical to a cold
- * full prompt. */
+ * still improves the cheap token-prefix path, while text-prefix lookup handles
+ * the cases where canonical prompt tokenization spells the same bytes
+ * differently.  The 2048 alignment also matches the Metal prefill chunk
+ * schedule, which keeps compressor row finalization identical to a cold full
+ * prompt. */
 #define KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS 32
 #define KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS 2048
 #define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 10000
@@ -5112,14 +5283,10 @@ static void hex20(const uint8_t in[20], char out[41]) {
     out[40] = '\0';
 }
 
-static void sha1_tokens_hex(const ds4_tokens *tokens, int n, char out[41]) {
+static void sha1_bytes_hex(const void *ptr, size_t len, char out[41]) {
     sha1_ctx c;
     sha1_init(&c);
-    for (int i = 0; i < n; i++) {
-        uint8_t b[4];
-        le_put32(b, (uint32_t)tokens->v[i]);
-        sha1_update(&c, b, sizeof(b));
-    }
+    sha1_update(&c, ptr, len);
     uint8_t digest[20];
     sha1_final(&c, digest);
     hex20(digest, out);
@@ -5505,32 +5672,18 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
     id_list_free(&wanted);
 }
 
-static bool kv_entry_is_live_continued_prefix(const kv_entry *e, const ds4_tokens *live) {
-    if (!e || e->reason != KV_REASON_CONTINUED) return false;
-    if (!live || (int)e->tokens >= live->len) return false;
-    char sha[41];
-    sha1_tokens_hex(live, (int)e->tokens, sha);
-    return !strcmp(sha, e->sha);
-}
-
 static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live) {
     if (!e || e->file_size == 0) return 0.0;
+    (void)live;
     /*
      * Hits count successful disk reuses, but a fresh snapshot is still useful:
      * it may be the only copy of the session that is about to be evicted from
-     * RAM.  Use hits+1 for eviction value so a just-written checkpoint does not
-     * get deleted immediately just because its persisted hit counter is still 0.
+     * RAM.  Continued checkpoints are deliberately aligned restart frontiers,
+     * so do not demote them just because they are a prefix of the live session.
+     * Use hits+1 for eviction value so a just-written checkpoint does not get
+     * deleted immediately just because its persisted hit counter is still 0.
      */
-    double score = ((double)e->hits + 1.0) * (double)e->tokens / (double)e->file_size;
-    if (kv_entry_is_live_continued_prefix(e, live)) {
-        /* A continued checkpoint that is already a strict prefix of the live
-         * RAM session is only a crash fallback.  Under pressure, cold prefixes
-         * and non-dominated branch points are more valuable. */
-        double depth = (double)e->tokens / (double)live->len;
-        score *= e->hits ? 0.25 : 0.02;
-        score *= depth;
-    }
-    return score;
+    return ((double)e->hits + 1.0) * (double)e->tokens / (double)e->file_size;
 }
 
 static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live) {
@@ -5613,10 +5766,37 @@ static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, si
     return buf_take(&b);
 }
 
+static bool byte_prefix_match(const char *text, size_t text_len,
+                              const char *prefix, size_t prefix_len) {
+    return prefix_len <= text_len &&
+           (prefix_len == 0 || memcmp(text, prefix, prefix_len) == 0);
+}
+
 static void tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n) {
     dst->len = 0;
     if (n > src->len) n = src->len;
     for (int i = 0; i < n; i++) ds4_tokens_push(dst, src->v[i]);
+}
+
+static void tokens_append(ds4_tokens *dst, const ds4_tokens *src) {
+    if (!dst || !src) return;
+    for (int i = 0; i < src->len; i++) ds4_tokens_push(dst, src->v[i]);
+}
+
+static void build_prompt_from_exact_prefix_and_text_suffix(
+        ds4_engine *engine,
+        const ds4_tokens *exact_prefix,
+        const char *suffix_text,
+        ds4_tokens *out)
+{
+    ds4_tokens_copy(out, exact_prefix);
+
+    ds4_tokens suffix = {0};
+    /* The suffix may start with DS4 chat markers such as <｜User｜> or
+     * </think>, so use the rendered-chat tokenizer, not plain text BPE. */
+    ds4_tokenize_rendered_chat(engine, suffix_text ? suffix_text : "", &suffix);
+    tokens_append(out, &suffix);
+    ds4_tokens_free(&suffix);
 }
 
 static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
@@ -5630,17 +5810,74 @@ static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
     return tokens;
 }
 
-/* A same-token file can be reused by a larger context, but not by a smaller
- * one: the payload was validated against the context capacity recorded in the
- * file.  If the existing file cannot be used by this server, replace it so this
- * context can still populate its own cache. */
-static bool kv_cache_existing_compatible(kv_disk_cache *kc, const char *path, int quant_bits, int ctx_size) {
+static int kv_cache_continued_step(const kv_disk_cache *kc) {
+    if (!kc->enabled || kc->opt.continued_interval_tokens <= 0) return 0;
+    int step = kc->opt.continued_interval_tokens;
+    const int align = kc->opt.boundary_align_tokens;
+    if (align > 0) {
+        step = ((step + align - 1) / align) * align;
+        if (step <= 0) step = align;
+    }
+    return step;
+}
+
+static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens) {
+    const int step = kv_cache_continued_step(kc);
+    if (step <= 0) return 0;
+    if (live_tokens < kc->opt.min_tokens) return 0;
+
+    /* Continued checkpoints cannot roll the live graph backward.  Save only
+     * at absolute aligned frontiers, not relative to the last cold/evict file.
+     * Otherwise an early cold checkpoint can shift the whole schedule and leave
+     * long generations with no recent durable restart point. */
+    if (live_tokens % step != 0) return 0;
+    if (live_tokens <= kc->continued_last_store_tokens) return 0;
+    return live_tokens;
+}
+
+/* A same-text-prefix file can be reused by a larger context, but not by a
+ * smaller one: the payload was validated against the context capacity recorded
+ * in the file.  If the existing file cannot be used by this server, replace it
+ * so this context can still populate its own cache. */
+static bool kv_cache_file_text_matches(const char *path, const char sha[41],
+                                       const char *text, size_t text_len) {
+    if (text_len > UINT32_MAX) return false;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return false;
+
+    kv_entry hdr = {0};
+    uint32_t text_bytes = 0;
+    bool ok = kv_read_header(fp, &hdr, &text_bytes) &&
+              text_bytes == (uint32_t)text_len;
+    char *stored = NULL;
+    if (ok) {
+        stored = xmalloc((size_t)text_bytes + 1);
+        ok = fread(stored, 1, text_bytes, fp) == text_bytes;
+    }
+    fclose(fp);
+    if (!ok) {
+        free(stored);
+        return false;
+    }
+
+    char stored_sha[41];
+    sha1_bytes_hex(stored, text_bytes, stored_sha);
+    ok = !strcmp(stored_sha, sha) &&
+         (text_len == 0 || memcmp(stored, text, text_len) == 0);
+    free(stored);
+    return ok;
+}
+
+static bool kv_cache_existing_compatible(kv_disk_cache *kc, const char *path,
+                                         const char sha[41],
+                                         const char *text, size_t text_len,
+                                         int quant_bits, int ctx_size) {
     if (access(path, F_OK) != 0) return false;
     kv_entry e = {0};
-    char dummy_sha[41] = "0000000000000000000000000000000000000000";
-    if (!kv_read_entry_file(path, dummy_sha, &e)) return false;
+    if (!kv_read_entry_file(path, sha, &e)) return false;
     bool compatible = (!kc->reject_different_quant || e.quant_bits == (uint8_t)quant_bits) &&
-                      e.ctx_size <= (uint32_t)ctx_size;
+                      e.ctx_size <= (uint32_t)ctx_size &&
+                      kv_cache_file_text_matches(path, sha, text, text_len);
     kv_entry_free(&e);
     if (!compatible) {
         if (unlink(path) == 0) {
@@ -5691,12 +5928,8 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     ds4_tokens store_tokens = {0};
     tokens_copy_prefix(&store_tokens, tokens, store_len);
 
-    char sha[41];
-    sha1_tokens_hex(&store_tokens, store_tokens.len, sha);
-    char *path = kv_path_for_sha(kc, sha);
     const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
     if (quant_bits != 2 && quant_bits != 4) {
-        free(path);
         ds4_tokens_free(&store_tokens);
         return false;
     }
@@ -5714,14 +5947,12 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
                    store_tokens.len,
                    reason,
                    live_tokens ? live_tokens->len : -1);
-        free(path);
         ds4_tokens_free(&store_tokens);
         return false;
     }
 
     uint64_t payload_bytes = ds4_session_payload_bytes(s->session);
     if (payload_bytes == 0) {
-        free(path);
         ds4_tokens_free(&store_tokens);
         return false;
     }
@@ -5731,12 +5962,16 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     if (text_len > UINT32_MAX) {
         server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache skipped tokens=%d because rendered text is too large", store_tokens.len);
         free(text);
-        free(path);
         ds4_tokens_free(&store_tokens);
         return false;
     }
 
-    if (kv_cache_existing_compatible(kc, path, quant_bits, ds4_session_ctx(s->session))) {
+    char sha[41];
+    sha1_bytes_hex(text, text_len, sha);
+    char *path = kv_path_for_sha(kc, sha);
+
+    if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
+                                     quant_bits, ds4_session_ctx(s->session))) {
         kv_cache_rewrite_tool_map(s, path, text);
         free(text);
         free(path);
@@ -5821,39 +6056,51 @@ static void kv_cache_note_store(kv_disk_cache *kc, int tokens) {
 
 static void kv_cache_maybe_store_continued(server *s) {
     kv_disk_cache *kc = &s->kv;
-    if (!kc->enabled || kc->opt.continued_interval_tokens <= 0) return;
     const ds4_tokens *tokens = ds4_session_tokens(s->session);
-    if (!tokens || tokens->len < kc->opt.min_tokens) return;
-    if (tokens->len - kc->continued_last_store_tokens < kc->opt.continued_interval_tokens) return;
-    if (kv_cache_store_live_prefix(s, tokens, tokens->len, "continued")) {
-        kv_cache_note_store(kc, tokens->len);
+    if (!tokens) return;
+    const int target = kv_cache_continued_store_target(kc, tokens->len);
+    if (target == 0) return;
+    if (kv_cache_store_live_prefix(s, tokens, target, "continued")) {
+        kv_cache_note_store(kc, target);
     }
 }
 
-static int kv_cache_find_prefix(kv_disk_cache *kc, const ds4_tokens *prompt, int quant_bits, int ctx_size) {
+static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
+                                     int quant_bits, int ctx_size) {
+    if (!prompt_text) return -1;
+    const size_t prompt_bytes = strlen(prompt_text);
     kv_cache_refresh(kc);
     int best = -1;
     for (int i = 0; i < kc->len; i++) {
         kv_entry *e = &kc->entry[i];
-        if ((int)e->tokens > prompt->len) continue;
+        if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
         if ((int)e->tokens < kc->opt.min_tokens) continue;
         if ((uint32_t)ctx_size < e->ctx_size) continue;
         if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
-        if (best >= 0 && e->tokens <= kc->entry[best].tokens) continue;
+        if (best >= 0) {
+            kv_entry *b = &kc->entry[best];
+            if (e->text_bytes < b->text_bytes) continue;
+            if (e->text_bytes == b->text_bytes && e->tokens <= b->tokens) continue;
+        }
         char sha[41];
-        sha1_tokens_hex(prompt, (int)e->tokens, sha);
+        sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
         if (!strcmp(sha, e->sha)) best = i;
     }
     return best;
 }
 
-static int kv_cache_try_load_tokens(server *s, const ds4_tokens *prompt, char **loaded_path_out) {
+static int kv_cache_try_load_text(server *s, const char *prompt_text,
+                                  ds4_tokens *effective_prompt,
+                                  char **loaded_path_out) {
     if (loaded_path_out) *loaded_path_out = NULL;
+    if (effective_prompt) effective_prompt->len = 0;
     kv_disk_cache *kc = &s->kv;
-    if (!kc->enabled) return 0;
+    if (!kc->enabled || !prompt_text) return 0;
     const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
     if (quant_bits != 2 && quant_bits != 4) return 0;
-    int idx = kv_cache_find_prefix(kc, prompt, quant_bits, ds4_session_ctx(s->session));
+    const size_t prompt_bytes = strlen(prompt_text);
+    int idx = kv_cache_find_text_prefix(kc, prompt_text, quant_bits,
+                                        ds4_session_ctx(s->session));
     if (idx < 0) return 0;
 
     kv_entry e = kc->entry[idx];
@@ -5866,27 +6113,60 @@ static int kv_cache_try_load_tokens(server *s, const ds4_tokens *prompt, char **
     }
     uint32_t text_bytes = 0;
     kv_entry hdr = {0};
+    const char *fail_reason = "invalid header";
     bool header_ok = kv_read_header(fp, &hdr, &text_bytes);
-    if (header_ok && fseeko(fp, (off_t)text_bytes, SEEK_CUR) != 0) header_ok = false;
+    char *cached_text = NULL;
+    if (header_ok) {
+        if ((uint64_t)text_bytes > prompt_bytes) {
+            header_ok = false;
+            fail_reason = "cached text is longer than prompt";
+        } else {
+            cached_text = xmalloc((size_t)text_bytes + 1);
+            if (fread(cached_text, 1, text_bytes, fp) != text_bytes) {
+                header_ok = false;
+                fail_reason = "truncated cached text";
+            } else {
+                cached_text[text_bytes] = '\0';
+                char text_sha[41];
+                sha1_bytes_hex(cached_text, text_bytes, text_sha);
+                if (strcmp(text_sha, e.sha)) {
+                    header_ok = false;
+                    fail_reason = "cached text hash mismatch";
+                } else if (!byte_prefix_match(prompt_text, prompt_bytes,
+                                              cached_text, text_bytes)) {
+                    header_ok = false;
+                    fail_reason = "cached text prefix mismatch";
+                }
+            }
+        }
+    }
     char err[160] = {0};
     int loaded = 0;
     if (header_ok && ds4_session_load_payload(s->session, fp, hdr.payload_bytes, err, sizeof(err)) == 0) {
         const ds4_tokens *loaded_tokens = ds4_session_tokens(s->session);
-        if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens &&
-            ds4_tokens_starts_with(prompt, loaded_tokens))
-        {
+        if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
             loaded = (int)hdr.tokens;
+            if (effective_prompt) {
+                /* The cache lookup was by bytes, but the graph state is still
+                 * the exact token history stored in the payload.  Build the
+                 * prompt we give ds4_session_sync() from that exact history and
+                 * tokenize only the text suffix after the byte prefix. */
+                build_prompt_from_exact_prefix_and_text_suffix(
+                    s->engine, loaded_tokens, prompt_text + text_bytes,
+                    effective_prompt);
+            }
             if (hdr.ext_flags & KV_EXT_TOOL_MAP) kv_tool_map_load_from_pos(s, fp, NULL);
         } else {
             ds4_session_invalidate(s->session);
             unlink(path);
-            server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache discarded corrupt token prefix %s", path);
+            server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache discarded corrupt text-prefix payload %s", path);
         }
     } else {
-        ds4_session_invalidate(s->session);
-        server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache load failed %s: %s load=%.1f ms",
+        if (header_ok) ds4_session_invalidate(s->session);
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache load failed %s: %s load=%.1f ms",
                    path,
-                   header_ok ? err : "invalid header",
+                   header_ok ? err : fail_reason,
                    (now_sec() - load_t0) * 1000.0);
     }
     fclose(fp);
@@ -5898,21 +6178,52 @@ static int kv_cache_try_load_tokens(server *s, const ds4_tokens *prompt, char **
         if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
             unlink(path);
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: kv cache hit tokens=%d quant=%u load=%.1f ms consumed file=%s",
-                       loaded, hdr.quant_bits, load_ms, path);
+                       "ds4-server: kv cache hit text tokens=%d text=%u quant=%u load=%.1f ms consumed file=%s",
+                       loaded, text_bytes, hdr.quant_bits, load_ms, path);
         } else {
             kv_cache_touch_file(path, hdr.hits + 1);
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: kv cache hit tokens=%d quant=%u load=%.1f ms file=%s",
-                       loaded, hdr.quant_bits, load_ms, path);
+                       "ds4-server: kv cache hit text tokens=%d text=%u quant=%u load=%.1f ms file=%s",
+                       loaded, text_bytes, hdr.quant_bits, load_ms, path);
         }
     }
+    free(cached_text);
     free(path);
     return loaded;
 }
 
-static int kv_cache_try_load(server *s, const request *req, char **loaded_path_out) {
-    return kv_cache_try_load_tokens(s, &req->prompt, loaded_path_out);
+static int kv_cache_try_load(server *s, const request *req,
+                             ds4_tokens *effective_prompt,
+                             char **loaded_path_out) {
+    return kv_cache_try_load_text(s, req ? req->prompt_text : NULL,
+                                  effective_prompt, loaded_path_out);
+}
+
+static int live_text_prefix_prompt(server *s, const request *req,
+                                   ds4_tokens *effective_prompt) {
+    if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    if (!live_tokens || live_tokens->len <= 0) return 0;
+
+    size_t live_text_len = 0;
+    char *live_text = render_tokens_text(s->engine, live_tokens, &live_text_len);
+    const size_t prompt_text_len = strlen(req->prompt_text);
+    if (!byte_prefix_match(req->prompt_text, prompt_text_len,
+                           live_text, live_text_len))
+    {
+        free(live_text);
+        return 0;
+    }
+
+    /* This is the core text-prefix case.  The live graph is authoritative, so
+     * keep its sampled tokenization and tokenize only the request bytes that
+     * come after it.  Reusing req->prompt's token suffix would be wrong: full
+     * prompt BPE may have merged across this byte boundary. */
+    build_prompt_from_exact_prefix_and_text_suffix(
+        s->engine, live_tokens, req->prompt_text + live_text_len,
+        effective_prompt);
+    free(live_text);
+    return live_tokens->len;
 }
 
 /* =========================================================================
@@ -6036,7 +6347,7 @@ static void trace_write_cache_diag(
             "live_tokens_before: %d\n"
             "prompt_tokens: %d\n"
             "live_prompt_common: %d\n"
-            "memory_reusable: %d\n"
+            "memory_token_reusable: %d\n"
             "memory_miss_reason: %s\n"
             "tool_replay: mem=%d disk=%d canonical=%d missing_ids=%d\n"
             "cache_source: %s\n"
@@ -6099,6 +6410,7 @@ static uint64_t trace_begin(
         server *s,
         const job *j,
         int cached,
+        int effective_prompt_tokens,
         const trace_cache_diag *cache_diag,
         const char *cache_source,
         int disk_cached,
@@ -6110,13 +6422,14 @@ static uint64_t trace_begin(
     fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
     trace_time(s->trace);
     fprintf(s->trace,
-            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\nseed: %llu\n",
+            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\nseed: %llu\n",
             j->req.kind == REQ_CHAT ? "chat" : "completion",
             j->req.model ? j->req.model : "",
             j->req.stream ? 1 : 0,
             j->req.has_tools ? 1 : 0,
             ds4_think_mode_name(j->req.think_mode),
             j->req.prompt.len,
+            effective_prompt_tokens,
             cached,
             j->req.max_tokens,
             j->req.temperature,
@@ -6381,6 +6694,114 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
     return buf_take(&suffix);
 }
 
+/* In thinking mode without tools, old assistant reasoning is intentionally not
+ * rendered back into later prompts.  The sampled live graph still contains the
+ * reasoning bytes, so the next request would miss the session cache even though
+ * the conversation prefix is logically the same.  Rewrite the finished turn to
+ * the exact toolless history form that render_chat_prompt_text() will produce:
+ *
+ *   prompt-without-final-<think> + </think> + visible-content + eos
+ *
+ * This is the same policy the prompt renderer already applies.  The only goal
+ * here is to make the live checkpoint match that policy before the next turn. */
+static void canonicalize_thinking_checkpoint(server *s, const job *j, const char *ctx,
+                                             uint64_t trace_id, const char *content) {
+    if (!j->req.prompt_text) return;
+    if (!ds4_think_mode_enabled(j->req.think_mode)) return;
+
+    size_t pt_len = strlen(j->req.prompt_text);
+    const char *think_tag = "<think>";
+    size_t tag_len = strlen(think_tag);
+    if (pt_len < tag_len ||
+        memcmp(j->req.prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
+        return;
+    }
+
+    buf stable_prefix = {0};
+    buf_append(&stable_prefix, j->req.prompt_text, pt_len - tag_len);
+
+    buf rendered = {0};
+    buf_puts(&rendered, stable_prefix.ptr ? stable_prefix.ptr : "");
+    buf_puts(&rendered, "</think>");
+    buf_puts(&rendered, content ? content : "");
+    buf_puts(&rendered, "<｜end▁of▁sentence｜>");
+
+    ds4_tokens stable = {0};
+    ds4_tokens canonical = {0};
+    ds4_tokenize_rendered_chat(s->engine, stable_prefix.ptr ? stable_prefix.ptr : "", &stable);
+    ds4_tokenize_rendered_chat(s->engine, rendered.ptr ? rendered.ptr : "", &canonical);
+    const int live_len = ds4_session_pos(s->session);
+    const int common = ds4_session_common_prefix(s->session, &canonical);
+    if (common == live_len && canonical.len == live_len) goto done;
+
+    if (common < stable.len) {
+        trace_event(s, trace_id,
+                    "thinking checkpoint canonicalization skipped: common=%d stable=%d live=%d canonical=%d",
+                    common, stable.len, live_len, canonical.len);
+        goto done;
+    }
+
+    char err[160] = {0};
+    ds4_session_rewrite_result rr =
+        ds4_session_rewrite_from_common(s->session, &canonical, common,
+                                        err, sizeof(err));
+    if (rr == DS4_SESSION_REWRITE_OK) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: thinking checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d",
+                   ctx, common, live_len, canonical.len);
+        trace_event(s, trace_id,
+                    "thinking checkpoint canonicalized: common=%d live=%d canonical=%d",
+                    common, live_len, canonical.len);
+    } else if (rr == DS4_SESSION_REWRITE_REBUILD_NEEDED) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: thinking checkpoint canonicalization needs rebuild ctx=%s common=%d live=%d canonical=%d reason=\"%s\"",
+                   ctx, common, live_len, canonical.len, err);
+        char *path = NULL;
+        ds4_tokens effective = {0};
+        int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
+                                            &effective, &path);
+        if (loaded == 0) ds4_session_invalidate(s->session);
+
+        char sync_err[160] = {0};
+        const ds4_tokens *sync_prompt = loaded > 0 ? &effective : &canonical;
+        if (ds4_session_sync(s->session, sync_prompt, sync_err, sizeof(sync_err)) == 0) {
+            if (loaded > 0) {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: thinking checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d via=disk cached=%d",
+                           ctx, common, live_len, canonical.len, loaded);
+                trace_event(s, trace_id,
+                            "thinking checkpoint canonicalized via disk: common=%d live=%d canonical=%d cached=%d file=%s",
+                            common, live_len, canonical.len, loaded, path ? path : "");
+            } else {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: thinking checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d via=rebuild",
+                           ctx, common, live_len, canonical.len);
+                trace_event(s, trace_id,
+                            "thinking checkpoint canonicalized via rebuild: common=%d live=%d canonical=%d reason=%s",
+                            common, live_len, canonical.len, err);
+            }
+        } else {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: thinking checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
+                       ctx, common, live_len, canonical.len, sync_err);
+            trace_event(s, trace_id, "thinking checkpoint canonicalization failed after rebuild request: %s", sync_err);
+        }
+        ds4_tokens_free(&effective);
+        free(path);
+    } else {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: thinking checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
+                   ctx, common, live_len, canonical.len, err);
+        trace_event(s, trace_id, "thinking checkpoint canonicalization failed: %s", err);
+    }
+
+done:
+    ds4_tokens_free(&stable);
+    ds4_tokens_free(&canonical);
+    buf_free(&stable_prefix);
+    buf_free(&rendered);
+}
+
 /* After a successful tool-call finish, make the live checkpoint match what the
  * next request will render.  Usually that is just the exact DSML remembered by
  * tool id.  If a client sends a tool call without an id we know, the fallback
@@ -6402,6 +6823,20 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
     const int live_len = ds4_session_pos(s->session);
     const int common = ds4_session_common_prefix(s->session, &canonical);
     if (common == live_len && canonical.len == live_len) goto done;
+
+    size_t live_text_len = 0;
+    char *live_text = render_tokens_text(s->engine, ds4_session_tokens(s->session), &live_text_len);
+    if (live_text_len == rendered.len &&
+        (live_text_len == 0 || memcmp(live_text, rendered.ptr, live_text_len) == 0))
+    {
+        /* The graph already represents the bytes the next request will render.
+         * Token-level canonicalization would only replace a valid sampled
+         * history with a different BPE spelling of the same transcript. */
+        free(live_text);
+        goto done;
+    }
+    free(live_text);
+
     if (common < j->req.prompt.len) {
         trace_event(s, trace_id,
                     "tool checkpoint canonicalization skipped: common=%d prompt=%d live=%d canonical=%d",
@@ -6429,11 +6864,14 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
                    "ds4-server: tool checkpoint canonicalization needs rebuild ctx=%s common=%d live=%d canonical=%d reason=\"%s\"",
                    ctx, common, live_len, canonical.len, err);
         char *path = NULL;
-        int loaded = kv_cache_try_load_tokens(s, &canonical, &path);
+        ds4_tokens effective = {0};
+        int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
+                                            &effective, &path);
         if (loaded == 0) ds4_session_invalidate(s->session);
 
         char sync_err[160] = {0};
-        if (ds4_session_sync(s->session, &canonical, sync_err, sizeof(sync_err)) == 0) {
+        const ds4_tokens *sync_prompt = loaded > 0 ? &effective : &canonical;
+        if (ds4_session_sync(s->session, sync_prompt, sync_err, sizeof(sync_err)) == 0) {
             if (loaded > 0) {
                 server_log(DS4_LOG_KVCACHE,
                            "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d via=disk cached=%d",
@@ -6455,6 +6893,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
                        ctx, common, live_len, canonical.len, sync_err);
             trace_event(s, trace_id, "tool checkpoint canonicalization failed after rebuild request: %s", sync_err);
         }
+        ds4_tokens_free(&effective);
         free(path);
     } else {
         server_log(DS4_LOG_KVCACHE,
@@ -6471,11 +6910,15 @@ done:
 
 /* Execute one request on the worker-owned session.
  *
- * Clients resend full prompts.  The worker first tries the in-memory checkpoint,
- * then the disk KV index, then a cold prefill.  Cold prompt caching is handled
- * before generation: if the stable checkpoint is shorter than the full prompt,
- * we prefill to that boundary, store it, and immediately continue to the real
- * prompt.  The live graph therefore always moves forward. */
+ * Clients resend full prompts as text.  The worker first tries the old exact
+ * token-prefix hit, then a rendered-text prefix hit for the live checkpoint,
+ * then the disk text-prefix index, then a cold prefill.  On text-prefix hits we
+ * build a fresh effective prompt from the checkpoint's exact token history plus
+ * a newly tokenized string suffix; the canonical full-prompt tokens are not
+ * sliced because BPE may merge across the byte boundary.  Cold prompt caching is
+ * handled before generation: if the stable checkpoint is shorter than the full
+ * prompt, we prefill to that boundary, store it, and immediately continue to the
+ * real prompt.  The live graph therefore always moves forward. */
 static void generate_job(server *s, job *j) {
     char err[160];
     err[0] = '\0';
@@ -6486,10 +6929,20 @@ static void generate_job(server *s, job *j) {
         trace_cache_capture(&cache_diag, ds4_session_tokens(s->session),
                             &j->req.prompt, old_pos, common);
     }
+    ds4_tokens effective_prompt = {0};
+    const ds4_tokens *prompt_for_sync = &j->req.prompt;
     int cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
-    const char *cache_source = cached > 0 ? "memory" : "none";
+    const char *cache_source = cached > 0 ? "memory-token" : "none";
     int disk_cached = 0;
     char *disk_cache_path = NULL;
+    if (cached == 0) {
+        int text_cached = live_text_prefix_prompt(s, &j->req, &effective_prompt);
+        if (text_cached > 0) {
+            cached = text_cached;
+            cache_source = "memory-text";
+            prompt_for_sync = &effective_prompt;
+        }
+    }
     if (cached == 0) s->kv.continued_last_store_tokens = 0;
     if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
@@ -6498,22 +6951,25 @@ static void generate_job(server *s, job *j) {
         kv_cache_store_current(s, "evict");
     }
     if (cached == 0) {
-        disk_cached = kv_cache_try_load(s, &j->req, &disk_cache_path);
+        disk_cached = kv_cache_try_load(s, &j->req, &effective_prompt,
+                                        &disk_cache_path);
         if (disk_cached > 0) {
             cached = disk_cached;
-            cache_source = "disk";
+            cache_source = "disk-text";
+            prompt_for_sync = &effective_prompt;
         }
     }
+    const int prompt_tokens = prompt_for_sync->len;
     const double t0 = now_sec();
-    uint64_t trace_id = trace_begin(s, j, cached, &cache_diag, cache_source,
-                                    disk_cached, disk_cache_path);
+    uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
+                                    cache_source, disk_cached, disk_cache_path);
     free(disk_cache_path);
     char ctx_span[48];
-    request_ctx_span(ctx_span, sizeof(ctx_span), cached, j->req.prompt.len);
+    request_ctx_span(ctx_span, sizeof(ctx_span), cached, prompt_tokens);
     server_prefill_progress progress = {
         .srv = s,
         .kind = j->req.kind,
-        .prompt_tokens = j->req.prompt.len,
+        .prompt_tokens = prompt_tokens,
         .cached_tokens = cached,
         .has_tools = j->req.has_tools,
         .t0 = t0,
@@ -6532,33 +6988,35 @@ static void generate_job(server *s, job *j) {
     int cold_store_len = 0;
     if (cached == 0 &&
         s->kv.enabled &&
-        j->req.prompt.len >= s->kv.opt.min_tokens &&
+        prompt_for_sync->len >= s->kv.opt.min_tokens &&
         s->kv.opt.cold_max_tokens > 0 &&
-        j->req.prompt.len <= s->kv.opt.cold_max_tokens)
+        prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
     {
-        cold_store_len = kv_cache_store_len(&s->kv, j->req.prompt.len);
+        cold_store_len = kv_cache_store_len(&s->kv, prompt_for_sync->len);
     }
 
     if (s->kv.enabled &&
         cold_store_len >= s->kv.opt.min_tokens &&
-        cold_store_len < j->req.prompt.len)
+        cold_store_len < prompt_for_sync->len)
     {
         ds4_tokens prefix = {0};
-        tokens_copy_prefix(&prefix, &j->req.prompt, cold_store_len);
+        tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
         if (ds4_session_sync(s->session, &prefix, err, sizeof(err)) != 0) {
             ds4_tokens_free(&prefix);
+            ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(s->session, NULL, NULL);
             trace_event(s, trace_id, "prefill failed: %s", err);
             http_error(j->fd, 500, err);
             return;
         }
-        if (kv_cache_store_live_prefix(s, &j->req.prompt, cold_store_len, "cold")) {
+        if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
             kv_cache_note_store(&s->kv, cold_store_len);
         }
         ds4_tokens_free(&prefix);
     }
 
-    if (ds4_session_sync(s->session, &j->req.prompt, err, sizeof(err)) != 0) {
+    if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
+        ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
         trace_event(s, trace_id, "prefill failed: %s", err);
         http_error(j->fd, 500, err);
@@ -6572,8 +7030,8 @@ static void generate_job(server *s, job *j) {
                req_flags[0] ? " " : "",
                req_flags,
                now_sec() - t0);
-    if (cold_store_len == j->req.prompt.len) {
-        if (kv_cache_store_live_prefix(s, &j->req.prompt, cold_store_len, "cold")) {
+    if (cold_store_len == prompt_for_sync->len) {
+        if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
             kv_cache_note_store(&s->kv, cold_store_len);
         }
     }
@@ -6589,17 +7047,20 @@ static void generate_job(server *s, job *j) {
     if (j->req.stream) {
         if (!sse_headers(j->fd)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: %s ctx=%s sse headers failed", j->req.kind == REQ_CHAT ? "chat" : "completion", ctx_span);
+            ds4_tokens_free(&effective_prompt);
             return;
         }
         if (j->req.api == API_ANTHROPIC &&
             !anthropic_sse_start_live(j->fd, &j->req, id,
-                                      j->req.prompt.len, &anthropic_live)) {
+                                      prompt_tokens, &anthropic_live)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
+            ds4_tokens_free(&effective_prompt);
             return;
         }
         if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
+            ds4_tokens_free(&effective_prompt);
             return;
         }
         if (openai_live_chat) openai_stream_start(&j->req, &openai_live);
@@ -6635,6 +7096,9 @@ static void generate_job(server *s, job *j) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
+        if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
+            kv_cache_maybe_store_continued(s);
+        }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
         float top_p = j->req.top_p;
@@ -6792,9 +7256,6 @@ static void generate_job(server *s, job *j) {
                                     &last_decode_log_t,
                                     &last_decode_log_completion);
                 next_decode_log += 50;
-                if (!(j->req.kind == REQ_CHAT && j->req.has_tools && saw_tool_start)) {
-                    kv_cache_maybe_store_continued(s);
-                }
             }
 
             if (hit_stop) {
@@ -6840,11 +7301,6 @@ static void generate_job(server *s, job *j) {
                             decode_t0,
                             &last_decode_log_t,
                             &last_decode_log_completion);
-        if (strcmp(finish, "error") != 0 &&
-            !(j->req.kind == REQ_CHAT && j->req.has_tools && saw_tool_start))
-        {
-            kv_cache_maybe_store_continued(s);
-        }
     }
 
     if (j->req.stream && !structured_stream && text.len > plain_stream_pos) {
@@ -6857,19 +7313,27 @@ static void generate_job(server *s, job *j) {
     char *parsed_content = NULL;
     char *parsed_reasoning = NULL;
     const char *final_finish = finish;
+    bool recovered_tool_parse_failure = false;
     if (j->req.kind == REQ_CHAT) {
-        bool parsed_ok = parse_generated_message(text.ptr ? text.ptr : "", &parsed_content,
-                                                 &parsed_reasoning, &parsed_calls);
-        if (!parsed_ok) {
-            free(parsed_content);
-            free(parsed_reasoning);
-            parsed_content = xstrdup(text.ptr ? text.ptr : "");
-            parsed_reasoning = NULL;
-            tool_calls_free(&parsed_calls);
-            if (j->req.has_tools && saw_tool_start && strcmp(final_finish, "error") != 0) {
-                final_finish = "error";
-                snprintf(err, sizeof(err), "invalid tool call");
-            }
+        bool parsed_ok = parse_generated_message_for_response(
+            text.ptr ? text.ptr : "",
+            j->req.has_tools,
+            saw_tool_start,
+            &final_finish,
+            err,
+            sizeof(err),
+            &parsed_content,
+            &parsed_reasoning,
+            &parsed_calls,
+            &recovered_tool_parse_failure);
+        if (!parsed_ok && recovered_tool_parse_failure) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: chat ctx=%s invalid tool call returned as assistant text finish=%s",
+                       ctx_span,
+                       final_finish);
+            trace_event(s, trace_id,
+                        "invalid tool call returned as assistant text finish=%s",
+                        final_finish);
         }
         if (parsed_calls.len) {
             if (openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &openai_live);
@@ -6889,6 +7353,12 @@ static void generate_job(server *s, job *j) {
         canonicalize_tool_checkpoint(s, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
+    } else if (j->req.kind == REQ_CHAT && !parsed_calls.len &&
+               !j->req.prompt_preserves_reasoning &&
+               ds4_think_mode_enabled(j->req.think_mode) &&
+               strcmp(final_finish, "error") != 0) {
+        canonicalize_thinking_checkpoint(s, j, ctx_span, trace_id,
+                                         parsed_content ? parsed_content : "");
     }
 
     if (j->req.stream) {
@@ -6901,16 +7371,16 @@ static void generate_job(server *s, job *j) {
             response_ok = openai_sse_finish_live(j->fd, s, &j->req, id, &openai_live,
                                                  text.ptr ? text.ptr : "", text.len,
                                                  &parsed_calls, final_finish,
-                                                 j->req.prompt.len, completion);
+                                                 prompt_tokens, completion);
         } else if (structured_stream) {
             response_ok = sse_chat_finish(j->fd, &j->req, id,
                                           parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                           parsed_reasoning,
                                           &parsed_calls, final_finish,
-                                          j->req.prompt.len, completion);
+                                          prompt_tokens, completion);
         } else {
             response_ok = sse_chunk(j->fd, &j->req, id, NULL, final_finish) &&
-                          sse_done(j->fd, &j->req, id, j->req.prompt.len, completion);
+                          sse_done(j->fd, &j->req, id, prompt_tokens, completion);
         }
         if (!response_ok) {
             server_log(DS4_LOG_DEFAULT,
@@ -6923,13 +7393,13 @@ static void generate_job(server *s, job *j) {
                                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
-                                 j->req.prompt.len, completion);
+                                 prompt_tokens, completion);
     } else {
         final_response(j->fd, &j->req, id,
                        parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                        parsed_reasoning,
                        &parsed_calls, final_finish,
-                       j->req.prompt.len, completion);
+                       prompt_tokens, completion);
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
@@ -6988,12 +7458,12 @@ static void generate_job(server *s, job *j) {
                        now_sec() - t0);
         }
     }
-    if (strcmp(final_finish, "error") != 0) kv_cache_maybe_store_continued(s);
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
     openai_stream_free(&openai_live);
     buf_free(&text);
+    ds4_tokens_free(&effective_prompt);
 }
 
 static bool enqueue(server *s, job *j) {
@@ -7444,7 +7914,7 @@ static void usage(FILE *fp) {
         "  --kv-cache-cold-max-tokens N\n"
         "      Cold first prompts in [min,N] are saved automatically. 0 disables cold saves. Default: 30000\n"
         "  --kv-cache-continued-interval-tokens N\n"
-        "      Save the live conversation after it grows N tokens past the last saved point. 0 disables. Default: 10000\n"
+        "      Save at absolute aligned frontiers spaced about N tokens apart. 0 disables. Default: 10000\n"
         "  --kv-cache-boundary-trim-tokens N\n"
         "      Trim this many tail tokens before cold boundary saves to avoid tokenizer boundary merges. Default: 32\n"
         "  --kv-cache-boundary-align-tokens N\n"
@@ -7458,7 +7928,7 @@ static void usage(FILE *fp) {
         "\n"
         "  Cache triggers:\n"
         "      cold       save a stable prefix of a long first prompt before generation starts\n"
-        "      continued  save the active conversation after it grows by the configured interval\n"
+        "      continued  save absolute aligned restart frontiers during long prefill or generation\n"
         "      evict      save the live conversation before another request replaces it\n"
         "      shutdown   save the live conversation when the server exits cleanly\n"
         "\n"
@@ -8406,6 +8876,12 @@ static void test_render_preserves_reasoning_with_tools(void) {
     TEST_ASSERT(prompt != NULL);
     TEST_ASSERT(strstr(prompt, "<think>tool reasoning</think>") != NULL);
     TEST_ASSERT(strstr(prompt, "<tool_result>/tmp</tool_result>") != NULL);
+    free(prompt);
+
+    prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "<think>tool reasoning</think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "<tool_result>/tmp</tool_result>") != NULL);
 
     free(prompt);
     chat_msgs_free(&msgs);
@@ -8507,6 +8983,71 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
     free(reasoning);
     tool_calls_free(&calls);
     request_free(&r);
+}
+
+static void test_dsml_parser_recovers_loose_nested_parameters(void) {
+    const char *generated =
+        "review done\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"edit\">\n"
+        DS4_PARAM_START " name=\"path\">/private/tmp/tetris.c" DS4_PARAM_END "\n"
+        DS4_PARAM_START " name=\"edits\">\n"
+        DS4_PARAM_START " name=\"oldText\" string=\"true\">old &lt;text&gt;" DS4_PARAM_END "\n"
+        DS4_PARAM_START " name=\"newText\" string=\"true\">new text" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message(generated, &content, &reasoning, &calls));
+    TEST_ASSERT(content && !strcmp(content, "review done"));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "edit"));
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"/private/tmp/tetris.c\"") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"edits\": {") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"oldText\":\"old <text>\"") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"newText\":\"new text\"") != NULL);
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_tool_parse_failure_returns_recoverable_finish(void) {
+    const char *generated =
+        "trying a tool\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START ">\n"
+        DS4_TOOL_CALLS_END;
+
+    char err[128] = {0};
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    const char *finish = "tool_calls";
+    bool recovered = false;
+
+    TEST_ASSERT(!parse_generated_message_for_response(generated,
+                                                       true,
+                                                       true,
+                                                       &finish,
+                                                       err,
+                                                       sizeof(err),
+                                                       &content,
+                                                       &reasoning,
+                                                       &calls,
+                                                       &recovered));
+    TEST_ASSERT(recovered);
+    TEST_ASSERT(!strcmp(finish, "stop"));
+    TEST_ASSERT(!strcmp(err, "invalid tool call"));
+    TEST_ASSERT(content && strstr(content, DS4_TOOL_CALLS_START) != NULL);
+    TEST_ASSERT(reasoning == NULL);
+    TEST_ASSERT(calls.len == 0);
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
 }
 
 static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
@@ -9075,6 +9616,36 @@ static void test_kv_cache_store_len_uses_configured_boundary(void) {
     TEST_ASSERT(kv_cache_store_len(&kc, 3500) == 3500);
 }
 
+static void test_kv_cache_continued_uses_aligned_frontiers(void) {
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();
+
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10239) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
+
+    kc.continued_last_store_tokens = 4096;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
+
+    kc.continued_last_store_tokens = 24576;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30720) == 30720);
+
+    kc.continued_last_store_tokens = 10240;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 18432) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 20480) == 20480);
+
+    kc.opt.boundary_align_tokens = 0;
+    kc.continued_last_store_tokens = 20480;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
+}
+
+static void test_sha1_bytes_hex_matches_known_vector(void) {
+    char sha[41];
+    sha1_bytes_hex("abc", 3, sha);
+    TEST_ASSERT(!strcmp(sha, "a9993e364706816aba3e25717850c26c9cd0d89d"));
+}
+
 static void test_kv_stub_file(const char *dir, const char *sha,
                               uint8_t reason, uint32_t tokens, uint32_t hits,
                               uint64_t last_used, uint64_t payload_bytes) {
@@ -9098,6 +9669,74 @@ static void test_kv_stub_file(const char *dir, const char *sha,
     }
     TEST_ASSERT(fclose(fp) == 0);
     free(path);
+}
+
+static void test_kv_text_stub_file(const char *dir, const char *text,
+                                   uint32_t tokens, uint64_t payload_bytes) {
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (!fp) {
+        free(path);
+        return;
+    }
+
+    uint8_t h[KV_CACHE_FIXED_HEADER];
+    kv_fill_header(h, 2, KV_REASON_COLD, 0, tokens, 0, 32768, 100, 100, payload_bytes);
+    uint8_t text_len[4];
+    le_put32(text_len, (uint32_t)strlen(text));
+    TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+    TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+    TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
+    for (uint64_t i = 0; i < payload_bytes; i++) {
+        TEST_ASSERT(fputc(0, fp) != EOF);
+    }
+    TEST_ASSERT(fclose(fp) == 0);
+    free(path);
+}
+
+static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
+    char tmpl[] = "/tmp/ds4-kv-text-prefix-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *short_text = "transcript prefix";
+    const char *long_text = "transcript prefix with sampled token bytes";
+    test_kv_text_stub_file(dir, short_text, 512, 0);
+    test_kv_text_stub_file(dir, long_text, 768, 0);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    int idx = kv_cache_find_text_prefix(&kc,
+        "transcript prefix with sampled token bytes and suffix",
+        2, 32768);
+    TEST_ASSERT(idx >= 0);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 768);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].text_bytes == strlen(long_text));
+    TEST_ASSERT(kv_cache_find_text_prefix(&kc, "transcript prefiX", 2, 32768) < 0);
+
+    kv_cache_close(&kc);
+    char short_sha[41], long_sha[41];
+    sha1_bytes_hex(short_text, strlen(short_text), short_sha);
+    sha1_bytes_hex(long_text, strlen(long_text), long_sha);
+    char short_name[44], long_name[44];
+    snprintf(short_name, sizeof(short_name), "%.40s.kv", short_sha);
+    snprintf(long_name, sizeof(long_name), "%.40s.kv", long_sha);
+    char *short_path = path_join(dir, short_name);
+    char *long_path = path_join(dir, long_name);
+    unlink(short_path);
+    unlink(long_path);
+    free(short_path);
+    free(long_path);
+    rmdir(dir);
 }
 
 static void test_kv_tool_map_filters_by_dsml_text(void) {
@@ -9267,18 +9906,14 @@ static void test_kv_cache_eviction_values_fresh_snapshots(void) {
     rmdir(dir);
 }
 
-static void test_kv_cache_eviction_penalizes_live_continued_prefixes(void) {
+static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     char tmpl[] = "/tmp/ds4-kv-live-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
-    ds4_tokens live = {0};
-    for (int i = 0; i < 4096; i++) ds4_tokens_push(&live, i);
-
-    char cold_sha[41], continued_sha[41];
-    sha1_tokens_hex(&live, 512, cold_sha);
-    sha1_tokens_hex(&live, 2048, continued_sha);
+    const char *cold_sha = "1111111111111111111111111111111111111111";
+    const char *continued_sha = "2222222222222222222222222222222222222222";
     test_kv_stub_file(dir, cold_sha, KV_REASON_COLD, 512, 0, 200, 2048);
     test_kv_stub_file(dir, continued_sha, KV_REASON_CONTINUED, 2048, 0, 300, 2048);
 
@@ -9293,18 +9928,269 @@ static void test_kv_cache_eviction_penalizes_live_continued_prefixes(void) {
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
-    kv_cache_evict(&kc, &live);
+    kv_cache_evict(&kc, NULL);
 
-    TEST_ASSERT(access(continued_path, F_OK) != 0);
-    TEST_ASSERT(access(cold_path, F_OK) == 0);
+    TEST_ASSERT(access(cold_path, F_OK) != 0);
+    TEST_ASSERT(access(continued_path, F_OK) == 0);
 
     kv_cache_close(&kc);
     unlink(cold_path);
     unlink(continued_path);
     free(cold_path);
     free(continued_path);
-    ds4_tokens_free(&live);
     rmdir(dir);
+}
+
+static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
+    /* Simulate: user sends a single message, thinking mode on, no tools.
+     * Model generates reasoning + content.  The next request will drop the
+     * reasoning from this turn.  Verify that:
+     *   prompt_text[:-len("<think>")] + "</think>" + content + "<|eos|>"
+     * equals what render_chat_prompt_text produces for the history. */
+
+    chat_msgs prefix_msgs = {0};
+    chat_msg user1 = {0};
+    user1.role = xstrdup("user");
+    user1.content = xstrdup("What is 2+2?");
+    chat_msgs_push(&prefix_msgs, user1);
+
+    /* This is what prompt_text looks like for the first generation */
+    char *prompt_text = render_chat_prompt_text(&prefix_msgs, NULL, NULL, DS4_THINK_HIGH);
+    /* prompt_text should end with <think> */
+    size_t pt_len = strlen(prompt_text);
+    TEST_ASSERT(pt_len >= 7);
+    TEST_ASSERT(!memcmp(prompt_text + pt_len - 7, "<think>", 7));
+
+    /* The model generates: reasoning + </think> + content */
+    const char *reasoning = "Let me think... 2+2 = 4";
+    const char *content = "The answer is 4.";
+
+    /* Build the canonical checkpoint text (what we'd produce after canonicalization) */
+    buf canonical = {0};
+    buf_append(&canonical, prompt_text, pt_len - 7);  /* strip <think> */
+    buf_puts(&canonical, "</think>");
+    buf_puts(&canonical, content);
+    buf_puts(&canonical, "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">");
+
+    /* Now build what the NEXT request would render: history includes this
+     * assistant message, plus a new user message.  Extract just the prefix
+     * up to and including the eos of the assistant turn. */
+    chat_msgs history_msgs = {0};
+    chat_msg h_user1 = {0};
+    h_user1.role = xstrdup("user");
+    h_user1.content = xstrdup("What is 2+2?");
+    chat_msgs_push(&history_msgs, h_user1);
+    chat_msg h_asst = {0};
+    h_asst.role = xstrdup("assistant");
+    h_asst.reasoning = xstrdup(reasoning);
+    h_asst.content = xstrdup(content);
+    chat_msgs_push(&history_msgs, h_asst);
+    chat_msg h_user2 = {0};
+    h_user2.role = xstrdup("user");
+    h_user2.content = xstrdup("Thanks!");
+    chat_msgs_push(&history_msgs, h_user2);
+
+    char *future_prompt = render_chat_prompt_text(&history_msgs, NULL, NULL, DS4_THINK_HIGH);
+
+    /* The future prompt should START with our canonical text */
+    size_t clen = canonical.len;
+    TEST_ASSERT(strlen(future_prompt) > clen);
+    TEST_ASSERT(!memcmp(future_prompt, canonical.ptr, clen));
+
+    /* And what comes after is the new user turn + assistant prefix */
+    const char *rest = future_prompt + clen;
+    TEST_ASSERT(strstr(rest, "Thanks!") != NULL);
+    TEST_ASSERT(strstr(rest, "<think>") != NULL);  /* new turn starts thinking */
+
+    /* Verify reasoning is NOT in the future prompt for this turn */
+    const char *asst_turn = strstr(future_prompt, "<" "\xef\xbd\x9c" "Assistant" "\xef\xbd\x9c" ">");
+    TEST_ASSERT(asst_turn != NULL);
+    TEST_ASSERT(strstr(future_prompt, reasoning) == NULL);  /* reasoning dropped */
+
+    free(future_prompt);
+    buf_free(&canonical);
+    free(prompt_text);
+    chat_msgs_free(&prefix_msgs);
+    chat_msgs_free(&history_msgs);
+}
+
+static void test_thinking_canonical_empty_content(void) {
+    /* Edge case: model thinks but produces empty content (e.g. tool-less
+     * thinking where answer is entirely in reasoning).  Canonical should
+     * still be valid: prompt_text[:-7] + "</think><|eos|>" */
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Think about life");
+    chat_msgs_push(&msgs, user);
+
+    char *prompt_text = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    size_t pt_len = strlen(prompt_text);
+
+    /* Build canonical with empty content */
+    buf canonical = {0};
+    buf_append(&canonical, prompt_text, pt_len - 7);
+    buf_puts(&canonical, "</think>");
+    /* empty content */
+    buf_puts(&canonical, "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">");
+
+    /* Future prompt with empty content assistant message */
+    chat_msgs history = {0};
+    chat_msg h_u = {0};
+    h_u.role = xstrdup("user");
+    h_u.content = xstrdup("Think about life");
+    chat_msgs_push(&history, h_u);
+    chat_msg h_a = {0};
+    h_a.role = xstrdup("assistant");
+    h_a.reasoning = xstrdup("Deep thoughts about existence...");
+    h_a.content = xstrdup("");
+    chat_msgs_push(&history, h_a);
+    chat_msg h_u2 = {0};
+    h_u2.role = xstrdup("user");
+    h_u2.content = xstrdup("Continue");
+    chat_msgs_push(&history, h_u2);
+
+    char *future = render_chat_prompt_text(&history, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(strlen(future) > canonical.len);
+    TEST_ASSERT(!memcmp(future, canonical.ptr, canonical.len));
+    /* reasoning dropped */
+    TEST_ASSERT(strstr(future, "Deep thoughts") == NULL);
+
+    free(future);
+    buf_free(&canonical);
+    free(prompt_text);
+    chat_msgs_free(&msgs);
+    chat_msgs_free(&history);
+}
+
+static void test_thinking_canonical_multi_turn(void) {
+    /* Multi-turn: 3 user messages, 2 assistant responses with reasoning.
+     * Both prior assistant turns should have reasoning dropped.
+     * The canonical after the SECOND generation should produce text that
+     * matches the start of a 3rd-turn future prompt. */
+    chat_msgs turn2_prefix = {0};
+    chat_msg u1 = {0};
+    u1.role = xstrdup("user");
+    u1.content = xstrdup("Hello");
+    chat_msgs_push(&turn2_prefix, u1);
+    chat_msg a1 = {0};
+    a1.role = xstrdup("assistant");
+    a1.reasoning = xstrdup("first reasoning");
+    a1.content = xstrdup("Hi there");
+    chat_msgs_push(&turn2_prefix, a1);
+    chat_msg u2 = {0};
+    u2.role = xstrdup("user");
+    u2.content = xstrdup("How are you?");
+    chat_msgs_push(&turn2_prefix, u2);
+
+    /* prompt_text for the 2nd generation (includes 1st assistant turn) */
+    char *prompt_text = render_chat_prompt_text(&turn2_prefix, NULL, NULL, DS4_THINK_HIGH);
+    size_t pt_len = strlen(prompt_text);
+    TEST_ASSERT(!memcmp(prompt_text + pt_len - 7, "<think>", 7));
+
+    /* 1st turn reasoning is already dropped in this prompt_text */
+    TEST_ASSERT(strstr(prompt_text, "first reasoning") == NULL);
+    TEST_ASSERT(strstr(prompt_text, "Hi there") != NULL);
+
+    /* After 2nd generation: canonical drops 2nd reasoning too */
+    const char *content2 = "I'm doing well";
+    buf canonical = {0};
+    buf_append(&canonical, prompt_text, pt_len - 7);
+    buf_puts(&canonical, "</think>");
+    buf_puts(&canonical, content2);
+    buf_puts(&canonical, "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">");
+
+    /* Future: 3rd user message arrives */
+    chat_msgs future_msgs = {0};
+    chat_msg fu1 = {0}; fu1.role = xstrdup("user"); fu1.content = xstrdup("Hello");
+    chat_msgs_push(&future_msgs, fu1);
+    chat_msg fa1 = {0}; fa1.role = xstrdup("assistant");
+    fa1.reasoning = xstrdup("first reasoning");
+    fa1.content = xstrdup("Hi there");
+    chat_msgs_push(&future_msgs, fa1);
+    chat_msg fu2 = {0}; fu2.role = xstrdup("user"); fu2.content = xstrdup("How are you?");
+    chat_msgs_push(&future_msgs, fu2);
+    chat_msg fa2 = {0}; fa2.role = xstrdup("assistant");
+    fa2.reasoning = xstrdup("second reasoning");
+    fa2.content = xstrdup(content2);
+    chat_msgs_push(&future_msgs, fa2);
+    chat_msg fu3 = {0}; fu3.role = xstrdup("user"); fu3.content = xstrdup("Great");
+    chat_msgs_push(&future_msgs, fu3);
+
+    char *future = render_chat_prompt_text(&future_msgs, NULL, NULL, DS4_THINK_HIGH);
+    /* Both reasonings dropped */
+    TEST_ASSERT(strstr(future, "first reasoning") == NULL);
+    TEST_ASSERT(strstr(future, "second reasoning") == NULL);
+    /* Canonical is a prefix of future */
+    TEST_ASSERT(strlen(future) > canonical.len);
+    TEST_ASSERT(!memcmp(future, canonical.ptr, canonical.len));
+
+    free(future);
+    buf_free(&canonical);
+    free(prompt_text);
+    chat_msgs_free(&turn2_prefix);
+    chat_msgs_free(&future_msgs);
+}
+
+static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
+    /* When tools ARE present, reasoning is preserved in re-render.
+     * The thinking canonicalization should NOT fire (has_tools gate),
+     * and the tool canonicalization handles it.  Verify the template
+     * preserves reasoning when tool_context is true. */
+    const char *tool_schemas = "{\"name\":\"bash\"}";
+
+    chat_msgs msgs = {0};
+    chat_msg u = {0};
+    u.role = xstrdup("user");
+    u.content = xstrdup("run ls");
+    chat_msgs_push(&msgs, u);
+
+    char *prompt_text = render_chat_prompt_text(&msgs, tool_schemas, NULL, DS4_THINK_HIGH);
+    size_t pt_len = strlen(prompt_text);
+    TEST_ASSERT(!memcmp(prompt_text + pt_len - 7, "<think>", 7));
+
+    /* With tools, next render KEEPS reasoning */
+    chat_msgs history = {0};
+    chat_msg hu = {0}; hu.role = xstrdup("user"); hu.content = xstrdup("run ls");
+    chat_msgs_push(&history, hu);
+    chat_msg ha = {0}; ha.role = xstrdup("assistant");
+    ha.reasoning = xstrdup("I should run bash");
+    ha.content = xstrdup("Here you go");
+    chat_msgs_push(&history, ha);
+    chat_msg hu2 = {0}; hu2.role = xstrdup("user"); hu2.content = xstrdup("thanks");
+    chat_msgs_push(&history, hu2);
+
+    char *future = render_chat_prompt_text(&history, tool_schemas, NULL, DS4_THINK_HIGH);
+    /* Reasoning IS preserved when tools present */
+    TEST_ASSERT(strstr(future, "I should run bash") != NULL);
+    TEST_ASSERT(strstr(future, "<think>I should run bash</think>") != NULL);
+
+    free(future);
+    free(prompt_text);
+    chat_msgs_free(&msgs);
+    chat_msgs_free(&history);
+}
+
+static void test_thinking_canonical_non_thinking_mode_noop(void) {
+    /* When thinking is disabled (deepseek-chat), prompt_text ends with
+     * </think> not <think>.  The canonicalization should be a no-op
+     * (early return on memcmp check). */
+    chat_msgs msgs = {0};
+    chat_msg u = {0};
+    u.role = xstrdup("user");
+    u.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, u);
+
+    char *prompt_text = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
+    size_t pt_len = strlen(prompt_text);
+    /* Should end with </think>, not <think> */
+    TEST_ASSERT(pt_len >= 8);
+    TEST_ASSERT(!memcmp(prompt_text + pt_len - 8, "</think>", 8));
+    /* Does NOT end with <think> */
+    TEST_ASSERT(memcmp(prompt_text + pt_len - 7, "<think>", 7) != 0);
+
+    free(prompt_text);
+    chat_msgs_free(&msgs);
 }
 
 static void ds4_server_unit_tests_run(void) {
@@ -9331,6 +10217,8 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_handles_multiple_calls();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
+    test_dsml_parser_recovers_loose_nested_parameters();
+    test_tool_parse_failure_returns_recoverable_finish();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
@@ -9339,6 +10227,11 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
+    test_thinking_checkpoint_canonical_matches_future_prompt();
+    test_thinking_canonical_empty_content();
+    test_thinking_canonical_multi_turn();
+    test_thinking_canonical_with_tools_preserves_reasoning();
+    test_thinking_canonical_non_thinking_mode_noop();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();
     test_stop_list_parses_all_sequences();
@@ -9350,8 +10243,11 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
     test_kv_cache_store_len_uses_configured_boundary();
+    test_kv_cache_continued_uses_aligned_frontiers();
+    test_sha1_bytes_hex_matches_known_vector();
+    test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_eviction_values_fresh_snapshots();
-    test_kv_cache_eviction_penalizes_live_continued_prefixes();
+    test_kv_cache_eviction_keeps_aligned_continued_frontiers();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN
