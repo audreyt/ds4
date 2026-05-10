@@ -25,6 +25,8 @@
  */
 
 enum {
+    DS4_METAL_TENSOR_F16     = 1,
+    DS4_METAL_TENSOR_Q8_0    = 8,
     DS4_METAL_TENSOR_Q2_K    = 10,
     DS4_METAL_TENSOR_Q4_K    = 12,
     DS4_METAL_TENSOR_IQ2_XXS = 16,
@@ -39,12 +41,14 @@ static NSMutableArray<id<MTLCommandBuffer>> *g_pending_cbs;
 static id<MTLComputePipelineState> g_set_rows_f32_i32_pipeline;
 static id<MTLComputePipelineState> g_get_rows_f32_pipeline;
 static id<MTLComputePipelineState> g_get_rows_f16_pipeline;
+static id<MTLComputePipelineState> g_get_rows_q8_0_pipeline;
 static id<MTLComputePipelineState> g_get_rows_i32_pipeline;
 static id<MTLComputePipelineState> g_repeat_f32_pipeline;
 static id<MTLComputePipelineState> g_concat_pipeline;
 static id<MTLComputePipelineState> g_cpy_f32_f32_pipeline;
 static id<MTLComputePipelineState> g_cpy_f32_f16_pipeline;
 static id<MTLComputePipelineState> g_cpy_f16_f32_pipeline;
+static id<MTLComputePipelineState> g_cpy_q8_0_f32_pipeline;
 static id<MTLComputePipelineState> g_swiglu_pipeline;
 static id<MTLComputePipelineState> g_add_pipeline;
 static id<MTLComputePipelineState> g_mul_pipeline;
@@ -1382,6 +1386,14 @@ static float ds4_metal_negative_infinity(void) {
     return v.f;
 }
 
+/* Total bytes for `n_elems` of an APE-style weight tensor of `ape_type`.
+ * F32 (0) = 4 bytes/elem; F16 (1) = 2 bytes/elem; Q8_0 (8) = 34 bytes per
+ * QK8_0=32 elements (caller must ensure n_elems is 32-aligned for Q8_0). */
+static uint64_t ds4_metal_ape_bytes(uint32_t ape_type, uint64_t n_elems) {
+    if (ape_type == 8u) return (n_elems / 32u) * 34u;
+    return n_elems * (ape_type == 1u ? 2u : 4u);
+}
+
 static float ds4_metal_positive_infinity(void) {
     union { uint32_t u; float f; } v = { 0x7f800000u };
     return v.f;
@@ -1444,6 +1456,14 @@ static int ds4_metal_encode_cpy_f32_f16_2d(
         uint64_t             dst_row_stride);
 
 static int ds4_metal_encode_cpy_f16_f32_1d(
+        id<MTLCommandBuffer> cb,
+        id<MTLBuffer>        src,
+        NSUInteger           src_off,
+        id<MTLBuffer>        dst,
+        NSUInteger           dst_off,
+        uint32_t             n);
+
+static int ds4_metal_encode_cpy_q8_0_f32_1d(
         id<MTLCommandBuffer> cb,
         id<MTLBuffer>        src,
         NSUInteger           src_off,
@@ -2722,6 +2742,23 @@ int ds4_metal_init(void) {
             return 0;
         }
 
+        fn = [library newFunctionWithName:@"kernel_get_rows_q8_0"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_get_rows_q8_0 function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        g_get_rows_q8_0_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_get_rows_q8_0_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_get_rows_q8_0 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
         fn = [library newFunctionWithName:@"kernel_get_rows_i32"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_get_rows_i32 function not found\n");
@@ -2835,6 +2872,22 @@ int ds4_metal_init(void) {
         g_cpy_f16_f32_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
         if (!g_cpy_f16_f32_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_cpy_f16_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        fn = [library newFunctionWithName:@"kernel_cpy_q8_0_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_cpy_q8_0_f32 function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_cpy_q8_0_f32_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_cpy_q8_0_f32_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_cpy_q8_0_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -3935,12 +3988,14 @@ void ds4_metal_cleanup(void) {
         g_set_rows_f32_i32_pipeline = nil;
         g_get_rows_f32_pipeline = nil;
         g_get_rows_f16_pipeline = nil;
+        g_get_rows_q8_0_pipeline = nil;
         g_get_rows_i32_pipeline = nil;
         g_repeat_f32_pipeline = nil;
         g_concat_pipeline = nil;
         g_cpy_f32_f32_pipeline = nil;
         g_cpy_f32_f16_pipeline = nil;
         g_cpy_f16_f32_pipeline = nil;
+        g_cpy_q8_0_f32_pipeline = nil;
         g_swiglu_pipeline = nil;
         g_add_pipeline = nil;
         g_mul_pipeline = nil;
@@ -4070,7 +4125,9 @@ void ds4_metal_cleanup(void) {
     }
 }
 
-static int ds4_metal_encode_get_rows_f16(
+static int ds4_metal_embed_row_layout(uint32_t, uint32_t, uint64_t *, id<MTLComputePipelineState> *);
+
+static int ds4_metal_encode_get_rows(
         id<MTLCommandBuffer> cb,
         id<MTLBuffer>        weight,
         NSUInteger           weight_offset,
@@ -4080,12 +4137,16 @@ static int ds4_metal_encode_get_rows_f16(
         NSUInteger           out_offset,
         uint32_t             n_vocab,
         uint32_t             n_tokens,
-        uint32_t             n_embd) {
+        uint32_t             n_embd,
+        uint32_t             weight_type) {
     if (!cb || !weight || !tokens || !out || n_vocab == 0 || n_tokens == 0 || n_embd == 0) {
         return 0;
     }
 
-    const uint64_t src_row_bytes = (uint64_t)n_embd * sizeof(uint16_t);
+    uint64_t src_row_bytes = 0;
+    id<MTLComputePipelineState> pipeline = nil;
+    if (!ds4_metal_embed_row_layout(weight_type, n_embd, &src_row_bytes, &pipeline)) return 0;
+
     const uint64_t dst_row_bytes = (uint64_t)n_embd * sizeof(float);
     const uint64_t token_bytes = (uint64_t)n_tokens * sizeof(int32_t);
     ds4_metal_get_rows_args args = {
@@ -4104,13 +4165,13 @@ static int ds4_metal_encode_get_rows_f16(
     };
 
     NSUInteger nth = (NSUInteger)n_embd;
-    const NSUInteger max_threads = g_get_rows_f16_pipeline.maxTotalThreadsPerThreadgroup;
+    const NSUInteger max_threads = pipeline.maxTotalThreadsPerThreadgroup;
     if (nth > max_threads) nth = max_threads;
     if (nth == 0) nth = 1;
     const NSUInteger nw0 = ((NSUInteger)n_embd + nth - 1u) / nth;
 
     id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
-    [enc setComputePipelineState:g_get_rows_f16_pipeline];
+    [enc setComputePipelineState:pipeline];
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:weight offset:weight_offset atIndex:1];
     [enc setBuffer:tokens offset:tokens_offset atIndex:2];
@@ -4168,6 +4229,33 @@ static int ds4_metal_encode_repeat_hc_embedding(
     return 1;
 }
 
+/* Per-row stride and gather pipeline for a token-embedding tensor type.
+ * Returns 0 (and a NULL pipeline) if the type is not supported. */
+static int ds4_metal_embed_row_layout(
+        uint32_t weight_type,
+        uint32_t n_embd,
+        uint64_t *out_src_row_bytes,
+        id<MTLComputePipelineState> *out_pipeline) {
+    switch (weight_type) {
+    case DS4_METAL_TENSOR_F16:
+        *out_src_row_bytes = (uint64_t)n_embd * sizeof(uint16_t);
+        *out_pipeline = g_get_rows_f16_pipeline;
+        return 1;
+    case DS4_METAL_TENSOR_Q8_0:
+        if ((n_embd % 32) != 0) {
+            fprintf(stderr, "ds4: Q8_0 token embedding stride %u is not 32-aligned\n", n_embd);
+            return 0;
+        }
+        /* block_q8_0 is sizeof(half) + 32*sizeof(int8_t) = 34 bytes per QK8_0 elements. */
+        *out_src_row_bytes = (uint64_t)(n_embd / 32) * 34;
+        *out_pipeline = g_get_rows_q8_0_pipeline;
+        return 1;
+    default:
+        fprintf(stderr, "ds4: token embedding type %u not supported by Metal embed\n", weight_type);
+        return 0;
+    }
+}
+
 int ds4_metal_embed_token_hc_tensor(
         ds4_metal_tensor *out_hc,
         const void       *model_map,
@@ -4176,7 +4264,8 @@ int ds4_metal_embed_token_hc_tensor(
         uint32_t          n_vocab,
         uint32_t          token,
         uint32_t          n_embd,
-        uint32_t          n_hc) {
+        uint32_t          n_hc,
+        uint32_t          weight_type) {
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out_hc || !model_map || n_vocab == 0 || token >= n_vocab || n_embd == 0 || n_hc == 0) {
         return 0;
@@ -4190,7 +4279,11 @@ int ds4_metal_embed_token_hc_tensor(
             return 0;
         }
 
-        const uint64_t weight_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
+        uint64_t src_row_bytes = 0;
+        id<MTLComputePipelineState> pipeline = nil;
+        if (!ds4_metal_embed_row_layout(weight_type, n_embd, &src_row_bytes, &pipeline)) return 0;
+
+        const uint64_t weight_bytes = (uint64_t)n_vocab * src_row_bytes;
         if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
             fprintf(stderr, "ds4: Metal graph embedding range is outside the mapped model\n");
             return 0;
@@ -4213,7 +4306,6 @@ int ds4_metal_embed_token_hc_tensor(
         if (!cb) return 0;
 
         const int32_t token_i32 = (int32_t)token;
-        const uint64_t src_row_bytes = (uint64_t)n_embd * sizeof(uint16_t);
         const uint64_t dst_row_bytes = (uint64_t)n_embd * sizeof(float);
         ds4_metal_get_rows_args args = {
             .ne00t = (int32_t)n_embd,
@@ -4230,12 +4322,12 @@ int ds4_metal_embed_token_hc_tensor(
             .nb3 = dst_row_bytes,
         };
         NSUInteger nth = (NSUInteger)n_embd;
-        const NSUInteger max_threads = g_get_rows_f16_pipeline.maxTotalThreadsPerThreadgroup;
+        const NSUInteger max_threads = pipeline.maxTotalThreadsPerThreadgroup;
         if (nth > max_threads) nth = max_threads;
         if (nth == 0) nth = 1;
         const NSUInteger nw0 = ((NSUInteger)n_embd + nth - 1u) / nth;
         id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
-        [enc setComputePipelineState:g_get_rows_f16_pipeline];
+        [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
         [enc setBytes:&token_i32 length:sizeof(token_i32) atIndex:2];
@@ -4270,7 +4362,8 @@ int ds4_metal_embed_tokens_hc_tensor(
         uint32_t                n_vocab,
         uint32_t                n_tokens,
         uint32_t                n_embd,
-        uint32_t                n_hc) {
+        uint32_t                n_hc,
+        uint32_t                weight_type) {
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out_hc || !tokens || !model_map || n_vocab == 0 || n_tokens == 0 || n_embd == 0 || n_hc == 0) {
         return 0;
@@ -4288,7 +4381,11 @@ int ds4_metal_embed_tokens_hc_tensor(
             return 0;
         }
 
-        const uint64_t weight_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
+        uint64_t src_row_bytes = 0;
+        id<MTLComputePipelineState> _row_pipeline = nil;
+        if (!ds4_metal_embed_row_layout(weight_type, n_embd, &src_row_bytes, &_row_pipeline)) return 0;
+
+        const uint64_t weight_bytes = (uint64_t)n_vocab * src_row_bytes;
         if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
             fprintf(stderr, "ds4: Metal graph batched embedding range is outside the mapped model\n");
             return 0;
@@ -4310,16 +4407,17 @@ int ds4_metal_embed_tokens_hc_tensor(
         id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
         if (!cb) return 0;
 
-        if (!ds4_metal_encode_get_rows_f16(cb,
-                                           wbuf,
-                                           (NSUInteger)inner_offset,
-                                           tokbuf,
-                                           ds4_metal_tensor_offset(tokens),
-                                           g_embed_rows_buffer,
-                                           0,
-                                           n_vocab,
-                                           n_tokens,
-                                           n_embd) ||
+        if (!ds4_metal_encode_get_rows(cb,
+                                       wbuf,
+                                       (NSUInteger)inner_offset,
+                                       tokbuf,
+                                       ds4_metal_tensor_offset(tokens),
+                                       g_embed_rows_buffer,
+                                       0,
+                                       n_vocab,
+                                       n_tokens,
+                                       n_embd,
+                                       weight_type) ||
             !ds4_metal_encode_repeat_hc_embedding(cb,
                                                   g_embed_rows_buffer,
                                                   0,
@@ -5328,13 +5426,13 @@ int ds4_metal_matmul_f32_tensor(
         const ds4_metal_tensor *x,
         uint64_t                n_tok) {
     if (!g_initialized && !ds4_metal_init()) return 0;
-    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX || n_tok != 1) return 0;
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
 
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_metal_tensor_buffer(x);
         id<MTLBuffer> outbuf = ds4_metal_tensor_buffer(out);
-        const uint64_t x_bytes = in_dim * sizeof(float);
-        const uint64_t out_bytes = out_dim * sizeof(float);
+        const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+        const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
         if (!xbuf || !outbuf ||
             ds4_metal_tensor_bytes(x) < x_bytes ||
             ds4_metal_tensor_bytes(out) < out_bytes) {
@@ -5356,6 +5454,36 @@ int ds4_metal_matmul_f32_tensor(
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
         if (!cb) return 0;
+
+        if (n_tok > 1) {
+            /* Multi-token prefill path: kernel_mul_mm_f32_f32 mirrors the
+             * existing F16/Q8_0 mul_mm_t instantiations in dense.metal. */
+            const bool bc_inp = (in_dim % 32u) != 0;
+            const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
+            id<MTLComputePipelineState> pipeline =
+                ds4_metal_get_mul_mm_pipeline("kernel_mul_mm_f32_f32", bc_inp, bc_out);
+            if (!pipeline) return 0;
+
+            ds4_metal_mul_mm_args args = ds4_metal_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+
+            id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+            [enc setBuffer:xbuf offset:ds4_metal_tensor_offset(x) atIndex:2];
+            [enc setBuffer:outbuf offset:ds4_metal_tensor_offset(out) atIndex:3];
+            [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
+                                                  ((NSUInteger)out_dim + 63u) / 64u,
+                                                  1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            ds4_metal_end_compute_encoder(cb, enc);
+
+            if (!ds4_metal_finish_command_buffer(cb, owned, "F32 tensor matmul")) {
+                return 0;
+            }
+            return 1;
+        }
 
         ds4_metal_q8_0_matvec_args mv_args = ds4_metal_make_f32_mv_args(in_dim, out_dim, 1);
         ds4_metal_mv_dispatch mv_dispatch = ds4_metal_make_plain_mv_dispatch(in_dim, 1);
@@ -6146,7 +6274,15 @@ static int ds4_metal_encode_compressor_score_with_ape(
         uint32_t             n_tokens) {
     if (!cb || !score_src || !score_dst || !apebuf ||
         width == 0 || ratio == 0 || n_tokens == 0 ||
-        (ape_type != 0u && ape_type != 1u)) {
+        (ape_type != 0u && ape_type != 1u && ape_type != 8u)) {
+        return 0;
+    }
+    /* Q8_0 ape rows must be QK8_0-aligned (the dequant kernel walks whole
+     * blocks and src_off must land on a block boundary). */
+    if (ape_type == 8u && (width % 32u) != 0u) {
+        fprintf(stderr,
+                "ds4: Metal compressor APE Q8_0 width %u is not 32-aligned\n",
+                width);
         return 0;
     }
 
@@ -6164,14 +6300,18 @@ static int ds4_metal_encode_compressor_score_with_ape(
         return 0;
     }
 
-    const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
+    /* Per-row source stride.  F16/F32 use natural element bytes; Q8_0 uses
+     * (width/32) * sizeof(block_q8_0) = (width/32) * 34 bytes. */
+    const uint64_t row_src_bytes = ape_type == 8u
+        ? (uint64_t)(width / 32u) * 34u
+        : (uint64_t)width * (ape_type == 1u ? 2u : 4u);
     uint32_t copied_rows = 0;
     uint32_t pos_mod = pos0 % ratio;
     while (copied_rows < n_tokens) {
         uint32_t seg_rows = ratio - pos_mod;
         if (seg_rows > n_tokens - copied_rows) seg_rows = n_tokens - copied_rows;
         const uint32_t seg_elems = seg_rows * width;
-        const NSUInteger src_off = ape_offset + (NSUInteger)pos_mod * width * elem_ape;
+        const NSUInteger src_off = ape_offset + (NSUInteger)pos_mod * row_src_bytes;
         const NSUInteger dst_off = (NSUInteger)copied_rows * width * sizeof(float);
         int ok;
         if (ape_type == 1u) {
@@ -6181,6 +6321,13 @@ static int ds4_metal_encode_compressor_score_with_ape(
                                                  g_compressor_store_ape_buffer,
                                                  dst_off,
                                                  seg_elems);
+        } else if (ape_type == 8u) {
+            ok = ds4_metal_encode_cpy_q8_0_f32_1d(cb,
+                                                  apebuf,
+                                                  src_off,
+                                                  g_compressor_store_ape_buffer,
+                                                  dst_off,
+                                                  seg_elems);
         } else {
             ok = ds4_metal_encode_cpy_f32_f32_1d(cb,
                                                  apebuf,
@@ -6277,7 +6424,7 @@ static int ds4_metal_compressor_store_one_tensor(
         uint32_t                ratio,
         uint32_t                pos) {
     if (!kv || !sc || !state_kv || !state_score || !model_map ||
-        width == 0 || ratio == 0 || (ape_type != 0u && ape_type != 1u)) {
+        width == 0 || ratio == 0 || (ape_type != 0u && ape_type != 1u && ape_type != 8u)) {
         return 0;
     }
 
@@ -6287,10 +6434,9 @@ static int ds4_metal_compressor_store_one_tensor(
     if (!pipeline) return 0;
 
     const uint32_t state_rows = ratio == 4u ? 2u * ratio : ratio;
-    const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
     const uint64_t row_bytes = (uint64_t)width * sizeof(float);
     const uint64_t state_bytes = (uint64_t)state_rows * row_bytes;
-    const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
+    const uint64_t ape_bytes = ds4_metal_ape_bytes(ape_type, (uint64_t)width * ratio);
     if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
         ds4_metal_tensor_bytes(kv) < row_bytes ||
         ds4_metal_tensor_bytes(sc) < row_bytes ||
@@ -6352,7 +6498,7 @@ int ds4_metal_compressor_store_batch_tensor(
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!kv || !sc || !state_kv || !state_score || !model_map ||
         head_dim == 0 || ratio == 0 || n_tokens == 0 ||
-        (ape_type != 0u && ape_type != 1u)) {
+        (ape_type != 0u && ape_type != 1u && ape_type != 8u)) {
         return 0;
     }
 
@@ -6360,10 +6506,9 @@ int ds4_metal_compressor_store_batch_tensor(
         const uint32_t coff = ratio == 4u ? 2u : 1u;
         const uint32_t width = coff * head_dim;
         const uint32_t state_rows = coff * ratio;
-        const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
         const uint64_t kv_bytes = (uint64_t)n_tokens * width * sizeof(float);
         const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
-        const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
+        const uint64_t ape_bytes = ds4_metal_ape_bytes(ape_type, (uint64_t)width * ratio);
 
         if (ape_offset > model_size || ape_bytes > model_size - ape_offset) {
             fprintf(stderr, "ds4: Metal compressor batch APE range is outside the mapped model\n");
@@ -6427,12 +6572,13 @@ int ds4_metal_compressor_store_batch_tensor(
         int ok = 1;
         uint32_t copied_rows = 0;
         uint32_t pos_mod = pos0 % ratio;
+        const uint64_t row_src_bytes = ds4_metal_ape_bytes(ape_type, (uint64_t)width);
         while (ok && copied_rows < n_tokens) {
             uint32_t seg_rows = ratio - pos_mod;
             if (seg_rows > n_tokens - copied_rows) seg_rows = n_tokens - copied_rows;
             const uint32_t seg_elems = seg_rows * width;
             const NSUInteger src_off = (NSUInteger)ape_inner +
-                                       (NSUInteger)pos_mod * width * elem_ape;
+                                       (NSUInteger)pos_mod * row_src_bytes;
             const NSUInteger dst_off = (NSUInteger)copied_rows * width * sizeof(float);
             if (ape_type == 1u) {
                 ok = ds4_metal_encode_cpy_f16_f32_1d(cb,
@@ -6441,6 +6587,13 @@ int ds4_metal_compressor_store_batch_tensor(
                                                      g_compressor_store_ape_buffer,
                                                      dst_off,
                                                      seg_elems);
+            } else if (ape_type == 8u) {
+                ok = ds4_metal_encode_cpy_q8_0_f32_1d(cb,
+                                                      apebuf,
+                                                      src_off,
+                                                      g_compressor_store_ape_buffer,
+                                                      dst_off,
+                                                      seg_elems);
             } else {
                 ok = ds4_metal_encode_cpy_f32_f32_1d(cb,
                                                      apebuf,
@@ -6995,7 +7148,7 @@ int ds4_metal_compressor_prefill_tensor(
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
         head_dim == 0 || ratio == 0 || n_tokens == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
-        (ape_type != 0u && ape_type != 1u) ||
+        (ape_type != 0u && ape_type != 1u && ape_type != 8u) ||
         norm_type != 0u) {
         return 0;
     }
@@ -7007,11 +7160,10 @@ int ds4_metal_compressor_prefill_tensor(
         const uint32_t n_comp = n_tokens / ratio;
         const uint32_t cutoff = n_comp * ratio;
         const uint32_t rem = n_tokens - cutoff;
-        const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
         const uint64_t kv_bytes = (uint64_t)n_tokens * width * sizeof(float);
         const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
         const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
-        const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
+        const uint64_t ape_bytes = ds4_metal_ape_bytes(ape_type, (uint64_t)width * ratio);
         const uint64_t norm_bytes = (uint64_t)head_dim * sizeof(float);
 
         if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
@@ -7350,7 +7502,7 @@ int ds4_metal_compressor_prefill_ratio4_replay_tensor(
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
         head_dim == 0 || n_tokens == 0 || (n_tokens & 3u) != 0 || (pos0 & 3u) != 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
-        (ape_type != 0u && ape_type != 1u) ||
+        (ape_type != 0u && ape_type != 1u && ape_type != 8u) ||
         norm_type != 0u) {
         return 0;
     }
@@ -7360,11 +7512,10 @@ int ds4_metal_compressor_prefill_ratio4_replay_tensor(
         const uint32_t width = 2u * head_dim;
         const uint32_t state_rows = 8u;
         const uint32_t n_comp = n_tokens / ratio;
-        const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
         const uint64_t kv_bytes = (uint64_t)n_tokens * width * sizeof(float);
         const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
         const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
-        const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
+        const uint64_t ape_bytes = ds4_metal_ape_bytes(ape_type, (uint64_t)width * ratio);
         const uint64_t norm_bytes = (uint64_t)head_dim * sizeof(float);
 
         if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
@@ -7644,7 +7795,7 @@ int ds4_metal_compressor_prefill_state_ratio4_tensor(
         uint32_t                pos0) {
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!state_kv || !state_score || !kv_tail || !sc_tail || !model_map ||
-        head_dim == 0 || (ape_type != 0u && ape_type != 1u)) {
+        head_dim == 0 || (ape_type != 0u && ape_type != 1u && ape_type != 8u)) {
         return 0;
     }
 
@@ -7652,10 +7803,9 @@ int ds4_metal_compressor_prefill_state_ratio4_tensor(
         const uint32_t ratio = 4u;
         const uint32_t width = 2u * head_dim;
         const uint32_t state_rows = 8u;
-        const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
         const uint64_t tail_bytes = (uint64_t)ratio * width * sizeof(float);
         const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
-        const uint64_t ape_bytes = (uint64_t)ratio * width * elem_ape;
+        const uint64_t ape_bytes = ds4_metal_ape_bytes(ape_type, (uint64_t)ratio * width);
 
         if (ape_offset > model_size || ape_bytes > model_size - ape_offset) {
             fprintf(stderr, "ds4: Metal compressor prefill-state APE range is outside the mapped model\n");
@@ -7758,7 +7908,7 @@ int ds4_metal_compressor_update_tensor(
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
         !model_map || head_dim == 0 || ratio == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
-        (ape_type != 0u && ape_type != 1u) ||
+        (ape_type != 0u && ape_type != 1u && ape_type != 8u) ||
         norm_type != 0u) {
         return 0;
     }
@@ -7768,11 +7918,10 @@ int ds4_metal_compressor_update_tensor(
         const uint32_t width = coff * head_dim;
         const uint32_t state_rows = coff * ratio;
         const uint32_t emit = ((pos + 1u) % ratio) == 0u ? 1u : 0u;
-        const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
         const uint64_t kv_bytes = (uint64_t)width * sizeof(float);
         const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
         const uint64_t comp_bytes = (uint64_t)(comp_row + (emit ? 1u : 0u)) * head_dim * sizeof(float);
-        const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
+        const uint64_t ape_bytes = ds4_metal_ape_bytes(ape_type, (uint64_t)width * ratio);
         const uint64_t norm_bytes = (uint64_t)head_dim * sizeof(float);
 
         if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
@@ -8483,6 +8632,34 @@ static int ds4_metal_encode_cpy_f16_f32_1d(
 
     id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
     [enc setComputePipelineState:g_cpy_f16_f32_pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:src offset:src_off atIndex:1];
+    [enc setBuffer:dst offset:dst_off atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+    ds4_metal_end_compute_encoder(cb, enc);
+
+    return 1;
+}
+
+/* Dequantize a contiguous Q8_0 region into F32.  `n` must be a multiple of
+ * QK8_0 (32) and `src_off` must point at a block_q8_0 boundary in src. */
+static int ds4_metal_encode_cpy_q8_0_f32_1d(
+        id<MTLCommandBuffer> cb,
+        id<MTLBuffer>        src,
+        NSUInteger           src_off,
+        id<MTLBuffer>        dst,
+        NSUInteger           dst_off,
+        uint32_t             n) {
+    if (!cb || !src || !dst || n == 0 || (n % 32u) != 0) return 0;
+
+    ds4_metal_cpy_args args =
+        ds4_metal_make_cpy_1d_args(n, /*src_elem_bytes=*/0, sizeof(float));
+    const NSUInteger nth = ds4_metal_cpy_threads(n, g_cpy_q8_0_f32_pipeline);
+    const NSUInteger groups = ((NSUInteger)n + nth - 1u) / nth;
+
+    id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+    [enc setComputePipelineState:g_cpy_q8_0_f32_pipeline];
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:src offset:src_off atIndex:1];
     [enc setBuffer:dst offset:dst_off atIndex:2];

@@ -47,6 +47,7 @@ void ds4_metal_print_memory_report(const char *label);
  * compressed-attention indexer that chooses visible compressed rows.
  */
 
+/* `weight_type` is the GGUF tensor type code (1 for F16, 8 for Q8_0). */
 int ds4_metal_embed_token_hc_tensor(
         ds4_metal_tensor *out_hc,
         const void       *model_map,
@@ -55,7 +56,8 @@ int ds4_metal_embed_token_hc_tensor(
         uint32_t          n_vocab,
         uint32_t          token,
         uint32_t          n_embd,
-        uint32_t          n_hc);
+        uint32_t          n_hc,
+        uint32_t          weight_type);
 
 int ds4_metal_embed_tokens_hc_tensor(
         ds4_metal_tensor       *out_hc,
@@ -66,7 +68,8 @@ int ds4_metal_embed_tokens_hc_tensor(
         uint32_t                n_vocab,
         uint32_t                n_tokens,
         uint32_t                n_embd,
-        uint32_t                n_hc);
+        uint32_t                n_hc,
+        uint32_t                weight_type);
 
 int ds4_metal_indexer_score_one_tensor(
         ds4_metal_tensor       *scores,

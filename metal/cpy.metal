@@ -55,3 +55,27 @@ typedef decltype(kernel_cpy_t_t<float, float>) kernel_cpy_t;
 template [[host_name("kernel_cpy_f32_f32")]] kernel kernel_cpy_t kernel_cpy_t_t<float, float>;
 template [[host_name("kernel_cpy_f32_f16")]] kernel kernel_cpy_t kernel_cpy_t_t<float, half>;
 template [[host_name("kernel_cpy_f16_f32")]] kernel kernel_cpy_t kernel_cpy_t_t<half, float>;
+
+// Q8_0 -> F32 dequantizing 1D copy.  Used by the compressor APE path so
+// stock-recipe GGUFs that ship `*.compressor_ape.weight` as Q8_0 can be
+// read through the same byte-strided copy that the F16/F32 ape paths use.
+// args.ne00 is the total element count (must be divisible by QK8_0 = 32);
+// src is a packed Q8_0 region and dst is contiguous F32.
+kernel void kernel_cpy_q8_0_f32(
+        constant ds4_metal_args_cpy & args,
+        device  const char * src0,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int n = (int) args.ne00;
+    const int gid = (int)(tgpig.x * ntg.x + tiitg);
+    if (gid >= n) return;
+
+    device const block_q8_0 *blocks = (device const block_q8_0 *) src0;
+    const int blk = gid / QK8_0;
+    const int idx = gid - blk * QK8_0;
+    const float d = (float) blocks[blk].d;
+    device float *out = (device float *) dst;
+    out[gid] = (float) blocks[blk].qs[idx] * d;
+}
