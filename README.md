@@ -1,36 +1,43 @@
-# CyberNeurova-DeepSeek-V4-Flash-abliterated-GGUF local inference engine with M5 Metal support
+# DeepSeek V4 Flash Abliterated on a personal laptop
 
-This is **a personal fork of [antirez/ds4](https://github.com/antirez/ds4)**, the
-DeepSeek V4 Flash inference engine. It exists as a staging area to combine
-upstream pull requests that I want to run together on my own M5 hardware
-before they land upstream.
+This is a personal fork of [antirez/ds4](https://github.com/antirez/ds4) —
+Salvatore Sanfilippo's hand-written C inference engine for DeepSeek V4 Flash —
+with three things added so the [cyberneurova abliterated GGUF](https://huggingface.co/cyberneurova/CyberNeurova-DeepSeek-V4-Flash-abliterated-GGUF)
+loads and runs end-to-end on Apple Silicon. The result is a 671b-parameter
+mixture-of-experts model running on a single laptop, with the steerability
+dial under the user's control, at about **440 prefill tokens per second**
+on M5 Max.
 
-`main` here is `antirez/ds4@HEAD` with three things merged in:
+The personal-computing arithmetic that flipped mainframe-vs-PC in the 1980s now
+applies to frontier AI: the centralized service is more powerful in aggregate,
+but the per-user slice has been overtaken on the desk (or laptop).
+
+## What this fork adds
+
+`main` is `antirez/ds4@HEAD` with three things merged in:
 
 1. **`feat(loader): support stock-recipe (Q8_0/F32) GGUFs end-to-end on Metal`**
    ([branch `support-q8_0-token-embd`](https://github.com/audreyt/ds4/tree/support-q8_0-token-embd),
-   sent as a PR to antirez/ds4). Makes ds4 accept GGUFs that were produced by
-   the upstream llama.cpp converter without per-tensor type overrides — files
-   where most small projections are Q8_0 and the routed-expert router is F32,
-   instead of antirez's hand-tuned recipe where they all stay F16. The
-   motivating case is the
-   `cyberneurova/CyberNeurova-DeepSeek-V4-Flash-abliterated-GGUF` models, but
-   the change is generic.
+   [sent upstream as PR #60](https://github.com/antirez/ds4/pull/60)).
+   Makes ds4 accept GGUFs that the upstream `llama.cpp` converter produces
+   without per-tensor type overrides — files where most small projections are
+   Q8_0 and the routed-expert router is F32, instead of antirez's hand-tuned
+   recipe where they all stay F16. The motivating case is the cyberneurova
+   GGUFs, but the change is generic and unblocks any stock-recipe DS4 file.
 
 2. **[ivanfioravanti's PR #15: Add Metal 4 M5 prefill optimizations](https://github.com/antirez/ds4/pull/15)**.
    M5-class Metal 4 (MPP) tensor-API paths for Q8_0 dense matmul, attention
    output low-projection, and staged routed-MoE projections, plus a fused
-   six-expert routed-MoE sum kernel. ~1.5x prefill speedup on MacBook Pro M5
-   Max for q2 prompts.
+   six-expert routed-MoE sum kernel. ~1.5x prefill speedup on M5 Max for q2
+   prompts.
 
 3. **`fix(metal): correct M5 MPP + Q8_0 ape compressor for stock-recipe GGUFs`**
    ([branch `m5-support-q8_0-token-embd`](https://github.com/audreyt/ds4/tree/m5-support-q8_0-token-embd)).
-   Two fixes that close a regression where (1) + (2) together produce garbage
+   Two fixes that close a regression where (1) + (2) together produced garbage
    output (BOS-token spam) for stock-recipe Q8_0 ape on M5: a CPU-side dequant
-   for the prefill compressor APE byte-strided path (with per-call MTLBuffer
-   to avoid an encode-time race condition on the shared scratch), and a Q8_0
+   for the prefill compressor APE byte-strided path (with a per-call
+   MTLBuffer to avoid an encode-time race on the shared scratch), and a Q8_0
    branch in the decode-time `kernel_dsv4_compressor_store_one` Metal kernel.
-   See the m5-support-q8_0-token-embd commit message for the full story.
 
 If you only want one of these, use the corresponding branch directly:
 
@@ -44,19 +51,13 @@ audreyt/ds4
 
 ## Why this fork exists
 
-I run [`pi-ds4`](https://github.com/audreyt/pi-ds4) on a MacBook M5 Max, and
-I wanted to try the cyberneurova abliterated DeepSeek V4 Flash GGUFs without
-pre-converting the file or running a separate inference engine. Loading those
-GGUFs into stock antirez/ds4 fails immediately because the recipe is different
-— ds4 expects `token_embd.weight` to be F16, the cyberneurova file has it as
-Q8_0; same for `output_hc_fn`, the HC fn weights, the attention/indexer
-compressors, the indexer projections, and so on (~360 tensor mismatches across
-12 families). The `support-q8_0-token-embd` PR is the engine work that closes
-those gaps so the file just loads.
+I run [pi-ds4](https://github.com/audreyt/pi-ds4) on a MacBook M5 Max and
+wanted the cyberneurova abliterated DeepSeek V4 Flash GGUFs to load without
+pre-converting the file or running a separate inference engine.
 
-PR #15 is independent: it's M5-class throughput. I wanted both, but loading
-unmodified cyberneurova on top of PR #15 surfaced a Q8_0-ape compressor bug
-(also fixed in this fork's `m5-support-q8_0-token-embd` branch).
+Stock antirez/ds4 rejects them at the loader — the recipes differ in
+~360 tensor headers across 12 families. The loader PR (item 1 above) closes
+those gaps so the file just loads.
 
 ## What's verified on M5
 
@@ -68,11 +69,12 @@ unmodified cyberneurova on top of PR #15 surfaced a Q8_0-ape compressor bug
 ## Benchmarks
 
 Prefill throughput on MacBook Pro M5 Max with the cyberneurova Q2_K GGUF
-(`cyberneurova-DeepSeek-V4-Flash-abliterated-Q2_K.gguf`, ~95 GB), `--ctx 32768`,
-3 repeats averaged. "MPP off" sets `DS4_METAL_MPP_DISABLE=1` (effectively the
-non-M5 path); "MPP on" is the default for `audreyt/ds4` `main`, which
-includes ivan's PR #15 plus the M5/cyber compressor fix. Same command shape
-ivan used in PR #15: `./ds4 --prompt-file <prompt> -n 1 --nothink --ctx 32768`.
+(`cyberneurova-DeepSeek-V4-Flash-abliterated-Q2_K.gguf`, ~95 GB),
+`--ctx 32768`, 3 repeats averaged. "MPP off" sets `DS4_METAL_MPP_DISABLE=1`
+(effectively the non-M5 path); "MPP on" is the default for `audreyt/ds4`
+`main`, which includes ivan's PR #15 plus the M5/cyber compressor fix. Same
+command shape ivan used in PR #15:
+`./ds4 --prompt-file <prompt> -n 1 --nothink --ctx 32768`.
 
 | prompt tokens | MPP off avg tok/s | MPP on avg tok/s | speedup |
 |---:|---:|---:|---:|
@@ -82,10 +84,18 @@ ivan used in PR #15: `./ds4 --prompt-file <prompt> -n 1 --nothink --ctx 32768`.
 | 8126 | 279.6 | 387.1 | 1.38x |
 | 16300 | 273.2 | 413.8 | 1.51x |
 
-Decode throughput sits around 24-37 tok/s and doesn't change in any
-consistent direction with MPP, which matches PR #15's design (MPP is a
-prefill-only optimization). Prompts were built by concatenating this
-README's text and trimming to approximate target token counts.
+The strategic point in those numbers: a single user on a single laptop is
+seeing prefill throughput in the same range commercial frontier-AI APIs
+deliver per user. Not because the M5 Max is faster than an H200 (it isn't),
+but because the laptop serves a batch of one and the operator amortizes
+their accelerator across N concurrent requests.
+
+Time-to-first-token on a personal device now compares favorably to
+commercial APIs for many model classes. Decode throughput sits around 24-37
+tok/s and doesn't change consistently with MPP, which matches PR #15's
+design (MPP is a prefill-only optimization). Prompts were built by
+concatenating this README's text and trimming to approximate target token
+counts.
 
 ## Build and run
 
@@ -109,6 +119,9 @@ flow works as-is:
 ./download_model.sh q2
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
+
+For a one-line install that handles the engine build, model download, and
+server lifecycle automatically, see [pi-ds4](https://github.com/audreyt/pi-ds4).
 
 ## Acknowledgements
 
