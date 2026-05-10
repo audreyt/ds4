@@ -60,7 +60,15 @@ template [[host_name("kernel_cpy_f16_f32")]] kernel kernel_cpy_t kernel_cpy_t_t<
 // stock-recipe GGUFs that ship `*.compressor_ape.weight` as Q8_0 can be
 // read through the same byte-strided copy that the F16/F32 ape paths use.
 // args.ne00 is the total element count (must be divisible by QK8_0 = 32);
-// src is a packed Q8_0 region and dst is contiguous F32.
+// src is a packed Q8_0 region (sizeof(block_q8_0) = 34 bytes per QK8_0 elements)
+// and dst is contiguous F32.
+//
+// Uses explicit byte arithmetic instead of `block_q8_0 *` indexing because
+// the GGUF byte stride (34) does not match Metal's natural struct alignment
+// for `block_q8_0` (which would be padded to a multiple of `alignof(half)`
+// in some cases).  Each thread handles one output element and re-reads the
+// half scale from its block's first two bytes; that's redundant but cheap
+// and the compressor APE total element count is tiny (a few thousand).
 kernel void kernel_cpy_q8_0_f32(
         constant ds4_metal_args_cpy & args,
         device  const char * src0,
@@ -72,10 +80,16 @@ kernel void kernel_cpy_q8_0_f32(
     const int gid = (int)(tgpig.x * ntg.x + tiitg);
     if (gid >= n) return;
 
-    device const block_q8_0 *blocks = (device const block_q8_0 *) src0;
+    constexpr int BLOCK_BYTES = 34;
     const int blk = gid / QK8_0;
     const int idx = gid - blk * QK8_0;
-    const float d = (float) blocks[blk].d;
+    device const char *bp = src0 + (uint64_t)blk * BLOCK_BYTES;
+    half d_h;
+    /* half scale lives at the first 2 bytes of the block */
+    thread char *dp = (thread char *) &d_h;
+    dp[0] = bp[0]; dp[1] = bp[1];
+    const float d = (float) d_h;
+    const int8_t q = (int8_t) bp[2 + idx];
     device float *out = (device float *) dst;
-    out[gid] = (float) blocks[blk].qs[idx] * d;
+    out[gid] = (float) q * d;
 }
