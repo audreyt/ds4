@@ -9080,17 +9080,19 @@ static bool metal_graph_encode_decode_layer(
             if (ok && g->layer_n_comp[il] > decode_top_k) {
                 const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
                 if (!layer->indexer_attn_q_b ||
-                    layer->indexer_attn_q_b->type != DS4_TENSOR_F16 ||
+                    (layer->indexer_attn_q_b->type != DS4_TENSOR_F16 &&
+                     layer->indexer_attn_q_b->type != DS4_TENSOR_Q8_0) ||
                     layer->indexer_attn_q_b->dim[0] != q_rank ||
                     layer->indexer_attn_q_b->dim[1] != indexer_q_dim) {
-                    fprintf(stderr, "ds4: Metal graph indexer q projection expects F16 weights\n");
+                    fprintf(stderr, "ds4: Metal graph indexer q projection expects F16 or Q8_0 weights\n");
                     ok = false;
                 }
                 if (ok && (!layer->indexer_proj ||
-                           layer->indexer_proj->type != DS4_TENSOR_F16 ||
+                           (layer->indexer_proj->type != DS4_TENSOR_F16 &&
+                            layer->indexer_proj->type != DS4_TENSOR_Q8_0) ||
                            layer->indexer_proj->dim[0] != DS4_N_EMBD ||
                            layer->indexer_proj->dim[1] != DS4_N_INDEXER_HEAD)) {
-                    fprintf(stderr, "ds4: Metal graph indexer weight projection expects F16 weights\n");
+                    fprintf(stderr, "ds4: Metal graph indexer weight projection expects F16 or Q8_0 weights\n");
                     ok = false;
                 }
                 if (ok) ok = metal_graph_matmul_plain_tensor(g->indexer_q, model, layer->indexer_attn_q_b, q_rank, indexer_q_dim, g->qr_norm, 1);
