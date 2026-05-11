@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -9666,6 +9667,30 @@ static bool metal_graph_matmul_pair_plain_tensor(
     return metal_graph_matmul_plain_tensor(out_b, model, w_b, in_dim, out_dim, x, n_tok);
 }
 
+static bool metal_graph_matmul_q8_0_named_tensor(
+        const char             *module,
+        uint32_t                il,
+        uint32_t                pos0,
+        ds4_metal_tensor       *out,
+        const ds4_model        *model,
+        const ds4_tensor       *w,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_metal_tensor *x,
+        uint64_t                n_tok) {
+    ds4_metal_set_mpp_compare_context(module, il, pos0);
+    const bool ok = ds4_metal_matmul_q8_0_tensor(out,
+                                                 model->map,
+                                                 model->size,
+                                                 w->abs_offset,
+                                                 in_dim,
+                                                 out_dim,
+                                                 x,
+                                                 n_tok) != 0;
+    ds4_metal_clear_mpp_compare_context();
+    return ok;
+}
+
 static bool metal_graph_encode_output_head_mtp(
         ds4_metal_graph       *g,
         const ds4_model       *base_model,
@@ -10648,6 +10673,66 @@ static bool metal_graph_q_stage_profile_boundary(
     return ds4_metal_begin_commands() != 0;
 }
 
+static bool ds4_env_bool_enabled(const char *name) {
+    const char *v = getenv(name);
+    if (!v) return false;
+
+    while (isspace((unsigned char)*v)) v++;
+    size_t n = strlen(v);
+    while (n > 0 && isspace((unsigned char)v[n - 1])) n--;
+    if (n == 0) return true;
+
+    if ((n == 1 && v[0] == '0') ||
+        (n == 2 && strncasecmp(v, "no", n) == 0) ||
+        (n == 3 && strncasecmp(v, "off", n) == 0) ||
+        (n == 5 && strncasecmp(v, "false", n) == 0)) {
+        return false;
+    }
+    return true;
+}
+
+static bool metal_graph_matmul_f16_pair_or_separate(
+        ds4_metal_tensor       *out_a,
+        ds4_metal_tensor       *out_b,
+        const ds4_model        *model,
+        uint64_t                weight_a_offset,
+        uint64_t                weight_b_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_metal_tensor *x,
+        uint64_t                n_tokens) {
+    if (ds4_env_bool_enabled("DS4_METAL_MPP_F16_PAIR")) {
+        if (ds4_metal_matmul_f16_pair_tensor(out_a,
+                                             out_b,
+                                             model->map,
+                                             model->size,
+                                             weight_a_offset,
+                                             weight_b_offset,
+                                             in_dim,
+                                             out_dim,
+                                             x,
+                                             n_tokens) != 0) {
+            return true;
+        }
+    }
+    return ds4_metal_matmul_f16_tensor(out_a,
+                                       model->map,
+                                       model->size,
+                                       weight_a_offset,
+                                       in_dim,
+                                       out_dim,
+                                       x,
+                                       n_tokens) != 0 &&
+           ds4_metal_matmul_f16_tensor(out_b,
+                                       model->map,
+                                       model->size,
+                                       weight_b_offset,
+                                       in_dim,
+                                       out_dim,
+                                       x,
+                                       n_tokens) != 0;
+}
+
 static bool metal_graph_encode_layer_attention_batch(
         ds4_metal_graph  *g,
         const ds4_model        *model,
@@ -10756,28 +10841,32 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_ATTN_STAGE("norm");
     DS4_METAL_PROFILE_Q_STAGE("pre_q");
-    if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->batch_qr,
-                                              model->map,
-                                              model->size,
-                                              layer->attn_q_a->abs_offset,
-                                              DS4_N_EMBD,
-                                              q_rank,
-                                              g->batch_attn_norm,
-                                              n_tokens) != 0;
+    if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_q_a",
+                                                      il,
+                                                      pos0,
+                                                      g->batch_qr,
+                                                      model,
+                                                      layer->attn_q_a,
+                                                      DS4_N_EMBD,
+                                                      q_rank,
+                                                      g->batch_attn_norm,
+                                                      n_tokens);
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora", g->batch_qr,
                                       (uint64_t)n_tokens * q_rank, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("q_a");
     if (qkv_rms_fused) {
-        if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->batch_kv_raw,
-                                                  model->map,
-                                                  model->size,
-                                                  layer->attn_kv->abs_offset,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HEAD_DIM,
-                                                  g->batch_attn_norm,
-                                                  n_tokens) != 0;
+        if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_kv",
+                                                          il,
+                                                          pos0,
+                                                          g->batch_kv_raw,
+                                                          model,
+                                                          layer->attn_kv,
+                                                          DS4_N_EMBD,
+                                                          DS4_N_HEAD_DIM,
+                                                          g->batch_attn_norm,
+                                                          n_tokens);
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", g->batch_kv_raw,
                                           (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
@@ -10813,14 +10902,16 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("q_a_norm");
-    if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->batch_q,
-                                              model->map,
-                                              model->size,
-                                              layer->attn_q_b->abs_offset,
-                                              q_rank,
-                                              q_dim,
-                                              g->batch_qr_norm,
-                                              n_tokens) != 0;
+    if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_q_b",
+                                                      il,
+                                                      pos0,
+                                                      g->batch_q,
+                                                      model,
+                                                      layer->attn_q_b,
+                                                      q_rank,
+                                                      q_dim,
+                                                      g->batch_qr_norm,
+                                                      n_tokens);
     if (ok) {
         metal_graph_debug_dump_tensor("Qraw", g->batch_q,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
@@ -10857,14 +10948,16 @@ static bool metal_graph_encode_layer_attention_batch(
     DS4_METAL_PROFILE_Q_STAGE("rope");
     DS4_METAL_PROFILE_ATTN_STAGE("q_path");
     if (!qkv_rms_fused) {
-        if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->batch_kv_raw,
-                                                  model->map,
-                                                  model->size,
-                                                  layer->attn_kv->abs_offset,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HEAD_DIM,
-                                                  g->batch_attn_norm,
-                                                  n_tokens) != 0;
+        if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_kv",
+                                                          il,
+                                                          pos0,
+                                                          g->batch_kv_raw,
+                                                          model,
+                                                          layer->attn_kv,
+                                                          DS4_N_EMBD,
+                                                          DS4_N_HEAD_DIM,
+                                                          g->batch_attn_norm,
+                                                          n_tokens);
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", g->batch_kv_raw,
                                           (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
@@ -10991,13 +11084,39 @@ static bool metal_graph_encode_layer_attention_batch(
             fprintf(stderr, "ds4: Metal layer-major prefill needs attention compressor weights\n");
             ok = false;
         }
-        if (ok) ok = metal_graph_matmul_plain_tensor(g->batch_comp_kv, model, layer->attn_compressor_kv, DS4_N_EMBD, comp_width, g->batch_attn_norm, n_tokens);
+        if (ok && ds4_env_bool_enabled("DS4_METAL_MPP_F16_PAIR")) {
+            ok = metal_graph_matmul_f16_pair_or_separate(g->batch_comp_kv,
+                                                         g->batch_comp_sc,
+                                                         model,
+                                                         layer->attn_compressor_kv->abs_offset,
+                                                         layer->attn_compressor_gate->abs_offset,
+                                                         DS4_N_EMBD,
+                                                         comp_width,
+                                                         g->batch_attn_norm,
+                                                         n_tokens);
+        } else if (ok) {
+            ok = ds4_metal_matmul_f16_tensor(g->batch_comp_kv,
+                                             model->map,
+                                             model->size,
+                                             layer->attn_compressor_kv->abs_offset,
+                                             DS4_N_EMBD,
+                                             comp_width,
+                                             g->batch_attn_norm,
+                                             n_tokens) != 0;
+            if (ok) ok = ds4_metal_matmul_f16_tensor(g->batch_comp_sc,
+                                                     model->map,
+                                                     model->size,
+                                                     layer->attn_compressor_gate->abs_offset,
+                                                     DS4_N_EMBD,
+                                                     comp_width,
+                                                     g->batch_attn_norm,
+                                                     n_tokens) != 0;
+        }
         if (ok) metal_graph_debug_dump_tensor("attn_comp_kv_raw",
                                               g->batch_comp_kv,
                                               (uint64_t)comp_width * n_tokens,
                                               il,
                                               pos0);
-        if (ok) ok = metal_graph_matmul_plain_tensor(g->batch_comp_sc, model, layer->attn_compressor_gate, DS4_N_EMBD, comp_width, g->batch_attn_norm, n_tokens);
         if (ok) metal_graph_debug_dump_tensor("attn_comp_score_raw",
                                               g->batch_comp_sc,
                                               (uint64_t)comp_width * n_tokens,
@@ -11255,13 +11374,39 @@ static bool metal_graph_encode_layer_attention_batch(
                 fprintf(stderr, "ds4: Metal layer-major prefill needs indexer weights\n");
                 ok = false;
             }
-            if (ok) ok = metal_graph_matmul_plain_tensor(g->batch_comp_kv, model, layer->indexer_compressor_kv, DS4_N_EMBD, index_width, g->batch_attn_norm, n_tokens);
+            if (ok && ds4_env_bool_enabled("DS4_METAL_MPP_F16_PAIR")) {
+                ok = metal_graph_matmul_f16_pair_or_separate(g->batch_comp_kv,
+                                                             g->batch_comp_sc,
+                                                             model,
+                                                             layer->indexer_compressor_kv->abs_offset,
+                                                             layer->indexer_compressor_gate->abs_offset,
+                                                             DS4_N_EMBD,
+                                                             index_width,
+                                                             g->batch_attn_norm,
+                                                             n_tokens);
+            } else if (ok) {
+                ok = ds4_metal_matmul_f16_tensor(g->batch_comp_kv,
+                                                 model->map,
+                                                 model->size,
+                                                 layer->indexer_compressor_kv->abs_offset,
+                                                 DS4_N_EMBD,
+                                                 index_width,
+                                                 g->batch_attn_norm,
+                                                 n_tokens) != 0;
+                if (ok) ok = ds4_metal_matmul_f16_tensor(g->batch_comp_sc,
+                                                         model->map,
+                                                         model->size,
+                                                         layer->indexer_compressor_gate->abs_offset,
+                                                         DS4_N_EMBD,
+                                                         index_width,
+                                                         g->batch_attn_norm,
+                                                         n_tokens) != 0;
+            }
             if (ok) metal_graph_debug_dump_tensor("indexer_comp_kv_raw",
                                                   g->batch_comp_kv,
                                                   (uint64_t)index_width * n_tokens,
                                                   il,
                                                   pos0);
-            if (ok) ok = metal_graph_matmul_plain_tensor(g->batch_comp_sc, model, layer->indexer_compressor_gate, DS4_N_EMBD, index_width, g->batch_attn_norm, n_tokens);
             if (ok) metal_graph_debug_dump_tensor("indexer_comp_score_raw",
                                                   g->batch_comp_sc,
                                                   (uint64_t)index_width * n_tokens,
@@ -11849,20 +11994,24 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("inv_rope");
-    if (ok) ok = ds4_metal_attention_output_q8_batch_tensor(g->batch_attn_out,
-                                                            g->batch_attn_low,
-                                                            g->batch_group_tmp,
-                                                            g->batch_low_tmp,
-                                                            model->map,
-                                                            model->size,
-                                                            layer->attn_output_a->abs_offset,
-                                                            layer->attn_output_b->abs_offset,
-                                                            group_dim,
-                                                            rank,
-                                                            n_groups,
-                                                            DS4_N_EMBD,
-                                                            g->batch_heads,
-                                                            n_tokens) != 0;
+    if (ok) {
+        ds4_metal_set_mpp_compare_context("attn_out", il, pos0);
+        ok = ds4_metal_attention_output_q8_batch_tensor(g->batch_attn_out,
+                                                        g->batch_attn_low,
+                                                        g->batch_group_tmp,
+                                                        g->batch_low_tmp,
+                                                        model->map,
+                                                        model->size,
+                                                        layer->attn_output_a->abs_offset,
+                                                        layer->attn_output_b->abs_offset,
+                                                        group_dim,
+                                                        rank,
+                                                        n_groups,
+                                                        DS4_N_EMBD,
+                                                        g->batch_heads,
+                                                        n_tokens) != 0;
+        ds4_metal_clear_mpp_compare_context();
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("attn_low", g->batch_attn_low,
                                       (uint64_t)n_tokens * n_groups * rank,
@@ -12017,32 +12166,36 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
-    if (ok) ok = ds4_metal_routed_moe_batch_tensor(g->batch_routed_out,
-                                                   g->batch_routed_gate,
-                                                   g->batch_routed_up,
-                                                   g->batch_routed_mid,
-                                                   g->batch_routed_down,
-                                                   model->map,
-                                                   model->size,
-                                                   layer->ffn_gate_exps->abs_offset,
-                                                   layer->ffn_up_exps->abs_offset,
-                                                   layer->ffn_down_exps->abs_offset,
-                                                   layer->ffn_gate_exps->type,
-                                                   layer->ffn_down_exps->type,
-                                                   gate_expert_bytes,
-                                                   gate_row_bytes,
-                                                   down_expert_bytes,
-                                                   down_row_bytes,
-                                                   (uint32_t)expert_in_dim,
-                                                   (uint32_t)down_in_dim,
-                                                   (uint32_t)routed_out_dim,
-                                                   g->batch_router_selected,
-                                                   g->batch_router_weights,
-                                                   DS4_N_EXPERT_USED,
-                                                   DS4_SWIGLU_CLAMP_EXP,
-                                                   g->batch_ffn_norm,
-                                                   il,
-                                                   n_tokens) != 0;
+    if (ok) {
+        ds4_metal_set_mpp_compare_context("routed_moe", il, pos0);
+        ok = ds4_metal_routed_moe_batch_tensor(g->batch_routed_out,
+                                               g->batch_routed_gate,
+                                               g->batch_routed_up,
+                                               g->batch_routed_mid,
+                                               g->batch_routed_down,
+                                               model->map,
+                                               model->size,
+                                               layer->ffn_gate_exps->abs_offset,
+                                               layer->ffn_up_exps->abs_offset,
+                                               layer->ffn_down_exps->abs_offset,
+                                               layer->ffn_gate_exps->type,
+                                               layer->ffn_down_exps->type,
+                                               gate_expert_bytes,
+                                               gate_row_bytes,
+                                               down_expert_bytes,
+                                               down_row_bytes,
+                                               (uint32_t)expert_in_dim,
+                                               (uint32_t)down_in_dim,
+                                               (uint32_t)routed_out_dim,
+                                               g->batch_router_selected,
+                                               g->batch_router_weights,
+                                               DS4_N_EXPERT_USED,
+                                               DS4_SWIGLU_CLAMP_EXP,
+                                               g->batch_ffn_norm,
+                                               il,
+                                               n_tokens) != 0;
+        ds4_metal_clear_mpp_compare_context();
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->batch_routed_gate,
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim, il, pos0);
@@ -12062,22 +12215,26 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
-    if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->batch_shared_gate,
-                                              model->map,
-                                              model->size,
-                                              layer->ffn_gate_shexp->abs_offset,
-                                              DS4_N_EMBD,
-                                              shared_dim,
-                                              g->batch_ffn_norm,
-                                              n_tokens) != 0;
-    if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->batch_shared_up,
-                                              model->map,
-                                              model->size,
-                                              layer->ffn_up_shexp->abs_offset,
-                                              DS4_N_EMBD,
-                                              shared_dim,
-                                              g->batch_ffn_norm,
-                                              n_tokens) != 0;
+    if (ok) ok = metal_graph_matmul_q8_0_named_tensor("shared_gate",
+                                                      il,
+                                                      pos0,
+                                                      g->batch_shared_gate,
+                                                      model,
+                                                      layer->ffn_gate_shexp,
+                                                      DS4_N_EMBD,
+                                                      shared_dim,
+                                                      g->batch_ffn_norm,
+                                                      n_tokens);
+    if (ok) ok = metal_graph_matmul_q8_0_named_tensor("shared_up",
+                                                      il,
+                                                      pos0,
+                                                      g->batch_shared_up,
+                                                      model,
+                                                      layer->ffn_up_shexp,
+                                                      DS4_N_EMBD,
+                                                      shared_dim,
+                                                      g->batch_ffn_norm,
+                                                      n_tokens);
     DS4_METAL_PROFILE_FFN_STAGE("shared_gate_up");
     if (ok) ok = ds4_metal_swiglu_tensor(g->batch_shared_mid,
                                          g->batch_shared_gate,
@@ -12085,14 +12242,16 @@ static bool metal_graph_encode_layer_ffn_batch(
                                          (uint32_t)((uint64_t)n_tokens * shared_dim),
                                          0.0f,
                                          1.0f) != 0;
-    if (ok) ok = ds4_metal_matmul_q8_0_tensor(g->batch_shared_out,
-                                              model->map,
-                                              model->size,
-                                              layer->ffn_down_shexp->abs_offset,
-                                              shared_dim,
-                                              DS4_N_EMBD,
-                                              g->batch_shared_mid,
-                                              n_tokens) != 0;
+    if (ok) ok = metal_graph_matmul_q8_0_named_tensor("shared_down",
+                                                      il,
+                                                      pos0,
+                                                      g->batch_shared_out,
+                                                      model,
+                                                      layer->ffn_down_shexp,
+                                                      shared_dim,
+                                                      DS4_N_EMBD,
+                                                      g->batch_shared_mid,
+                                                      n_tokens);
     DS4_METAL_PROFILE_FFN_STAGE("shared_down");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_shexp", g->batch_shared_out,
@@ -13547,6 +13706,7 @@ struct ds4_engine {
     ds4_backend backend;
     int mtp_draft_tokens;
     float mtp_margin;
+    ds4_mpp_mode mpp_mode;
     bool quality;
     bool metal_ready;
     bool mtp_ready;
@@ -14703,6 +14863,15 @@ const char *ds4_backend_name(ds4_backend backend) {
     return backend == DS4_BACKEND_METAL ? "metal" : "cpu";
 }
 
+const char *ds4_mpp_mode_name(ds4_mpp_mode mode) {
+    switch (mode) {
+    case DS4_MPP_AUTO: return "auto";
+    case DS4_MPP_ON:   return "on";
+    case DS4_MPP_OFF:  return "off";
+    }
+    return "unknown";
+}
+
 bool ds4_think_mode_enabled(ds4_think_mode mode) {
     return mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX;
 }
@@ -15716,6 +15885,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->mtp_model.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
+    e->mpp_mode = opt->mpp_mode;
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
@@ -15747,6 +15917,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        ds4_metal_set_mpp_mode(e->mpp_mode);
         ds4_metal_set_quality(e->quality);
         if (!ds4_metal_set_model_map_range(e->model.map,
                                            e->model.size,
@@ -15790,6 +15961,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 
 void ds4_engine_summary(ds4_engine *e) {
     model_summary(&e->model);
+}
+
+int ds4_engine_vocab_size(ds4_engine *e) {
+    return e ? e->vocab.n_vocab : 0;
 }
 
 void ds4_engine_close(ds4_engine *e) {
@@ -15854,6 +16029,7 @@ void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *
     s->progress_ud = ud;
 }
 
+#ifndef DS4_NO_METAL
 typedef struct {
     ds4_session *session;
     const ds4_tokens *prompt;
@@ -15872,6 +16048,7 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
     }
     if (p->user) p->user(p->user_ud, event, current, total);
 }
+#endif
 
 /* Bring the Metal graph to exactly the supplied token prefix.
  *
@@ -16101,6 +16278,12 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
         out[i].logprob = isfinite(out[i].logit) ? (float)((double)out[i].logit - logsum) : DS4_NEG_INF;
     }
     return k;
+}
+
+int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
+    if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
+    memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
+    return (int)DS4_N_VOCAB;
 }
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
