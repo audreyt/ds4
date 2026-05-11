@@ -79,6 +79,57 @@ The same vector can be used in either direction. The sign is the important part:
 - positive scale suppresses that direction and usually gives the model more room
   to elaborate.
 
+## Uncertainty Example
+
+A second bundled example targets the model's hedging vs asserting register
+rather than a topic or style:
+
+- `examples/contested.txt`: 100 questions where the model would naturally
+  hedge (territorial sovereignty disputes, contested philosophical claims,
+  value debates).
+- `examples/settled.txt`: 100 questions with one widely accepted answer
+  (geography, math, established history).
+
+Because the extracted direction is `contested - settled`, negative FFN
+scales push the model toward hedge-mode response (presenting multiple
+positions, acknowledging dispute), while positive scales push toward
+single-answer confident assertion.
+
+Build the vector:
+
+```sh
+python3 dir-steering/tools/build_direction.py \
+  --ds4 ./ds4 \
+  --model ds4flash.gguf \
+  --good-file dir-steering/examples/contested.txt \
+  --bad-file dir-steering/examples/settled.txt \
+  --out dir-steering/out/uncertainty.json \
+  --component ffn_out \
+  --ctx 512
+```
+
+This writes:
+
+```text
+dir-steering/out/uncertainty.json
+dir-steering/out/uncertainty.f32
+```
+
+Useful on questions where the model would otherwise emit a strongly-trained
+closed-form completion. Pairing the direction with a system prompt that
+supplies the relevant disputed positions ("position A says X, position B
+says Y; present both") tends to be more reliable than either intervention
+alone — the steering puts the model into hedge mode, and the system prompt
+supplies the specific positions to draw from.
+
+Sweet spot in local tests: `ffn=-2` to `-3`. Below `-1` the effect is weak;
+at `-4` and beyond the model degenerates into repetition.
+
+Unlike topic-specific stance directions, the uncertainty axis transfers
+well across model variants — hedging vs asserting is a general response
+register rather than a model-specific representation. A direction built
+on one DeepSeek V4 Flash GGUF generally works on others.
+
 ## Evaluating Scales
 
 Use the sweep helper to test several strengths on a fixed prompt set:
