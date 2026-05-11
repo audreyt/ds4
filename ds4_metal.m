@@ -96,6 +96,7 @@ static id<MTLComputePipelineState> g_dsv4_compressor_store_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_sort_i32_rows_asc_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_rb4_pipeline;
+static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_rb16_pipeline;
 static id<MTLComputePipelineState> g_dsv4_softplus_sqrt_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_finalize_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_one_pipeline;
@@ -1007,6 +1008,14 @@ static int ds4_gpu_env_bool(const char *name) {
     return 1;
 }
 
+static int ds4_gpu_use_indexed_attention_rb4(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = ds4_gpu_env_bool("DS4_METAL_INDEXED_ATTN_RB4") > 0;
+    }
+    return enabled;
+}
+
 typedef enum {
     DS4_METAL_MPP_GLOBAL_OFF,
     DS4_METAL_MPP_GLOBAL_AUTO,
@@ -1103,6 +1112,12 @@ static uint32_t ds4_gpu_mpp_q8_0_tile_n(void) {
     return ds4_gpu_mpp_tile_n_env("DS4_METAL_MPP_Q8_0_TILE_N", 64);
 }
 
+static uint32_t ds4_gpu_mpp_q8_0_tile_n_for_tokens(uint64_t n_tok) {
+    const char *env = getenv("DS4_METAL_MPP_Q8_0_TILE_N");
+    if (env && env[0]) return ds4_gpu_mpp_q8_0_tile_n();
+    return n_tok >= 4096u ? 32u : 64u;
+}
+
 static uint32_t ds4_gpu_mpp_attn_out_tile_n(void) {
     return ds4_gpu_mpp_tile_n_env("DS4_METAL_MPP_ATTN_OUT_TILE_N", 64);
 }
@@ -1112,7 +1127,9 @@ static uint32_t ds4_gpu_mpp_moe_tile_n(void) {
 }
 
 static int ds4_gpu_mpp_moe_fast_layout(void) {
-    return ds4_gpu_env_bool("DS4_METAL_MPP_MOE_FAST_LAYOUT") > 0;
+    const int enabled = ds4_gpu_env_bool("DS4_METAL_MPP_MOE_FAST_LAYOUT");
+    if (enabled >= 0) return enabled > 0;
+    return 1;
 }
 
 static int ds4_gpu_mpp_moe_pair_gate_up(void) {
@@ -1181,6 +1198,14 @@ static int ds4_gpu_mpp_q8_0_late_safe_context(void) {
         return 1;
     }
     return 0;
+}
+
+static int ds4_gpu_mpp_q8_0_default_context(uint64_t n_tok) {
+    if (strstr(g_mpp_compare_context, "attn_q_b") != NULL &&
+        n_tok <= 2048u) {
+        return 1;
+    }
+    return ds4_gpu_mpp_q8_0_late_safe_context();
 }
 
 static int ds4_gpu_mpp_attn_out_late_safe_context(void) {
@@ -1280,10 +1305,10 @@ static int ds4_gpu_mpp_context_matches_filter(
     return 0;
 }
 
-static int ds4_gpu_mpp_q8_0_context_matches_filter(void) {
+static int ds4_gpu_mpp_q8_0_context_matches_filter(uint64_t n_tok) {
     const int default_match = ds4_gpu_mpp_fast_profile()
         ? 1
-        : ds4_gpu_mpp_q8_0_late_safe_context();
+        : ds4_gpu_mpp_q8_0_default_context(n_tok);
     return ds4_gpu_mpp_context_matches_filter("DS4_METAL_MPP_Q8_0_FILTER",
                                                 default_match,
                                                 ds4_gpu_mpp_q8_0_late_safe_context());
@@ -1292,7 +1317,7 @@ static int ds4_gpu_mpp_q8_0_context_matches_filter(void) {
 static int ds4_gpu_can_use_mpp_q8_0_matmul(uint64_t n_tok) {
     if (n_tok <= 8) return 0;
     if (!ds4_gpu_use_mpp_q8_0_matmul()) return 0;
-    if (!ds4_gpu_mpp_q8_0_context_matches_filter()) return 0;
+    if (!ds4_gpu_mpp_q8_0_context_matches_filter(n_tok)) return 0;
     if ((n_tok % 32u) == 0 || ds4_gpu_mpp_q8_0_partial_tiles_enabled()) return 1;
 
     if (!g_mpp_q8_partial_skip_reported) {
@@ -1340,12 +1365,12 @@ enum {
     DS4_METAL_MOE_MPP_UP   = 1 << 1,
     DS4_METAL_MOE_MPP_DOWN = 1 << 2,
 
-    DS4_METAL_MOE_MPP_DEFAULT_GATE_LAYER = 28,
-    DS4_METAL_MOE_MPP_DEFAULT_UP_LAYER   = 30,
-    DS4_METAL_MOE_MPP_DEFAULT_DOWN_LAYER = 28,
-    DS4_METAL_MOE_MPP_FAST_GATE_LAYER    = 13,
-    DS4_METAL_MOE_MPP_FAST_UP_LAYER      = 13,
-    DS4_METAL_MOE_MPP_FAST_DOWN_LAYER    = 2,
+    DS4_METAL_MOE_MPP_DEFAULT_GATE_LAYER = 0,
+    DS4_METAL_MOE_MPP_DEFAULT_UP_LAYER   = 0,
+    DS4_METAL_MOE_MPP_DEFAULT_DOWN_LAYER = 0,
+    DS4_METAL_MOE_MPP_FAST_GATE_LAYER    = 0,
+    DS4_METAL_MOE_MPP_FAST_UP_LAYER      = 0,
+    DS4_METAL_MOE_MPP_FAST_DOWN_LAYER    = 0,
 };
 
 static int ds4_gpu_mpp_routed_moe_default_target(void) {
@@ -1458,17 +1483,17 @@ static int ds4_gpu_mpp_routed_moe_mask_for_layer(uint32_t layer_index) {
         if ((int)layer_index >= gate_start) mask |= DS4_METAL_MOE_MPP_GATE;
         if ((mask & DS4_METAL_MOE_MPP_DOWN) &&
             !ds4_gpu_mpp_moe_context_matches_filter("DS4_METAL_MPP_MOE_DOWN_FILTER",
-                                                      DS4_METAL_MOE_MPP_DEFAULT_DOWN_LAYER)) {
+                                                      down_start)) {
             mask &= ~DS4_METAL_MOE_MPP_DOWN;
         }
         if ((mask & DS4_METAL_MOE_MPP_UP) &&
             !ds4_gpu_mpp_moe_context_matches_filter("DS4_METAL_MPP_MOE_UP_FILTER",
-                                                      DS4_METAL_MOE_MPP_DEFAULT_UP_LAYER)) {
+                                                      up_start)) {
             mask &= ~DS4_METAL_MOE_MPP_UP;
         }
         if ((mask & DS4_METAL_MOE_MPP_GATE) &&
             !ds4_gpu_mpp_moe_context_matches_filter("DS4_METAL_MPP_MOE_GATE_FILTER",
-                                                      DS4_METAL_MOE_MPP_DEFAULT_GATE_LAYER)) {
+                                                      gate_start)) {
             mask &= ~DS4_METAL_MOE_MPP_GATE;
         }
         return mask & requested_mask;
@@ -4785,6 +4810,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_dsv4_indexed_mixed_attention_heads8");
         g_dsv4_indexed_attention_heads8_rb4_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_indexed_mixed_attention_heads8_rb4");
+        g_dsv4_indexed_attention_heads8_rb16_pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv4_indexed_mixed_attention_heads8_rb16");
         g_dsv4_softplus_sqrt_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_softplus_sqrt_f32_4");
         g_dsv4_router_finalize_one_pipeline =
@@ -4798,6 +4825,7 @@ int ds4_gpu_init(void) {
             !g_dsv4_sort_i32_rows_asc_pipeline ||
             !g_dsv4_indexed_attention_heads8_pipeline ||
             !g_dsv4_indexed_attention_heads8_rb4_pipeline ||
+            !g_dsv4_indexed_attention_heads8_rb16_pipeline ||
             !g_dsv4_softplus_sqrt_pipeline ||
             !g_dsv4_router_finalize_one_pipeline ||
             !g_dsv4_router_weights_one_pipeline ||
@@ -5078,6 +5106,7 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_sort_i32_rows_asc_pipeline = nil;
         g_dsv4_indexed_attention_heads8_pipeline = nil;
         g_dsv4_indexed_attention_heads8_rb4_pipeline = nil;
+        g_dsv4_indexed_attention_heads8_rb16_pipeline = nil;
         g_dsv4_softplus_sqrt_pipeline = nil;
         g_dsv4_router_finalize_one_pipeline = nil;
         g_dsv4_router_weights_one_pipeline = nil;
@@ -6226,7 +6255,7 @@ int ds4_gpu_matmul_q8_0_mpp_tensor(
         id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size, weight_offset, weight_bytes, &inner_offset);
         if (!wbuf) return 0;
 
-        const uint32_t tile_n = ds4_gpu_mpp_q8_0_tile_n();
+        const uint32_t tile_n = ds4_gpu_mpp_q8_0_tile_n_for_tokens(n_tok);
         const bool direct_rhs =
             (tile_n == 32u || tile_n == 64u) &&
             ds4_gpu_mpp_q8_0_direct_rhs();
@@ -12312,10 +12341,14 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             ds4_gpu_hot_pipeline(g_dsv4_sort_i32_rows_asc_pipeline,
                                     "kernel_dsv4_sort_i32_rows_asc");
         const bool decode_one_token = n_tokens == 1u;
+        const bool decode_rb4 = decode_one_token && ds4_gpu_use_indexed_attention_rb4();
         id<MTLComputePipelineState> attn_pipeline =
-            decode_one_token ?
+            decode_rb4 ?
             ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_rb4_pipeline,
                                    "kernel_dsv4_indexed_mixed_attention_heads8_rb4") :
+            decode_one_token ?
+            ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_rb16_pipeline,
+                                   "kernel_dsv4_indexed_mixed_attention_heads8_rb16") :
             ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_pipeline,
                                    "kernel_dsv4_indexed_mixed_attention_heads8");
         if (!sort_pipeline || !attn_pipeline) return 0;
@@ -12396,7 +12429,8 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
              atIndex:4];
         [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
         [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:6];
-        [enc setThreadgroupMemoryLength:(decode_one_token ? 4u : 1u) * 128u * 4u * sizeof(float)
+        [enc setThreadgroupMemoryLength:(decode_one_token ? (decode_rb4 ? 4u : 16u) : 1u) *
+                                        128u * 4u * sizeof(float)
                                 atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, ((NSUInteger)n_head + 7u) / 8u, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
