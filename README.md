@@ -1,10 +1,10 @@
-# ds4.c
+# DwarfStar 4
 
-`ds4.c` is a small native inference engine for DeepSeek V4 Flash. It is
+DrawfStar 4 is a small native inference engine for DeepSeek V4 Flash. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
 runtime, and not a framework. The main path is a DeepSeek V4 Flash-specific
-Metal graph executor with DS4-specific loading, prompt rendering, KV state, and
-server API glue.
+Metal and CUDA graph executor with DS4-specific loading, prompt rendering,
+KV state, and server API glue.
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
@@ -29,7 +29,7 @@ That said, a few important things about this project:
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is just alpha quality code, so probably we are not still there.
-* This is **Metal-only**, may implement CUDA support in the future? Perhaps, but nothing more. The CPU path is only for correctness check, but **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
+* The optimized graph path targets **Metal on macOS** and **CUDA on Linux**. The CPU path is only for correctness checks and model/tokenizer diagnostics. For CPU-only Linux builds, use `make cpu`; it builds the normal `./ds4` and `./ds4-server` binaries without CUDA or Metal. On macOS, **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
 
 ## Acknowledgements to llama.cpp and GGML
 
@@ -40,7 +40,7 @@ We are thankful and indebted to [`llama.cpp`](https://github.com/ggml-org/llama.
 and its contributors. Their implementation, kernels, tests, and design choices were
 an essential reference while building this DeepSeek V4 Flash-specific inference path.
 Some source-level pieces are retained or adapted here under the MIT license: GGUF
-quant layouts and tables, CPU quant/dot logic, and certain Metal kernels. For this
+quant layouts and tables, CPU quant/dot logic, and certain kernels. For this
 reason, and because we are genuinely grateful, we keep the GGML authors copyright
 notice in our `LICENSE` file.
 
@@ -113,6 +113,37 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | Mac Studio M3 Ultra, 512 GB | q2 | 11709 tokens | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
+| DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
+
+![M3 Max t/s](bench/m3_max_ts.svg)
+
+## Benchmarking
+
+`ds4-bench` measures instantaneous prefill and generation throughput at context
+frontiers instead of reporting one whole-run average. It loads the model once,
+walks a fixed token sequence to frontiers such as 2048, 4096, 6144, and uses
+incremental prefill so each row measures only the newly-added token interval.
+After each frontier it saves the live KV state to memory, generates a fixed
+greedy non-EOS probe, restores the memory snapshot, and continues prefill.
+
+```sh
+./ds4-bench \
+  -m ds4flash.gguf \
+  --prompt-file bench/promessi_sposi.txt \
+  --ctx-start 2048 \
+  --ctx-max 65536 \
+  --step-incr 2048 \
+  --gen-tokens 128
+```
+
+The example file is a cleaned public-domain Project Gutenberg text of
+Alessandro Manzoni's *I Promessi Sposi* (ebook #45334), with the Gutenberg
+header and footer removed: <https://www.gutenberg.org/ebooks/45334>.
+
+Use `--step-incr N` for different linear spacing, or `--step-mul F` for
+exponential sweeps. Output is CSV with one row per frontier: latest prefill
+interval tokens/sec, generation tokens/sec at that frontier, and
+`kvcache_bytes`.
 
 ## Metal 4 and M5 Neural Accelerators
 
@@ -305,7 +336,7 @@ ds4>
 ```
 
 The interactive CLI is a real multi-turn DS4 chat. It keeps the rendered chat
-transcript and the live Metal KV checkpoint, so each turn extends the previous
+transcript and the live graph KV checkpoint, so each turn extends the previous
 conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
 `/ctx N`, `/read FILE`, and `/quit`. Ctrl+C interrupts the current generation
 and returns to `ds4>`.
@@ -324,12 +355,12 @@ Start a local OpenAI/Anthropic-compatible server:
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-The server is Metal-only. It keeps one mutable graph/KV checkpoint in memory,
+The server keeps one mutable backend/KV checkpoint in memory,
 so stateless clients that resend a longer version of the same prompt can reuse
 the shared prefix instead of pre-filling from token zero.
 
 Request parsing and sockets run in client threads, but inference itself is
-serialized through one Metal worker. The current server does not batch multiple
+serialized through one graph worker. The current server does not batch multiple
 independent requests together; concurrent requests wait their turn on the single
 live graph/session.
 
@@ -741,21 +772,37 @@ the kv cache files include the verbatim prompt cached.
 
 ## Backends
 
-The default backend is Metal:
+The default graph backend is Metal on macOS and CUDA on Linux CUDA builds:
 
 ```sh
 ./ds4 -p "Hello" --metal
+./ds4 -p "Hello" --cuda
 ```
 
 There is also a CPU reference/debug path:
 
 ```sh
 ./ds4 -p "Hello" --cpu
+make cpu
+./ds4
+./ds4 -p "Hello"
 ```
 
-Do not treat the CPU path as the production target. The server is Metal-only,
-and the optimized implementation lives in the Metal graph path. This may
-change in the future.
+Do not treat the CPU path as the production target. The CLI and `ds4-server`
+support the CPU backend for reference/debug use and share the same KV session
+and snapshot format as Metal and CUDA, but normal inference should use Metal or
+CUDA.
+
+## Steering
+
+This project supports steering with single-vector activation directions; see the
+`dir-steering` directory for more information. This follows the core idea of the
+[Refusal in Language Models Is Mediated by a Single Direction](https://arxiv.org/abs/2406.11717)
+paper. You can use it to make the model more or less verbose, less likely to
+answer programming questions if it is a chatbot for your car rental web site,
+and so forth, much faster than fine-tuning.
+This is also useful for cybersecurity researchers who want to reduce a model's
+willingness to provide dual-use or offensive security guidance.
 
 ## Test Vectors
 

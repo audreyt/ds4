@@ -1,0 +1,15 @@
+{
+  "format": "ds4-directional-steering-v1",
+  "shape": [
+    43,
+    4096
+  ],
+  "component": "ffn_out",
+  "thinking": false,
+  "pair_normalize": false,
+  "orthogonalize_control_mean": true,
+  "good_file": "dir-steering/examples/succinct.txt",
+  "bad_file": "dir-steering/examples/verbose.txt",
+  "model": "/Users/antirez/hack/2026/ds4.c/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf",
+  "note": "runtime positive scale suppresses this direction; negative scale amplifies it"
+}

@@ -87,6 +87,51 @@ struct ds4_metal_args_dsv4_router_select_one {
     uint32_t hash_rows;
 };
 
+struct ds4_metal_args_dsv4_directional_steering_project {
+    uint32_t width;
+    uint32_t rows;
+    uint32_t layer;
+    uint32_t n_threads;
+    float    scale;
+};
+
+// Optional directional steering projection.
+//
+// Each threadgroup owns one 4096-wide token row, computes
+// dot(row, direction[layer]), then subtracts scale * direction * dot in-place.
+// Positive scales remove a concept direction; negative scales amplify it.  The
+// kernel is not used unless a steering file and nonzero scale are provided.
+kernel void kernel_dsv4_directional_steering_project_f32(
+        constant ds4_metal_args_dsv4_directional_steering_project & args,
+        device float *x,
+        device const float *directions,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    if (row >= args.rows || args.width == 0) return;
+
+    device float *xr = x + (uint64_t)row * args.width;
+    device const float *dir = directions + (uint64_t)args.layer * args.width;
+    const uint nth = args.n_threads;
+
+    float sum = 0.0f;
+    for (uint i = tid; i < args.width; i += nth) {
+        sum += xr[i] * dir[i];
+    }
+    scratch[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint step = nth >> 1; step > 0; step >>= 1) {
+        if (tid < step) scratch[tid] += scratch[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float coeff = args.scale * scratch[0];
+    for (uint i = tid; i < args.width; i += nth) {
+        xr[i] -= coeff * dir[i];
+    }
+}
+
 // Decode-only DS4 ratio-4 indexer score builder.  One threadgroup owns one
 // compressed row for the current token, stages that 128-wide row once, then
 // walks the 64 indexer heads in four-head groups.  This avoids materializing the
