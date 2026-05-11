@@ -1,8 +1,8 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
 #include "../ds4_server.c"
-#ifndef DS4_NO_METAL
-#include "../ds4_metal.h"
+#ifndef DS4_NO_GPU
+#include "../ds4_gpu.h"
 #include <math.h>
 
 static ds4_engine *test_engine_fast;
@@ -92,13 +92,13 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
         }
     }
 
-    ds4_metal_tensor *x = ds4_metal_tensor_alloc((uint64_t)in_dim * sizeof(float));
-    ds4_metal_tensor *out = ds4_metal_tensor_alloc((uint64_t)out_dim * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)in_dim * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
     TEST_ASSERT(x != NULL);
     TEST_ASSERT(out != NULL);
     if (!x || !out) {
-        ds4_metal_tensor_free(x);
-        ds4_metal_tensor_free(out);
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(out);
         free(weights_raw);
         return;
     }
@@ -110,8 +110,8 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
     if (!x_host || !out_host) {
         free(x_host);
         free(out_host);
-        ds4_metal_tensor_free(x);
-        ds4_metal_tensor_free(out);
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(out);
         free(weights_raw);
         return;
     }
@@ -120,12 +120,12 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
         x_host[i] = (float)((int)(i % 31u) - 15) / 32.0f;
     }
 
-    TEST_ASSERT(ds4_metal_tensor_write(x, 0, x_host, (uint64_t)in_dim * sizeof(float)) != 0);
-    TEST_ASSERT(ds4_metal_set_model_map(weights_raw, weight_alloc) != 0);
-    ds4_metal_set_quality(false);
-    TEST_ASSERT(ds4_metal_matmul_f16_tensor(out, weights_raw, weight_alloc, 0,
+    TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, (uint64_t)in_dim * sizeof(float)) != 0);
+    TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
+    ds4_gpu_set_quality(false);
+    TEST_ASSERT(ds4_gpu_matmul_f16_tensor(out, weights_raw, weight_alloc, 0,
                                             in_dim, out_dim, x, 1) != 0);
-    TEST_ASSERT(ds4_metal_tensor_read(out, 0, out_host, (uint64_t)out_dim * sizeof(float)) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, (uint64_t)out_dim * sizeof(float)) != 0);
 
     float max_abs = 0.0f;
     for (uint32_t o = 0; o < out_dim; o++) {
@@ -141,8 +141,8 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
 
     free(x_host);
     free(out_host);
-    ds4_metal_tensor_free(x);
-    ds4_metal_tensor_free(out);
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(out);
     free(weights_raw);
 }
 
@@ -574,7 +574,7 @@ typedef struct {
 } ds4_test_entry;
 
 static const ds4_test_entry test_entries[] = {
-#ifndef DS4_NO_METAL
+#ifndef DS4_NO_GPU
     {"--long-context", "long-context", "long Metal continuation regression", test_long_security_continuation},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison", test_official_logprob_vectors},
@@ -656,7 +656,7 @@ int main(int argc, char **argv) {
         }
     }
 
-#ifndef DS4_NO_METAL
+#ifndef DS4_NO_GPU
     test_close_engines();
 #endif
 
