@@ -49,6 +49,15 @@ audreyt/ds4
 └── (PR #15 lives at https://github.com/ivanfioravanti/ds4/tree/codex/metal4-m5-scaffold)
 ```
 
+Separately, `dir-steering/out/uncertainty.f32` (and its `.json` metadata) is
+a steering-direction artifact scoped to this fork — sitting alongside
+upstream's `verbosity.f32` example. Unlike items 1–3 above, it hasn't been
+sent upstream. The runtime wiring that uses it (default `ffn=-3` plus a
+hedge system prompt) lives in [pi-ds4](https://github.com/audreyt/pi-ds4);
+see its [Directional steering](https://github.com/audreyt/pi-ds4#directional-steering)
+section for what it does, why uncertainty rather than stance, and how to
+turn it off.
+
 ## Why this fork exists
 
 I run [pi-ds4](https://github.com/audreyt/pi-ds4) on a MacBook M5 Max and
