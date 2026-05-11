@@ -1529,16 +1529,16 @@ void raxStart(raxIterator *it, rax *rt) {
 int raxIteratorAddChars(raxIterator *it, unsigned char *s, size_t len) {
     if (len == 0) return 1;
     if (it->key_max < it->key_len+len) {
-        unsigned char *old = (it->key == it->key_static_string) ? NULL :
-                                                                  it->key;
+        int from_static = it->key == it->key_static_string;
+        unsigned char *old = from_static ? NULL : it->key;
         size_t new_max = (it->key_len+len)*2;
-        it->key = rax_realloc(old,new_max);
-        if (it->key == NULL) {
-            it->key = (!old) ? it->key_static_string : old;
+        unsigned char *new_key = rax_realloc(old,new_max);
+        if (new_key == NULL) {
             errno = ENOMEM;
             return 0;
         }
-        if (old == NULL) memcpy(it->key,it->key_static_string,it->key_len);
+        it->key = new_key;
+        if (from_static) memcpy(it->key,it->key_static_string,it->key_len);
         it->key_max = new_max;
     }
     /* Use memmove since there could be an overlap between 's' and
@@ -2373,16 +2373,16 @@ static int raxDefragAddChars(raxDefragIterator *it, unsigned char *s,
 {
     if (len == 0) return 1;
     if (it->key_max < it->key_len+len) {
-        unsigned char *old = (it->key == it->key_static_string) ? NULL :
-                                                                  it->key;
+        int from_static = it->key == it->key_static_string;
+        unsigned char *old = from_static ? NULL : it->key;
         size_t new_max = (it->key_len+len)*2;
-        it->key = rax_realloc(old,new_max);
-        if (it->key == NULL) {
-            it->key = (!old) ? it->key_static_string : old;
+        unsigned char *new_key = rax_realloc(old,new_max);
+        if (new_key == NULL) {
             errno = ENOMEM;
             return 0;
         }
-        if (old == NULL) memcpy(it->key,it->key_static_string,it->key_len);
+        it->key = new_key;
+        if (from_static) memcpy(it->key,it->key_static_string,it->key_len);
         it->key_max = new_max;
     }
     memcpy(it->key+it->key_len,s,len);

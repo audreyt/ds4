@@ -16,6 +16,7 @@
 
 typedef enum {
     DS4_BACKEND_METAL,
+    DS4_BACKEND_CUDA,
     DS4_BACKEND_CPU,
 } ds4_backend;
 
@@ -67,6 +68,9 @@ typedef struct {
     int n_threads;
     int mtp_draft_tokens;
     float mtp_margin;
+    const char *directional_steering_file;
+    float directional_steering_attn;
+    float directional_steering_ffn;
     bool warm_weights;
     bool quality;
     ds4_mpp_mode mpp_mode;
@@ -84,6 +88,12 @@ typedef struct {
     uint32_t raw_cap;
     uint32_t comp_cap;
 } ds4_context_memory;
+
+typedef struct {
+    uint8_t *ptr;
+    uint64_t len;
+    uint64_t cap;
+} ds4_session_snapshot;
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
@@ -142,14 +152,14 @@ void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *
 typedef enum {
     DS4_SESSION_REWRITE_ERROR = -1,
     DS4_SESSION_REWRITE_OK = 0,
-    /* The live graph cannot be rewritten safely in place.  The caller should
+    /* The live backend state cannot be rewritten safely in place.  The caller should
      * restore an older checkpoint if it has one, then sync to the prompt. */
     DS4_SESSION_REWRITE_REBUILD_NEEDED = 1,
 } ds4_session_rewrite_result;
 
 /* Synchronize the live session to a full prompt token prefix.  If the current
- * checkpoint is a prefix, only the suffix is evaluated; otherwise the graph is
- * refilled from scratch. */
+ * checkpoint is a prefix, only the suffix is evaluated; otherwise the backend
+ * state is refilled from scratch. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
@@ -157,6 +167,7 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
 int ds4_session_argmax(ds4_session *s);
+int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
@@ -179,5 +190,8 @@ const ds4_tokens *ds4_session_tokens(ds4_session *s);
 uint64_t ds4_session_payload_bytes(ds4_session *s);
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
+int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen);
+int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
+void ds4_session_snapshot_free(ds4_session_snapshot *snap);
 
 #endif

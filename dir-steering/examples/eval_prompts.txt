@@ -1,0 +1,5 @@
+Explain why databases use indexes.
+How should I learn sorting algorithms?
+Describe how clouds form.
+Give me advice for debugging a slow program.
+What is public key cryptography?

@@ -1,0 +1,100 @@
+Write a detailed, multi-paragraph explanation of what binary search is, including intuition, preconditions, and a small example.
+Explain why databases use indexes in a thorough answer with several concrete tradeoffs and examples.
+Give an expansive explanation of TCP congestion control, covering its goal, feedback signals, and why it changes speed over time.
+Explain recursion carefully with a step-by-step description, a concrete analogy, and a note about base cases.
+Describe caches in detail, including what they store, why they help, and what can go wrong.
+Explain how rain forms in a rich answer covering evaporation, condensation, clouds, and falling droplets.
+Describe photosynthesis in depth, including inputs, outputs, energy conversion, and why plants depend on it.
+Explain why passwords should be unique with a careful discussion of breaches, reuse, and practical safety habits.
+Explain unit tests in detail, including what they verify, how they fit into development, and their limitations.
+Describe DNS thoroughly, including names, resolvers, records, caching, and why it matters for the web.
+Explain why exercise improves health in a detailed answer covering heart, muscles, mood, sleep, and long-term effects.
+Give a thorough explanation of hash tables, including hashing, buckets, collisions, and average-case performance.
+Explain gradient descent in depth, including the loss function, gradients, step size, and how iteration improves a model.
+Describe inflation carefully, including price levels, purchasing power, possible causes, and everyday consequences.
+Explain how vaccines work in detail, including immune memory, antigens, protection, and population effects.
+Describe what an API is with examples, explaining contracts, inputs, outputs, stability, and how developers use APIs.
+Explain how compilers work in a detailed sequence from parsing through optimization to code generation.
+Describe merge sort thoroughly, including divide and conquer, merging, complexity, and when it is useful.
+Explain why backups matter in depth, including accidents, hardware failure, ransomware, recovery time, and testing restores.
+Define latency with a detailed discussion of delay, network hops, queues, tail latency, and user-visible impact.
+Explain public key cryptography thoroughly, including key pairs, encryption, signatures, trust, and common uses.
+Describe load balancers in detail, including traffic distribution, health checks, failover, and scaling.
+Explain how solar panels generate electricity with a detailed description of photons, cells, current, and inverters.
+Explain supply and demand thoroughly, including curves, equilibrium, shortages, surpluses, and real-world examples.
+Describe containerization in depth, including images, isolation, portability, orchestration, and operational benefits.
+Explain the water cycle in a detailed answer covering evaporation, condensation, precipitation, runoff, and groundwater.
+Define entropy in a broad explanation covering disorder, information, uncertainty, and why context changes the meaning.
+Explain how recommendation systems work in detail, including signals, user history, item similarity, ranking, and feedback loops.
+Explain why teams use version control in depth, covering history, collaboration, branching, review, and recovery.
+Describe neural networks thoroughly, including layers, weights, activations, training, and what they approximate.
+Explain database transactions in detail, including atomicity, consistency, isolation, durability, and examples.
+Describe event loops thoroughly, including queues, callbacks, nonblocking I/O, and why they matter in servers.
+Explain how airplanes stay aloft in depth, covering lift, wings, airflow, thrust, drag, and control surfaces.
+Explain why sleep matters with a detailed discussion of memory, hormones, immune function, mood, and recovery.
+Explain OAuth in detail, including delegated authorization, access tokens, scopes, consent, and common flows.
+Define bandwidth in a detailed answer covering capacity, throughput, bottlenecks, and how it differs from latency.
+Explain how a thermostat works in detail, including sensors, set points, feedback loops, and heating or cooling control.
+Describe memoization thoroughly, including caching function results, when it helps, and when it can waste memory.
+Explain why code reviews are useful in depth, including correctness, maintainability, knowledge sharing, and team standards.
+Describe how markets set prices in detail, including buyers, sellers, incentives, information, scarcity, and competition.
+Explain microservices thoroughly, including service boundaries, independent deployment, communication, and operational costs.
+Explain backpropagation in depth, including forward passes, gradients, the chain rule, and weight updates.
+Describe how a search engine ranks pages in detail, including crawling, indexing, relevance, links, freshness, and quality signals.
+Explain opportunity cost thoroughly, including tradeoffs, alternatives, hidden costs, and everyday decision examples.
+Describe rate limiting in detail, including quotas, windows, tokens, fairness, abuse prevention, and user experience.
+Explain why logging is useful in depth, covering debugging, audits, operations, metrics, and incident response.
+Explain climate change carefully, including greenhouse gases, warming mechanisms, impacts, uncertainty, and mitigation.
+Describe how checksums detect errors in detail, including summaries, corruption, collision risk, and practical uses.
+Explain database normalization thoroughly, including redundancy, anomalies, normal forms, and tradeoffs.
+Describe garbage collection in detail, including allocation, reachability, tracing, freeing memory, and pauses.
+Explain why encryption needs keys in depth, covering secrecy, algorithms, key exchange, storage, and compromise.
+Describe how GPS finds location thoroughly, including satellites, timing, trilateration, clocks, and error correction.
+Explain continuous integration in detail, including automated builds, tests, integration frequency, and feedback.
+Describe queues and stacks thoroughly, including ordering rules, operations, use cases, and examples.
+Explain overfitting in depth, including training error, generalization, model complexity, validation, and prevention.
+Describe DNS caching thoroughly, including TTLs, resolvers, stale entries, performance, and invalidation problems.
+Explain what a kernel is in detail, including hardware mediation, processes, memory, drivers, and system calls.
+Explain how to prioritize tasks in depth, covering urgency, impact, dependencies, deadlines, and opportunity cost.
+Explain why indexes can slow writes in detail, including maintenance, extra storage, page splits, and transaction overhead.
+Describe HTTP thoroughly, including requests, responses, methods, headers, status codes, and statelessness.
+Explain proxy servers in detail, including forwarding, filtering, caching, privacy, reverse proxies, and load balancing.
+Describe how compression saves space in depth, including redundancy, dictionaries, entropy coding, and lossless versus lossy tradeoffs.
+Explain database replication thoroughly, including primary and replicas, lag, failover, consistency, and read scaling.
+Describe how compilers differ from interpreters in depth, including translation timing, runtime behavior, optimization, and examples.
+Explain amortized cost thoroughly, including occasional expensive operations, averaged guarantees, and data structure examples.
+Describe Bloom filters in detail, including hashing, bit arrays, false positives, memory efficiency, and use cases.
+Explain why batteries degrade in depth, including chemistry, charge cycles, heat, fast charging, and capacity loss.
+Explain runoff voting thoroughly, including ballot ranking, elimination rounds, majority goals, and possible strategic effects.
+Describe semantic versioning in detail, including major, minor, and patch numbers, compatibility promises, and release examples.
+Explain how a CDN helps a website in depth, including edge caches, latency, bandwidth, resilience, and invalidation.
+Define idempotency thoroughly, including repeated operations, safety, HTTP examples, retries, and distributed systems relevance.
+Explain mutexes in detail, including mutual exclusion, critical sections, contention, deadlocks, and alternatives.
+Explain why monitoring matters thoroughly, covering metrics, logs, alerts, trends, incidents, and service reliability.
+Describe how email routing works in detail, including DNS records, SMTP servers, queues, spam checks, and delivery.
+Explain how neural embeddings represent text in depth, including vectors, semantic similarity, training signals, and retrieval uses.
+Describe dependency injection thoroughly, including object construction, decoupling, testing, configuration, and tradeoffs.
+Explain race conditions in detail, including shared state, timing, nondeterminism, examples, and prevention techniques.
+Explain why documentation helps teams in depth, covering onboarding, decisions, maintenance, coordination, and future debugging.
+Describe how a blockchain works thoroughly, including blocks, hashes, consensus, append-only history, and tradeoffs.
+Explain memory leaks in detail, including unreachable allocations, retained references, symptoms, and detection.
+Define consensus in distributed systems thoroughly, including agreement, failures, quorums, leaders, and consistency.
+Describe priority queues in depth, including priorities, heap implementations, operations, and scheduling examples.
+Explain why caching is hard to invalidate in detail, including stale data, dependencies, timing, consistency, and user impact.
+Explain how to debug a slow program thoroughly, covering measurement, profiling, hypotheses, bottlenecks, and regression checks.
+Describe firewalls in detail, including packet filtering, rules, ports, network boundaries, and limitations.
+Explain how interest rates affect borrowing in depth, including monthly payments, risk, central banks, and business investment.
+Describe what an operating system does thoroughly, including process scheduling, memory, files, devices, and permissions.
+Explain how a web browser renders a page in detail, including parsing, CSS, layout, painting, JavaScript, and compositing.
+Describe feature flags thoroughly, including runtime switches, gradual rollout, experiments, rollback, and cleanup.
+Explain how garbage collection pauses happen in detail, including stop-the-world phases, heap scanning, compaction, and latency.
+Define eventual consistency thoroughly, including replicas, propagation delay, conflicts, convergence, and application tradeoffs.
+Describe sharding in depth, including partition keys, distribution, rebalancing, hotspots, and cross-shard queries.
+Explain deadlocks in detail, including locks, waiting cycles, conditions, detection, and prevention strategies.
+Describe how a camera sensor captures light in depth, including pixels, photons, charge, color filters, exposure, and noise.
+Explain why indexes need selectivity thoroughly, including cardinality, query planners, scans, and cases where indexes are ignored.
+Describe what a scheduler does in detail, including tasks, priorities, fairness, deadlines, and resource allocation.
+Define precision and recall thoroughly, including true positives, false positives, false negatives, and when each metric matters.
+Explain streaming APIs in depth, including incremental delivery, backpressure, connections, errors, and client handling.
+Explain why projects need tests thoroughly, including regression prevention, design feedback, confidence, automation, and documentation.
+Describe how to choose a data structure in detail, including operations, constraints, complexity, memory, and real-world tradeoffs.

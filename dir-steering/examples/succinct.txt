@@ -1,0 +1,100 @@
+Answer in one short sentence: what is binary search?
+In two concise bullets, explain why databases use indexes.
+Give a terse definition of TCP congestion control.
+Summarize recursion in exactly one sentence.
+Briefly explain what a cache does.
+Give a minimal explanation of how rain forms.
+In one compact paragraph, describe photosynthesis.
+Answer briefly: why should passwords be unique?
+Give a concise explanation of unit tests.
+In one sentence, explain what DNS does.
+Briefly explain why exercise improves health.
+Give a short answer: what is a hash table?
+Explain gradient descent in two crisp sentences.
+Define inflation in one sentence.
+Give a terse summary of how vaccines work.
+Answer briefly: what is an API?
+In one short paragraph, explain how compilers work.
+Give a compact explanation of merge sort.
+Briefly explain why backups matter.
+Define latency in one concise sentence.
+Give a minimal explanation of public key cryptography.
+In two short bullets, explain what a load balancer does.
+Briefly describe how solar panels generate electricity.
+Give a one-sentence explanation of supply and demand.
+Answer tersely: what is containerization?
+In one compact paragraph, explain the water cycle.
+Give a short definition of entropy.
+Briefly explain how a recommendation system works.
+Give a concise answer: why do teams use version control?
+Explain neural networks in two short sentences.
+Answer in one sentence: what is a database transaction?
+Give a terse explanation of event loops.
+Briefly explain how airplanes stay aloft.
+Give a compact summary of why sleep matters.
+In two concise bullets, explain what OAuth is for.
+Define bandwidth in one short sentence.
+Answer briefly: how does a thermostat work?
+Give a minimal explanation of memoization.
+Briefly explain why code reviews are useful.
+In one short paragraph, describe how markets set prices.
+Give a terse answer: what is a microservice?
+Explain backpropagation in two compact sentences.
+Briefly describe how a search engine ranks pages.
+Give a one-sentence explanation of opportunity cost.
+Answer concisely: what is rate limiting?
+In two short bullets, explain why logging is useful.
+Give a compact explanation of climate change.
+Briefly explain how checksums detect errors.
+Define normalization in databases in one sentence.
+Give a terse explanation of garbage collection.
+Answer briefly: why does encryption need keys?
+In one compact paragraph, explain how GPS finds location.
+Give a short explanation of continuous integration.
+Briefly describe how a queue differs from a stack.
+Define overfitting in one concise sentence.
+Give a minimal explanation of DNS caching.
+Answer tersely: what is a kernel?
+In two concise bullets, explain how to prioritize tasks.
+Briefly explain why indexes can slow writes.
+Give a compact explanation of HTTP.
+In one sentence, explain what a proxy server does.
+Answer briefly: how does compression save space?
+Give a terse explanation of database replication.
+Briefly explain how a compiler differs from an interpreter.
+Define amortized cost in one short sentence.
+Give a minimal explanation of a Bloom filter.
+Answer concisely: why do batteries degrade?
+In one compact paragraph, explain how elections use runoff voting.
+Give a short explanation of semantic versioning.
+Briefly describe how a CDN helps a website.
+Define idempotency in one concise sentence.
+Answer tersely: what is a mutex?
+In two short bullets, explain why monitoring matters.
+Give a compact explanation of how email routing works.
+Briefly explain how a neural embedding represents text.
+Give a one-sentence explanation of dependency injection.
+Answer briefly: what is a race condition?
+In one compact paragraph, explain why documentation helps teams.
+Give a terse description of how a blockchain works.
+Briefly explain what a memory leak is.
+Define consensus in distributed systems in one sentence.
+Give a minimal explanation of a priority queue.
+Answer concisely: why is caching hard to invalidate?
+In two concise bullets, explain how to debug a slow program.
+Briefly explain what a firewall does.
+Give a compact explanation of how interest rates affect borrowing.
+In one sentence, explain what an operating system does.
+Answer briefly: how does a web browser render a page?
+Give a terse explanation of feature flags.
+Briefly explain how garbage collection pauses happen.
+Define eventual consistency in one concise sentence.
+Give a minimal explanation of sharding.
+Answer concisely: what is a deadlock?
+In one compact paragraph, explain how a camera sensor captures light.
+Give a short explanation of why indexes need selectivity.
+Briefly describe what a scheduler does.
+Define precision and recall in one sentence.
+Give a terse explanation of streaming APIs.
+Answer briefly: why do projects need tests?
+In two short bullets, explain how to choose a data structure.
