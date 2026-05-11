@@ -1733,16 +1733,9 @@ kernel void kernel_mul_mm_id(
                 const short lx = i;
                 const short ly = (tiitg/NL1)%8;
 
-#ifdef DS4_METAL_HAS_TENSOR
-                if (FC_mul_mm_id_mpp) {
-                    *(sb + NK*(8*sy + ly) + 8*sx + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
-                } else
-#endif
-                {
                 const short ib = 4*sx + sy;
 
                 *(sb + 64*ib + 8*ly + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
-                }
             }
             }
         } else {
@@ -1778,12 +1771,6 @@ kernel void kernel_mul_mm_id(
 
             const short ly = (tiitg/NL1)%8;
 
-#ifdef DS4_METAL_HAS_TENSOR
-            if (FC_mul_mm_id_mpp) {
-                *(threadgroup S1_2x4 *)(sb + NK*(8*sy + ly) + 8*sx) = (S1_2x4)(*((device T1_2x4 *) y));
-            } else
-#endif
-            {
             const short ib = 4*sx + sy;
 
             *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y));
@@ -2480,87 +2467,6 @@ typedef decltype(kernel_attn_out_low_q8_0_mpp_direct_rhs<64>) attn_out_low_q8_0_
 template [[host_name("kernel_attn_out_low_q8_0_mpp_direct_rhs")]] kernel attn_out_low_q8_0_mpp_direct_rhs_t kernel_attn_out_low_q8_0_mpp_direct_rhs<32>;
 template [[host_name("kernel_attn_out_low_q8_0_mpp_direct_rhs_n64")]] kernel attn_out_low_q8_0_mpp_direct_rhs_n64_t kernel_attn_out_low_q8_0_mpp_direct_rhs<64>;
 
-#endif
-
-#ifdef DS4_METAL_HAS_TENSOR
-kernel void kernel_attn_out_low_q8_0_mpp(
-        constant ds4_metal_args_mul_mm_id & args,
-        device const char * srcA,
-        device const char * srcB,
-        device       char * dst,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiitg [[thread_index_in_threadgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    (void) sgitg;
-
-    constexpr int NR0 = 64;
-    constexpr int NR1 = 32;
-    constexpr int NK  = 32;
-    constexpr int NL  = NK/16;
-    constexpr int NUM_THREADS = 128;
-
-    const int K = args.ne00;
-    const int M = args.ne0;
-    const int N = args.ne21;
-    const int G = args.ne1;
-    const int group = tgpig.z;
-    const int r0 = tgpig.y*NR0;
-    const int r1 = tgpig.x*NR1;
-
-    threadgroup half *sa = (threadgroup half *)shmem;
-    auto tA = tensor(sa, dextents<int32_t, 2>(NK, NR0));
-
-    device float *ptrB = (device float *)(srcB + args.nb11*group);
-    const int strideB = args.nb12/sizeof(float);
-    auto tB = tensor(ptrB, dextents<int32_t, 2>(K, N), array<int, 2>({1, strideB}));
-
-    matmul2d<
-        matmul2d_descriptor(NR1, NR0, NK, false, true, true,
-            matmul2d_descriptor::mode::multiply_accumulate),
-        execution_simdgroups<4>> mm;
-
-    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
-
-    for (int loop_k = 0; loop_k < K; loop_k += NK) {
-        for (int work = tiitg; work < NR0*NL; work += NUM_THREADS) {
-            const int row = work/NL;
-            const int k_chunk = work%NL;
-            const int k_pos = loop_k + k_chunk*16;
-            const short k_base = k_chunk*16;
-
-            if (r0 + row < M) {
-                const int block_idx = k_pos/32;
-                const short il = (k_pos/16)%2;
-                device const block_q8_0 *row_ptr =
-                    (device const block_q8_0 *)(srcA + args.nb01*(r0 + row) + group*args.nb02);
-
-                half4x4 temp_a;
-                dequantize_q8_0(row_ptr + block_idx, il, temp_a);
-                FOR_UNROLL (short i = 0; i < 16; i++) {
-                    sa[row*NK + k_base + i] = (k_pos + i < K) ? temp_a[i/4][i%4] : (half)0;
-                }
-            } else {
-                FOR_UNROLL (short i = 0; i < 16; i++) {
-                    sa[row*NK + k_base + i] = (half)0;
-                }
-            }
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        auto mA = tA.slice(0, 0);
-        auto mB = tB.slice(loop_k, r1);
-        mm.run(mB, mA, cT);
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    device float *dst_group = (device float *)dst + group*M;
-    auto tD = tensor(dst_group, dextents<int32_t, 2>(M, N), array<int, 2>({1, G*M}));
-    auto mD = tD.slice(r0, r1);
-    cT.store(mD);
-}
 #endif
 
 #undef QK_NL
