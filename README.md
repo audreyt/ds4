@@ -1,4 +1,4 @@
-# DeepSeek V4 Flash Abliterated on a personal laptop
+# DwarfStar 4 (Abliterated)
 
 This is a personal fork of [antirez/ds4](https://github.com/antirez/ds4) —
 Salvatore Sanfilippo's hand-written C inference engine for DeepSeek V4 Flash —
