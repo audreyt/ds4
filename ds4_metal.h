@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "ds4.h"
+
 /* =========================================================================
  * Metal Tensor and Command Lifetime.
  * =========================================================================
@@ -37,6 +39,9 @@ int ds4_metal_synchronize(void);
 int ds4_metal_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
 void ds4_metal_set_quality(bool quality);
+void ds4_metal_set_mpp_mode(ds4_mpp_mode mode);
+void ds4_metal_set_mpp_compare_context(const char *module, uint32_t layer_index, uint32_t pos0);
+void ds4_metal_clear_mpp_compare_context(void);
 void ds4_metal_print_memory_report(const char *label);
 
 /* =========================================================================

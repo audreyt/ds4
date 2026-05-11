@@ -96,7 +96,9 @@ static void usage(FILE *fp) {
         "  -t, --threads N\n"
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
-        "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
+        "      Prefer exact kernels where faster approximate paths exist; disables Metal 4 MPP routes; MTP uses strict verification.\n"
+        "  --mpp MODE\n"
+        "      Metal 4 MPP policy: auto, on, or off. Default: auto. Auto enables validated safe routes; 'on' is a route diagnostic and may change output.\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
         "\n"
@@ -205,6 +207,15 @@ static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4: invalid backend: %s\n", s);
     fprintf(stderr, "ds4: valid backends are: metal, cpu\n");
+    exit(2);
+}
+
+static ds4_mpp_mode parse_mpp_mode(const char *s) {
+    if (!strcmp(s, "auto")) return DS4_MPP_AUTO;
+    if (!strcmp(s, "on")) return DS4_MPP_ON;
+    if (!strcmp(s, "off")) return DS4_MPP_OFF;
+    fprintf(stderr, "ds4: invalid MPP mode: %s\n", s);
+    fprintf(stderr, "ds4: valid MPP modes are: auto, on, off\n");
     exit(2);
 }
 
@@ -1211,6 +1222,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
+        } else if (!strcmp(arg, "--mpp")) {
+            c.engine.mpp_mode = parse_mpp_mode(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
