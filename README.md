@@ -53,14 +53,14 @@ Separately, `dir-steering/out/uncertainty.f32` (and its `.json` metadata) is
 a steering-direction artifact scoped to this fork — sitting alongside
 upstream's `verbosity.f32` example. Unlike items 1–3 above, it hasn't been
 sent upstream. The runtime wiring that uses it (default `ffn=-3` plus a
-hedge system prompt) lives in [pi-ds4](https://github.com/audreyt/pi-ds4);
+hedge system prompt) lives in [audreyt/pi-ds4](https://github.com/audreyt/pi-ds4);
 see its [Directional steering](https://github.com/audreyt/pi-ds4#directional-steering)
 section for what it does, why uncertainty rather than stance, and how to
 turn it off.
 
 ## Why this fork exists
 
-I run [pi-ds4](https://github.com/audreyt/pi-ds4) on a MacBook M5 Max and
+I run [audreyt/pi-ds4](https://github.com/audreyt/pi-ds4) on a MacBook M5 Max and
 wanted the cyberneurova abliterated DeepSeek V4 Flash GGUFs to load without
 pre-converting the file or running a separate inference engine.
 
@@ -130,7 +130,7 @@ flow works as-is:
 ```
 
 For a one-line install that handles the engine build, model download, and
-server lifecycle automatically, see [pi-ds4](https://github.com/audreyt/pi-ds4).
+server lifecycle automatically, see [audreyt/pi-ds4](https://github.com/audreyt/pi-ds4).
 
 ## Acknowledgements
 
