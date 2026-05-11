@@ -11084,7 +11084,10 @@ static bool metal_graph_encode_layer_attention_batch(
             fprintf(stderr, "ds4: Metal layer-major prefill needs attention compressor weights\n");
             ok = false;
         }
-        if (ok && ds4_env_bool_enabled("DS4_METAL_MPP_F16_PAIR")) {
+        const bool attn_comp_f16 = ok &&
+                                   layer->attn_compressor_kv->type == DS4_TENSOR_F16 &&
+                                   layer->attn_compressor_gate->type == DS4_TENSOR_F16;
+        if (attn_comp_f16 && ds4_env_bool_enabled("DS4_METAL_MPP_F16_PAIR")) {
             ok = metal_graph_matmul_f16_pair_or_separate(g->batch_comp_kv,
                                                          g->batch_comp_sc,
                                                          model,
@@ -11095,22 +11098,14 @@ static bool metal_graph_encode_layer_attention_batch(
                                                          g->batch_attn_norm,
                                                          n_tokens);
         } else if (ok) {
-            ok = ds4_metal_matmul_f16_tensor(g->batch_comp_kv,
-                                             model->map,
-                                             model->size,
-                                             layer->attn_compressor_kv->abs_offset,
-                                             DS4_N_EMBD,
-                                             comp_width,
-                                             g->batch_attn_norm,
-                                             n_tokens) != 0;
-            if (ok) ok = ds4_metal_matmul_f16_tensor(g->batch_comp_sc,
-                                                     model->map,
-                                                     model->size,
-                                                     layer->attn_compressor_gate->abs_offset,
-                                                     DS4_N_EMBD,
-                                                     comp_width,
-                                                     g->batch_attn_norm,
-                                                     n_tokens) != 0;
+            ok = metal_graph_matmul_plain_tensor(g->batch_comp_kv, model,
+                                                 layer->attn_compressor_kv,
+                                                 DS4_N_EMBD, comp_width,
+                                                 g->batch_attn_norm, n_tokens);
+            if (ok) ok = metal_graph_matmul_plain_tensor(g->batch_comp_sc, model,
+                                                         layer->attn_compressor_gate,
+                                                         DS4_N_EMBD, comp_width,
+                                                         g->batch_attn_norm, n_tokens);
         }
         if (ok) metal_graph_debug_dump_tensor("attn_comp_kv_raw",
                                               g->batch_comp_kv,
@@ -11374,7 +11369,10 @@ static bool metal_graph_encode_layer_attention_batch(
                 fprintf(stderr, "ds4: Metal layer-major prefill needs indexer weights\n");
                 ok = false;
             }
-            if (ok && ds4_env_bool_enabled("DS4_METAL_MPP_F16_PAIR")) {
+            const bool idx_comp_f16 = ok &&
+                                      layer->indexer_compressor_kv->type == DS4_TENSOR_F16 &&
+                                      layer->indexer_compressor_gate->type == DS4_TENSOR_F16;
+            if (idx_comp_f16 && ds4_env_bool_enabled("DS4_METAL_MPP_F16_PAIR")) {
                 ok = metal_graph_matmul_f16_pair_or_separate(g->batch_comp_kv,
                                                              g->batch_comp_sc,
                                                              model,
@@ -11385,22 +11383,14 @@ static bool metal_graph_encode_layer_attention_batch(
                                                              g->batch_attn_norm,
                                                              n_tokens);
             } else if (ok) {
-                ok = ds4_metal_matmul_f16_tensor(g->batch_comp_kv,
-                                                 model->map,
-                                                 model->size,
-                                                 layer->indexer_compressor_kv->abs_offset,
-                                                 DS4_N_EMBD,
-                                                 index_width,
-                                                 g->batch_attn_norm,
-                                                 n_tokens) != 0;
-                if (ok) ok = ds4_metal_matmul_f16_tensor(g->batch_comp_sc,
-                                                         model->map,
-                                                         model->size,
-                                                         layer->indexer_compressor_gate->abs_offset,
-                                                         DS4_N_EMBD,
-                                                         index_width,
-                                                         g->batch_attn_norm,
-                                                         n_tokens) != 0;
+                ok = metal_graph_matmul_plain_tensor(g->batch_comp_kv, model,
+                                                     layer->indexer_compressor_kv,
+                                                     DS4_N_EMBD, index_width,
+                                                     g->batch_attn_norm, n_tokens);
+                if (ok) ok = metal_graph_matmul_plain_tensor(g->batch_comp_sc, model,
+                                                             layer->indexer_compressor_gate,
+                                                             DS4_N_EMBD, index_width,
+                                                             g->batch_attn_norm, n_tokens);
             }
             if (ok) metal_graph_debug_dump_tensor("indexer_comp_kv_raw",
                                                   g->batch_comp_kv,
