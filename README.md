@@ -403,6 +403,18 @@ Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
 }
 ```
 
+For **swival.dev**, point its generic OpenAI-compatible provider at the running server:
+
+```sh
+swival --provider generic \
+       --base-url http://127.0.0.1:8000/v1 \
+       --model deepseek-v4-flash \
+       "Refactor the error handling in src/api.py"
+```
+
+Drop the positional task to start swival in REPL mode against ds4-server,
+or omit it and pipe the prompt on stdin.
+
 For **Claude Code**, use the Anthropic-compatible endpoint. A wrapper like this
 matches the local `~/bin/claude-ds4` setup:
 
