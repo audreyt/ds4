@@ -175,16 +175,16 @@ static void test_metal_q8_0_mpp_matmul_case(const char *label,
 
     const uint64_t x_bytes = (uint64_t)n_tok * in_dim * sizeof(float);
     const uint64_t out_bytes = (uint64_t)n_tok * out_dim * sizeof(float);
-    ds4_metal_tensor *x = ds4_metal_tensor_alloc(x_bytes);
-    ds4_metal_tensor *out_ref = ds4_metal_tensor_alloc(out_bytes);
-    ds4_metal_tensor *out_mpp = ds4_metal_tensor_alloc(out_bytes);
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
+    ds4_gpu_tensor *out_ref = ds4_gpu_tensor_alloc(out_bytes);
+    ds4_gpu_tensor *out_mpp = ds4_gpu_tensor_alloc(out_bytes);
     TEST_ASSERT(x != NULL);
     TEST_ASSERT(out_ref != NULL);
     TEST_ASSERT(out_mpp != NULL);
     if (!x || !out_ref || !out_mpp) {
-        ds4_metal_tensor_free(x);
-        ds4_metal_tensor_free(out_ref);
-        ds4_metal_tensor_free(out_mpp);
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(out_ref);
+        ds4_gpu_tensor_free(out_mpp);
         free(weights_raw);
         return;
     }
@@ -199,9 +199,9 @@ static void test_metal_q8_0_mpp_matmul_case(const char *label,
         free(x_host);
         free(ref_host);
         free(mpp_host);
-        ds4_metal_tensor_free(x);
-        ds4_metal_tensor_free(out_ref);
-        ds4_metal_tensor_free(out_mpp);
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(out_ref);
+        ds4_gpu_tensor_free(out_mpp);
         free(weights_raw);
         return;
     }
@@ -213,13 +213,13 @@ static void test_metal_q8_0_mpp_matmul_case(const char *label,
         }
     }
 
-    TEST_ASSERT(ds4_metal_tensor_write(x, 0, x_host, x_bytes) != 0);
-    TEST_ASSERT(ds4_metal_set_model_map(weights_raw, weight_alloc) != 0);
-    ds4_metal_set_quality(false);
-    TEST_ASSERT(ds4_metal_matmul_q8_0_tensor(out_ref, weights_raw, weight_alloc, 0,
+    TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
+    ds4_gpu_set_quality(false);
+    TEST_ASSERT(ds4_gpu_matmul_q8_0_tensor(out_ref, weights_raw, weight_alloc, 0,
                                              in_dim, out_dim, x, n_tok) != 0);
 
-    int have_mpp = ds4_metal_matmul_q8_0_mpp_tensor(
+    int have_mpp = ds4_gpu_matmul_q8_0_mpp_tensor(
         out_mpp, weights_raw, weight_alloc, 0, in_dim, out_dim, x, n_tok);
     if (!have_mpp) {
         fprintf(stderr, "ds4-test: skipping MPP Q8_0 matmul %s; Metal 4 tensor API unavailable\n",
@@ -227,15 +227,15 @@ static void test_metal_q8_0_mpp_matmul_case(const char *label,
         free(x_host);
         free(ref_host);
         free(mpp_host);
-        ds4_metal_tensor_free(x);
-        ds4_metal_tensor_free(out_ref);
-        ds4_metal_tensor_free(out_mpp);
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(out_ref);
+        ds4_gpu_tensor_free(out_mpp);
         free(weights_raw);
         return;
     }
 
-    TEST_ASSERT(ds4_metal_tensor_read(out_ref, 0, ref_host, out_bytes) != 0);
-    TEST_ASSERT(ds4_metal_tensor_read(out_mpp, 0, mpp_host, out_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(out_ref, 0, ref_host, out_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(out_mpp, 0, mpp_host, out_bytes) != 0);
 
     float max_abs = 0.0f;
     double sumsq = 0.0;
@@ -263,9 +263,9 @@ static void test_metal_q8_0_mpp_matmul_case(const char *label,
     free(x_host);
     free(ref_host);
     free(mpp_host);
-    ds4_metal_tensor_free(x);
-    ds4_metal_tensor_free(out_ref);
-    ds4_metal_tensor_free(out_mpp);
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(out_ref);
+    ds4_gpu_tensor_free(out_mpp);
     free(weights_raw);
 }
 
