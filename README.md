@@ -1,8 +1,23 @@
-# DwarfStar 4
+# DwarfStar 4 with M5 optimizations
 
-**Apple M5 note:** this fork includes M5-specific `metal_simdgroup_matrix`
-optimization for dense prefill/routed-MoE matmul kernels and GPU-private
-scratch buffers for hot Metal intermediates.
+**Apple M5 performance note:** on an Apple M5 Max with 128 GB RAM, this `m5`
+branch is substantially faster than `main` in a single-run Metal `ds4-bench`
+sweep using `ds4flash.gguf`, `speed-bench/promessi_sposi.txt`, contexts
+2048-8192, 2048-token steps, and 64 generated tokens.
+
+Geometric-mean speedup across the measured frontiers is **1.86x prefill**
+and **1.45x generation**.
+
+| Context | main prefill | m5 prefill | Prefill uplift | main gen | m5 gen | Gen uplift |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2048 | 188.46 t/s | 369.98 t/s | +96.3% | 20.43 t/s | 31.35 t/s | +53.5% |
+| 4096 | 168.54 t/s | 336.40 t/s | +99.6% | 20.89 t/s | 30.97 t/s | +48.3% |
+| 6144 | 175.20 t/s | 328.10 t/s | +87.3% | 21.73 t/s | 30.62 t/s | +40.9% |
+| 8192 | 182.32 t/s | 300.43 t/s | +64.8% | 22.12 t/s | 30.46 t/s | +37.7% |
+
+The `m5` branch includes M5-specific `metal_simdgroup_matrix` optimization for
+dense prefill/routed-MoE matmul kernels and GPU-private scratch buffers for hot
+Metal intermediates.
 
 DrawfStar 4 is a small native inference engine for DeepSeek V4 Flash. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
