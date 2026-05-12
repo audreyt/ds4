@@ -11,3 +11,4 @@
 *.dSYM/
 /misc/
 .*.swp
+.DS_Store
