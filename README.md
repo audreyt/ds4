@@ -1,5 +1,8 @@
 # DwarfStar 4
 
+**Apple M5 note:** this fork includes an M5-specific `metal_simdgroup_matrix`
+optimization for dense prefill and routed-MoE matmul kernels.
+
 DrawfStar 4 is a small native inference engine for DeepSeek V4 Flash. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
 runtime, and not a framework. The main path is a DeepSeek V4 Flash-specific
