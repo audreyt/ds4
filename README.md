@@ -3,10 +3,10 @@
 This is a personal fork of [antirez/ds4](https://github.com/antirez/ds4) —
 Salvatore Sanfilippo's hand-written C inference engine for DeepSeek V4 Flash —
 with three things added so the [cyberneurova abliterated GGUF](https://huggingface.co/cyberneurova/CyberNeurova-DeepSeek-V4-Flash-abliterated-GGUF)
-loads and runs end-to-end on Apple Silicon. The result is a 671b-parameter
+loads and runs end-to-end on Apple Silicon. The result is a 284b-parameter
 mixture-of-experts model running on a single laptop, with the steerability
-dial under the user's control, at about **440 prefill tokens per second**
-on M5 Max.
+dial under the user's control, at about **440 prefill tokens per second and
+30 inference tokens/second** on M5 Max.
 
 The personal-computing arithmetic that flipped mainframe-vs-PC in the 1980s now
 applies to frontier AI: the centralized service is more powerful in aggregate,
