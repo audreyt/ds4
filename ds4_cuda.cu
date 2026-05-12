@@ -24,6 +24,16 @@
 #define CUDA_QK_K 256
 #define DS4_CUDA_UNUSED __attribute__((unused))
 
+enum {
+    /* attention_decode_mixed_kernel stores raw-window scores plus visible
+     * compressed scores in shared memory.  The host routes larger unmasked
+     * decode calls to the online attention kernel so this fixed buffer never
+     * becomes an out-of-bounds write at long context. */
+    DS4_CUDA_ATTENTION_SCORE_CAP = 8192u,
+    DS4_CUDA_ATTENTION_RAW_SCORE_CAP = 256u,
+    DS4_CUDA_TOPK_MERGE_GROUP = 8u
+};
+
 struct ds4_gpu_tensor {
     void *ptr;
     uint64_t bytes;
@@ -114,6 +124,8 @@ static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
+static int g_q8_f16_disabled_after_oom;
+static int g_q8_f16_budget_notice_printed;
 static uint64_t g_model_load_progress_next;
 static double g_model_load_progress_last;
 static int g_model_load_progress_started;
@@ -163,6 +175,10 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     g_cuda_tmp = ptr;
     g_cuda_tmp_bytes = bytes;
     return g_cuda_tmp;
+}
+
+static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
+    return n_comp <= DS4_CUDA_ATTENTION_SCORE_CAP - DS4_CUDA_ATTENTION_RAW_SCORE_CAP;
 }
 
 static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
@@ -303,9 +319,142 @@ static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, ui
     return 0;
 }
 
+static void cuda_q8_f16_cache_release_all(void) {
+    for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
+        (void)cudaFree(r.device_ptr);
+    }
+    g_q8_f16_ranges.clear();
+    g_q8_f16_by_offset.clear();
+    g_q8_f16_bytes = 0;
+}
+
+static uint64_t cuda_parse_mib_env(const char *name, int *present) {
+    const char *env = getenv(name);
+    if (present) *present = 0;
+    if (!env || !env[0]) return 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(env, &end, 10);
+    if (end == env || *end != '\0') return 0;
+    if (present) *present = 1;
+    if (v > UINT64_MAX / 1048576ull) return UINT64_MAX;
+    return (uint64_t)v * 1048576ull;
+}
+
+static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
+    int present = 0;
+    const uint64_t limit = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_MB", &present);
+    return present ? limit : UINT64_MAX;
+}
+
+static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
+    int present = 0;
+    const uint64_t reserve = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB", &present);
+    if (present) return reserve;
+
+    /* The expanded Q8->F16 cache is only an acceleration path.  Keep enough
+     * device memory free for cuBLAS workspaces, transient graph buffers, and
+     * driver bookkeeping instead of letting optional cached weights consume the
+     * last few GiB on 96 GiB cards. */
+    const uint64_t min_reserve = 4096ull * 1048576ull;
+    const uint64_t pct_reserve = total_bytes / 20u; /* 5% */
+    return pct_reserve > min_reserve ? pct_reserve : min_reserve;
+}
+
+static void cuda_q8_f16_cache_budget_notice(
+        const char *reason,
+        uint64_t request_bytes,
+        uint64_t free_bytes,
+        uint64_t total_bytes,
+        uint64_t reserve_bytes,
+        uint64_t limit_bytes) {
+    if (g_q8_f16_budget_notice_printed && getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") == NULL) return;
+    g_q8_f16_budget_notice_printed = 1;
+    if (limit_bytes != UINT64_MAX && free_bytes == 0 && total_bytes == 0 && reserve_bytes == 0) {
+        fprintf(stderr,
+                "ds4: CUDA q8 fp16 cache %s; using q8 kernels "
+                "(request=%.2f MiB cached=%.2f GiB limit=%.2f GiB)\n",
+                reason,
+                (double)request_bytes / 1048576.0,
+                (double)g_q8_f16_bytes / 1073741824.0,
+                (double)limit_bytes / 1073741824.0);
+    } else if (limit_bytes == UINT64_MAX) {
+        fprintf(stderr,
+                "ds4: CUDA q8 fp16 cache %s; using q8 kernels "
+                "(request=%.2f MiB cached=%.2f GiB free=%.2f GiB reserve=%.2f GiB total=%.2f GiB)\n",
+                reason,
+                (double)request_bytes / 1048576.0,
+                (double)g_q8_f16_bytes / 1073741824.0,
+                (double)free_bytes / 1073741824.0,
+                (double)reserve_bytes / 1073741824.0,
+                (double)total_bytes / 1073741824.0);
+    } else {
+        fprintf(stderr,
+                "ds4: CUDA q8 fp16 cache %s; using q8 kernels "
+                "(request=%.2f MiB cached=%.2f GiB limit=%.2f GiB free=%.2f GiB reserve=%.2f GiB total=%.2f GiB)\n",
+                reason,
+                (double)request_bytes / 1048576.0,
+                (double)g_q8_f16_bytes / 1073741824.0,
+                (double)limit_bytes / 1073741824.0,
+                (double)free_bytes / 1073741824.0,
+                (double)reserve_bytes / 1073741824.0,
+                (double)total_bytes / 1073741824.0);
+    }
+}
+
+static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *label) {
+    (void)label;
+    const uint64_t limit = cuda_q8_f16_cache_limit_bytes();
+    if (limit == 0) return 0;
+    if (g_q8_f16_bytes > limit || request_bytes > limit - g_q8_f16_bytes) {
+        cuda_q8_f16_cache_budget_notice("limit reached", request_bytes, 0, 0, 0, limit);
+        return 0;
+    }
+
+    size_t free_b = 0;
+    size_t total_b = 0;
+    cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA q8 fp16 cache memory query failed: %s; using q8 kernels\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    const uint64_t free_bytes = (uint64_t)free_b;
+    const uint64_t total_bytes = (uint64_t)total_b;
+    const uint64_t reserve_bytes = cuda_q8_f16_cache_reserve_bytes(total_bytes);
+    if (request_bytes > free_bytes ||
+        free_bytes - request_bytes < reserve_bytes) {
+        cuda_q8_f16_cache_budget_notice("budget exhausted", request_bytes,
+                                        free_bytes, total_bytes,
+                                        reserve_bytes, limit);
+        return 0;
+    }
+    return 1;
+}
+
+static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t request_bytes) {
+    if (!g_q8_f16_disabled_after_oom) {
+        fprintf(stderr,
+                "ds4: CUDA q8 fp16 cache disabled after %s "
+                "(request=%.2f MiB cached=%.2f GiB); using q8 kernels\n",
+                what ? what : "allocation failure",
+                (double)request_bytes / 1048576.0,
+                (double)g_q8_f16_bytes / 1073741824.0);
+    }
+    g_q8_f16_disabled_after_oom = 1;
+    if (!g_q8_f16_ranges.empty()) {
+        (void)cudaDeviceSynchronize();
+        cuda_q8_f16_cache_release_all();
+    }
+    (void)cudaGetLastError();
+}
+
 static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (g_quality_mode) return 0;
+    if (g_q8_f16_disabled_after_oom) return 0;
     if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
+    if (cuda_q8_f16_cache_limit_bytes() == 0) return 0;
     if (getenv("DS4_CUDA_Q8_F16_ALL") != NULL) return 1;
     if (!label) return 0;
     if (strstr(label, "attn_output_a") != NULL ||
@@ -381,13 +530,16 @@ static const __half *cuda_q8_f16_ptr(
     const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
     if (!q8) return NULL;
 
+    if (in_dim != 0 && out_dim > UINT64_MAX / in_dim / sizeof(__half)) return NULL;
     const uint64_t out_bytes = in_dim * out_dim * sizeof(__half);
+    if (!cuda_q8_f16_cache_has_budget(out_bytes, label)) return NULL;
+
     __half *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA q8 fp16 cache alloc failed (%.2f MiB): %s\n",
                 (double)out_bytes / 1048576.0, cudaGetErrorString(err));
-        (void)cudaGetLastError();
+        cuda_q8_f16_cache_disable_after_failure("allocation failure", out_bytes);
         return NULL;
     }
     const uint64_t blocks = (in_dim + 31) / 32;
@@ -399,6 +551,7 @@ static const __half *cuda_q8_f16_ptr(
                                                           blocks);
     if (!cuda_ok(cudaGetLastError(), "q8 fp16 dequant launch")) {
         (void)cudaFree(dev);
+        cuda_q8_f16_cache_disable_after_failure("dequant launch failure", out_bytes);
         return NULL;
     }
     g_q8_f16_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
@@ -1063,12 +1216,9 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cublas = NULL;
     }
     cuda_model_range_release_all();
-    for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
-        (void)cudaFree(r.device_ptr);
-    }
-    g_q8_f16_ranges.clear();
-    g_q8_f16_by_offset.clear();
-    g_q8_f16_bytes = 0;
+    cuda_q8_f16_cache_release_all();
+    g_q8_f16_disabled_after_oom = 0;
+    g_q8_f16_budget_notice_printed = 0;
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
         (void)cudaFree(r.device_ptr);
     }
@@ -1196,12 +1346,9 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
     cuda_model_range_release_all();
-    for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
-        (void)cudaFree(r.device_ptr);
-    }
-    g_q8_f16_ranges.clear();
-    g_q8_f16_by_offset.clear();
-    g_q8_f16_bytes = 0;
+    cuda_q8_f16_cache_release_all();
+    g_q8_f16_disabled_after_oom = 0;
+    g_q8_f16_budget_notice_printed = 0;
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
         (void)cudaFree(r.device_ptr);
     }
@@ -2614,7 +2761,7 @@ __global__ static void attention_decode_mixed_kernel(
     uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
     if (visible_comp > n_comp) visible_comp = n_comp;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
-    __shared__ float scores[768];
+    __shared__ float scores[DS4_CUDA_ATTENTION_SCORE_CAP];
     __shared__ uint32_t raw_rows[256];
     __shared__ float partial[256];
     __shared__ float max_s;
@@ -3415,9 +3562,13 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     const uint32_t qpos = pos0 + t;
     const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
     uint32_t comp_count = 0;
-    if (n_comp != 0u && ratio != 0u) {
-        comp_count = (qpos + 1u) / ratio;
-        if (comp_count > n_comp) comp_count = n_comp;
+    if (n_comp != 0u) {
+        if (n_tokens == 1u && ratio == 0u) {
+            comp_count = n_comp;
+        } else if (ratio != 0u) {
+            comp_count = (qpos + 1u) / ratio;
+            if (comp_count > n_comp) comp_count = n_comp;
+        }
     }
     if (threadIdx.x == 0) {
         uint32_t raw_count = 0;
@@ -4639,6 +4790,77 @@ __global__ static void indexer_topk_merge_pow2_kernel(
     }
 }
 
+template <uint32_t SORT_N>
+__global__ static void indexer_topk_tree_merge_pow2_kernel(
+        uint32_t *out,
+        const uint32_t *candidates,
+        const float *scores,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t top_k,
+        uint32_t n_sets,
+        uint32_t merge_group,
+        uint32_t candidate_stride,
+        uint32_t out_stride) {
+    uint32_t t = blockIdx.x;
+    uint32_t group = blockIdx.y;
+    uint32_t tid = threadIdx.x;
+    if (t >= n_tokens) return;
+
+    const uint32_t set0 = group * merge_group;
+    if (set0 >= n_sets) return;
+    uint32_t set_count = n_sets - set0;
+    if (set_count > merge_group) set_count = merge_group;
+    const uint32_t candidate_count = set_count * top_k;
+
+    __shared__ float vals[SORT_N];
+    __shared__ uint32_t idxs[SORT_N];
+
+    const float *row = scores + (uint64_t)t * n_comp;
+    const uint32_t *cand = candidates + (uint64_t)t * candidate_stride + set0 * top_k;
+    for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
+        uint32_t idx = UINT32_MAX;
+        float v = -INFINITY;
+        if (i < candidate_count) {
+            idx = cand[i];
+            if (idx < n_comp) v = row[idx];
+        }
+        vals[i] = v;
+        idxs[i] = idx;
+    }
+    __syncthreads();
+
+    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
+        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
+            for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
+                uint32_t other = i ^ j;
+                if (other > i && other < SORT_N) {
+                    const float av = vals[i];
+                    const float bv = vals[other];
+                    const uint32_t ai = idxs[i];
+                    const uint32_t bi = idxs[other];
+                    const bool desc_half = (i & k) == 0u;
+                    const bool swap = desc_half
+                        ? topk_score_better(bv, bi, av, ai)
+                        : topk_score_better(av, ai, bv, bi);
+                    if (swap) {
+                        vals[i] = bv;
+                        idxs[i] = bi;
+                        vals[other] = av;
+                        idxs[other] = ai;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    uint32_t *dst = out + (uint64_t)t * out_stride + group * top_k;
+    for (uint32_t i = tid; i < top_k; i += blockDim.x) {
+        dst[i] = idxs[i];
+    }
+}
+
 __global__ static void topk_mask_kernel(float *mask, const uint32_t *topk, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * n_comp;
@@ -4820,33 +5042,72 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
     }
+    if (top_k == 512u && n_comp <= 4096u &&
+        getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
+        indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+                                                           (const float *)scores->ptr,
+                                                           n_comp, n_tokens, top_k);
+        return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
+    }
     if (top_k == 512u && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK_CHUNKED") == NULL) {
-        const uint32_t chunk_n = 2048u;
+        const uint32_t chunk_n = 4096u;
         const uint32_t n_chunks = (n_comp + chunk_n - 1u) / chunk_n;
         const uint32_t candidate_stride = n_chunks * top_k;
-        if (candidate_stride <= 4096u) {
-            const uint64_t tmp_bytes = (uint64_t)n_tokens * candidate_stride * sizeof(uint32_t);
-            uint32_t *candidates = (uint32_t *)cuda_tmp_alloc(tmp_bytes, "indexer topk candidates");
-            if (!candidates) return 0;
-            dim3 grid_chunks(n_tokens, n_chunks, 1);
-            indexer_topk_chunk_pow2_kernel<2048><<<grid_chunks, 1024>>>(candidates,
-                                                                        (const float *)scores->ptr,
-                                                                        n_comp,
-                                                                        n_tokens,
-                                                                        top_k,
-                                                                        candidate_stride);
-            if (!cuda_ok(cudaGetLastError(), "indexer topk chunk launch")) return 0;
-            indexer_topk_merge_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                                     candidates,
-                                                                     (const float *)scores->ptr,
-                                                                     n_comp,
-                                                                     n_tokens,
-                                                                     top_k,
-                                                                     candidate_stride,
-                                                                     candidate_stride);
-            return cuda_ok(cudaGetLastError(), "indexer topk merge launch");
+        uint32_t n_sets = n_chunks;
+        uint64_t scratch_u32_per_token = candidate_stride;
+        while (n_sets > DS4_CUDA_TOPK_MERGE_GROUP) {
+            n_sets = (n_sets + DS4_CUDA_TOPK_MERGE_GROUP - 1u) / DS4_CUDA_TOPK_MERGE_GROUP;
+            scratch_u32_per_token += (uint64_t)n_sets * top_k;
         }
+        if (scratch_u32_per_token > UINT64_MAX / n_tokens / sizeof(uint32_t)) return 0;
+        const uint64_t tmp_bytes = (uint64_t)n_tokens * scratch_u32_per_token * sizeof(uint32_t);
+        uint32_t *scratch = (uint32_t *)cuda_tmp_alloc(tmp_bytes, "indexer topk tree");
+        if (!scratch) return 0;
+
+        uint32_t *cur = scratch;
+        n_sets = n_chunks;
+        uint32_t cur_stride = candidate_stride;
+        dim3 grid_chunks(n_tokens, n_chunks, 1);
+        indexer_topk_chunk_pow2_kernel<4096><<<grid_chunks, 1024>>>(cur,
+                                                                    (const float *)scores->ptr,
+                                                                    n_comp,
+                                                                    n_tokens,
+                                                                    top_k,
+                                                                    candidate_stride);
+        if (!cuda_ok(cudaGetLastError(), "indexer topk chunk launch")) return 0;
+
+        while (n_sets > DS4_CUDA_TOPK_MERGE_GROUP) {
+            const uint32_t next_sets = (n_sets + DS4_CUDA_TOPK_MERGE_GROUP - 1u) / DS4_CUDA_TOPK_MERGE_GROUP;
+            const uint32_t next_stride = next_sets * top_k;
+            uint32_t *next = cur + (uint64_t)n_tokens * cur_stride;
+            dim3 grid_merge(n_tokens, next_sets, 1);
+            indexer_topk_tree_merge_pow2_kernel<4096><<<grid_merge, 1024>>>(
+                    next,
+                    cur,
+                    (const float *)scores->ptr,
+                    n_comp,
+                    n_tokens,
+                    top_k,
+                    n_sets,
+                    DS4_CUDA_TOPK_MERGE_GROUP,
+                    cur_stride,
+                    next_stride);
+            if (!cuda_ok(cudaGetLastError(), "indexer topk tree merge launch")) return 0;
+            cur = next;
+            n_sets = next_sets;
+            cur_stride = next_stride;
+        }
+
+        indexer_topk_merge_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+                                                                 cur,
+                                                                 (const float *)scores->ptr,
+                                                                 n_comp,
+                                                                 n_tokens,
+                                                                 top_k,
+                                                                 n_sets * top_k,
+                                                                 cur_stride);
+        return cuda_ok(cudaGetLastError(), "indexer topk tree final launch");
     }
     indexer_topk_kernel<<<n_tokens, 1>>>((uint32_t *)selected->ptr,
                                          (const float *)scores->ptr,
@@ -4932,7 +5193,13 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                                              (int)out_dim,
                                              CUDA_R_32F,
                                              CUBLAS_GEMM_DEFAULT);
-            return cublas_ok(st, "q8 f16 matmul");
+            if (st == CUBLAS_STATUS_SUCCESS) return 1;
+            fprintf(stderr, "ds4: cuBLAS q8 f16 matmul failed: status %d\n", (int)st);
+            cuda_q8_f16_cache_disable_after_failure("cuBLAS f16 matmul failure",
+                                                    in_dim * out_dim * sizeof(__half));
+            /* The F16 expansion cache is only an optimization.  If cuBLAS
+             * rejects the cached path under memory pressure, retry the same
+             * operation through the native Q8 kernels below. */
         }
     }
     const uint64_t xq_bytes = n_tok * blocks * 32u;
@@ -5809,6 +6076,30 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    if (!cuda_attention_score_buffer_fits(n_comp)) {
+        if (!use_mask && head_dim == 512u &&
+            getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
+            dim3 online_grid(1, (n_head + 7u) / 8u, 1);
+            attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
+                                                                              sinks,
+                                                                              (const float *)q->ptr,
+                                                                              (const float *)raw_kv->ptr,
+                                                                              n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                              1,
+                                                                              0,
+                                                                              n_raw,
+                                                                              raw_cap,
+                                                                              raw_start,
+                                                                              n_comp,
+                                                                              0,
+                                                                              0,
+                                                                              n_head,
+                                                                              head_dim);
+            return cuda_ok(cudaGetLastError(), "attention decode online launch");
+        }
+        fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
+        return 0;
+    }
     dim3 grid(1, n_head, 1);
     attention_decode_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                  sinks,
@@ -5956,6 +6247,30 @@ static int attention_decode_batch_launch(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    if (!cuda_attention_score_buffer_fits(n_comp)) {
+        if (!use_comp_mask && head_dim == 512u &&
+            getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
+            dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
+            attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
+                                                                              sinks,
+                                                                              (const float *)q->ptr,
+                                                                              (const float *)raw_kv->ptr,
+                                                                              n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                              n_tokens,
+                                                                              pos0,
+                                                                              n_raw,
+                                                                              raw_cap,
+                                                                              raw_start,
+                                                                              n_comp,
+                                                                              window,
+                                                                              ratio,
+                                                                              n_head,
+                                                                              head_dim);
+            return cuda_ok(cudaGetLastError(), "attention decode online launch");
+        }
+        fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
+        return 0;
+    }
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
         (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
