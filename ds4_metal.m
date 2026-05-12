@@ -326,7 +326,12 @@ static int ds4_gpu_ensure_scratch_buffer(
 
     MTLResourceOptions options = MTLResourceStorageModeShared;
     if (ds4_gpu_use_m5_private_scratch() && !ds4_gpu_scratch_needs_cpu_access(label)) {
-        options = MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked;
+        /*
+         * Keep Metal's default hazard tracking. These scratch buffers are
+         * reused by dependent kernels across many compute encoders, and the
+         * graph does not insert explicit fences for untracked resources.
+         */
+        options = MTLResourceStorageModePrivate;
     }
 
     *buffer = [g_device newBufferWithLength:bytes options:options];
