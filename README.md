@@ -20,12 +20,12 @@ dense models, we can report that:
 4. Being so large, it knows more things if you go sampling at the edge of knowledge. For instance asking about Italian show or political questions soon uncovers that 284B parameters are a lot more than 27B or 35B parameters.
 5. It writes much better English and Italian. It *feels* a quasi-frontier model.
 6. The KV cache is incredibly compressed, allowing long context inference on local computers and **on disk KV cache persistence**.
-7. It works well with 2-bit quantization, if quantized in a special way (read later). This allows to run it in MacBooks with 128GB of RAM.
+7. It works well with 2-bit quantization, if quantized in a special way (read later). This allows to run it in MacBooks with 128GB of RAM (and many people reported it working with 96GB as well, even at 250k context window!).
 8. We expect DeepSeek to release **updated versions of v4 Flash** in the future, even better than the current one.
 
 That said, a few important things about this project:
 
-* The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: local inference credible on high end personal machines or Mac Studios, starting from 128GB of memory.
+* The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: local inference credible on high end personal machines or Mac Studios, starting from 96/128GB of memory.
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is just alpha quality code, so probably we are not still there.
@@ -68,21 +68,25 @@ projections, routing) are left untouched to guarantee quality.
 Download one main model:
 
 ```sh
-./download_model.sh q2   # 128 GB RAM machines
-./download_model.sh q4   # >= 256 GB RAM machines
+./download_model.sh q2           # 96/128 GB RAM machines
+./download_model.sh q2-imatrix   # 96/128 GB RAM machines, imatrix-tuned q2
+./download_model.sh q4           # >= 256 GB RAM machines
 ```
 
 The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
 stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
-updates `./ds4flash.gguf` to point at the selected q2/q4 model. Authentication
-is optional for public downloads, but `--token TOKEN`, `HF_TOKEN`, or the local
-Hugging Face token cache are used when present.
+updates `./ds4flash.gguf` to point at the selected q2/q2-imatrix/q4 model.
+The plain q2 XXS weights are produced with the weights importance vector only,
+without an imatrix. The q2-imatrix variant uses an antirez-made recipe for
+imatrix generation that shows small error versus q4 quantization on logits.
+Authentication is optional for public downloads, but `--token TOKEN`,
+`HF_TOKEN`, or the local Hugging Face token cache are used when present.
 
 `./download_model.sh mtp` fetches the optional speculative decoding support
-GGUF. It can be used with both q2 and q4, but must be enabled explicitly with
-`--mtp`. The current MTP/speculative decoding path is still experimental: it is
-correctness-gated and currently provides at most a slight speedup, not a
-meaningful generation-speed win.
+GGUF. It can be used with q2, q2-imatrix, and q4, but must be enabled
+explicitly with `--mtp`. The current MTP/speculative decoding path is still
+experimental: it is correctness-gated and currently provides at most a slight
+speedup, not a meaningful generation-speed win.
 
 Then build:
 
@@ -450,7 +454,9 @@ You can use larger context and larger cache if you wish. Full context of
 alone will be like 22GB), so configure a context which makes sense in
 your system. With 128GB of RAM you would run the 2-bit quants, which are
 already 81GB, 26GB are going to be likely too much, so a context window
-of 100~300k tokens is wiser.
+of 100~300k tokens is wiser. However users reported being able to run 2bit
+quants with 250k ctx window in a Macs with just 96GB of system memory: make sure
+to kill processes that use too much memory, if you plan doing so ;)
 
 The `384000` output limit below avoids token caps since the model is able
 to generate very long replies otherwise (up to 384k tokens). The server
@@ -777,6 +783,14 @@ The default graph backend is Metal on macOS and CUDA on Linux CUDA builds:
 ```sh
 ./ds4 -p "Hello" --metal
 ./ds4 -p "Hello" --cuda
+```
+
+CUDA builds default to `CUDA_ARCH=native`, so `nvcc` targets the visible GPU.
+Set `CUDA_ARCH` explicitly when cross-building or when you need a known target:
+
+```sh
+make CUDA_ARCH=sm_120
+make CUDA_ARCH=        # old nvcc default target behavior
 ```
 
 There is also a CPU reference/debug path:
