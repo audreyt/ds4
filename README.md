@@ -149,7 +149,7 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
 | DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
 
-![M3 Max t/s](bench/m3_max_ts.svg)
+![M3 Max t/s](speed-bench/m3_max_ts.svg)
 
 ## Benchmarking
 
@@ -163,7 +163,7 @@ greedy non-EOS probe, restores the memory snapshot, and continues prefill.
 ```sh
 ./ds4-bench \
   -m ds4flash.gguf \
-  --prompt-file bench/promessi_sposi.txt \
+  --prompt-file speed-bench/promessi_sposi.txt \
   --ctx-start 2048 \
   --ctx-max 65536 \
   --step-incr 2048 \
