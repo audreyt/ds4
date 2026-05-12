@@ -1356,6 +1356,25 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
     }
 }
 
+typedef enum {
+    DS4_MPP_AUTO = 0,
+    DS4_MPP_ON,
+    DS4_MPP_OFF,
+} ds4_mpp_mode;
+
+extern "C" void ds4_gpu_set_mpp_mode(ds4_mpp_mode mode) {
+    (void)mode;
+}
+
+extern "C" void ds4_gpu_set_mpp_compare_context(const char *module, uint32_t layer_index, uint32_t pos0) {
+    (void)module;
+    (void)layer_index;
+    (void)pos0;
+}
+
+extern "C" void ds4_gpu_clear_mpp_compare_context(void) {
+}
+
 __global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n = n_embd * n_hc;
