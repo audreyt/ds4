@@ -6624,6 +6624,17 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
+static bool should_canonicalize_thinking_checkpoint(const request *r,
+                                                    const thinking_state *thinking,
+                                                    const char *finish) {
+    if (!r || r->kind != REQ_CHAT || r->has_tools) return false;
+    if (r->prompt_preserves_reasoning) return false;
+    if (!ds4_think_mode_enabled(r->think_mode)) return false;
+    if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
+    if (thinking && thinking->inside) return false;
+    return true;
+}
+
 static void log_tool_calls_summary(const char *ctx, const tool_calls *calls) {
     if (!calls || calls->len == 0) return;
     buf names = {0};
@@ -6649,14 +6660,18 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
         if (p->srv && current > p->cached_tokens) kv_cache_maybe_store_continued(p->srv);
         return;
     }
-    int display_total = p->prompt_tokens > total ? p->prompt_tokens : total;
-    double pct = display_total > 0 ? 100.0 * (double)current / (double)display_total : 100.0;
-    if (pct > 100.0) pct = 100.0;
-    int processed = current - p->cached_tokens;
-    if (processed < 0) processed = current;
-    int suffix = p->prompt_tokens - p->cached_tokens;
-    if (suffix > 0 && processed > suffix) processed = suffix;
-    double avg_tps = elapsed > 0.0 ? (double)processed / elapsed : 0.0;
+    int display_start = p->cached_tokens;
+    if (display_start < 0 || display_start > p->prompt_tokens) display_start = 0;
+    int display_total = p->prompt_tokens - display_start;
+    if (display_total <= 0) {
+        display_start = 0;
+        display_total = p->prompt_tokens > total ? p->prompt_tokens : total;
+    }
+    int display_current = current - display_start;
+    if (display_current < 0) display_current = 0;
+    if (display_current > display_total) display_current = display_total;
+    double pct = display_total > 0 ? 100.0 * (double)display_current / (double)display_total : 100.0;
+    double avg_tps = elapsed > 0.0 ? (double)display_current / elapsed : 0.0;
     int interval_tokens = p->seen ? current - p->last_current : 0;
     if (interval_tokens < 0) interval_tokens = 0;
     double interval_s = p->seen ? now - p->last_t : 0.0;
@@ -6672,7 +6687,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                p->ctx,
                flags[0] ? " " : "",
                flags,
-               current,
+               display_current,
                display_total,
                pct,
                chunk_tps,
@@ -7353,10 +7368,8 @@ static void generate_job(server *s, job *j) {
         canonicalize_tool_checkpoint(s, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
-    } else if (j->req.kind == REQ_CHAT && !parsed_calls.len &&
-               !j->req.prompt_preserves_reasoning &&
-               ds4_think_mode_enabled(j->req.think_mode) &&
-               strcmp(final_finish, "error") != 0) {
+    } else if (!parsed_calls.len &&
+               should_canonicalize_thinking_checkpoint(&j->req, &thinking, final_finish)) {
         canonicalize_thinking_checkpoint(s, j, ctx_span, trace_id,
                                          parsed_content ? parsed_content : "");
     }
@@ -9621,6 +9634,31 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request_free(&r);
 }
 
+static void test_thinking_checkpoint_canonicalization_gate(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+    thinking_state st = {.inside = true};
+
+    TEST_ASSERT(!should_canonicalize_thinking_checkpoint(&r, &st, "length"));
+    TEST_ASSERT(!should_canonicalize_thinking_checkpoint(&r, &st, "stop"));
+
+    st.inside = false;
+    TEST_ASSERT(!should_canonicalize_thinking_checkpoint(&r, &st, "length"));
+    TEST_ASSERT(should_canonicalize_thinking_checkpoint(&r, &st, "stop"));
+
+    r.prompt_preserves_reasoning = true;
+    TEST_ASSERT(!should_canonicalize_thinking_checkpoint(&r, &st, "stop"));
+    r.prompt_preserves_reasoning = false;
+    r.has_tools = true;
+    TEST_ASSERT(!should_canonicalize_thinking_checkpoint(&r, &st, "stop"));
+    r.has_tools = false;
+    r.think_mode = DS4_THINK_NONE;
+    TEST_ASSERT(!should_canonicalize_thinking_checkpoint(&r, &st, "stop"));
+
+    request_free(&r);
+}
+
 static void test_tool_marker_state_ignores_orphan_end(void) {
     bool saw_start = false;
     bool saw_end = false;
@@ -10298,6 +10336,7 @@ static void ds4_server_unit_tests_run(void) {
     test_model_metadata_clamps_completion_to_context();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
+    test_thinking_checkpoint_canonicalization_gate();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
     test_kv_cache_store_len_uses_configured_boundary();
