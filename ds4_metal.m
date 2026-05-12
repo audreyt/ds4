@@ -2281,7 +2281,7 @@ static const char *ds4_gpu_source =
 "#define N_SG_Q8_0 4\n"
 "#define FC_MUL_MV 600\n"
 "#define FC_MUL_MM 700\n"
-"#define FC_MUL_MM_M5_SGMATRIX 702\n"
+"#define FC_MUL_MM_M5_SGMATRIX 800\n"
 "#define FC_BIN 1300\n"
 "#define FOR_UNROLL(x) _Pragma(\"clang loop unroll(full)\") for (x)\n"
 "#define M_PI_F 3.14159265358979323846f\n"
