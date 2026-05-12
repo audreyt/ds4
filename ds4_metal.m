@@ -13056,7 +13056,8 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                n_expert,
         float                   clamp,
         const ds4_gpu_tensor *x,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        bool                   *mid_is_f16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !gate || !up || !mid || !x || !model_map || !selected || !weights ||
         n_tokens == 0 || n_expert == 0 || n_expert > 6) {
@@ -13334,6 +13335,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             use_mm_id &&
             use_fused_activation &&
             request_mid_f16;
+        if (mid_is_f16) *mid_is_f16 = use_mid_f16;
         if (ok && use_fused_activation) {
             ok = ds4_gpu_encode_moe_swiglu_weight(cb,
                                                     gatebuf,

@@ -34,6 +34,10 @@ typedef struct {
     bool dump_tokens;
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
+    const char *imatrix_dataset_path;
+    const char *imatrix_output_path;
+    int imatrix_max_prompts;
+    int imatrix_max_tokens;
     ds4_think_mode think_mode;
     bool head_test;
     bool first_token_test;
@@ -153,6 +157,14 @@ static void usage(FILE *fp) {
         "      Write greedy continuation top-logprobs as JSON without printing text.\n"
         "  --logprobs-top-k N\n"
         "      Number of local alternatives stored by --dump-logprobs. Default: 20\n"
+        "  --imatrix-dataset FILE\n"
+        "      Rendered DS4 prompt dataset produced by misc/imatrix_dataset.\n"
+        "  --imatrix-out FILE\n"
+        "      Collect a routed-MoE activation imatrix and write llama-compatible .dat.\n"
+        "  --imatrix-max-prompts N\n"
+        "      Stop imatrix collection after N prompts. Default: no prompt limit\n"
+        "  --imatrix-max-tokens N\n"
+        "      Stop imatrix collection after N prompt tokens. Default: no token limit\n"
         "  --head-test\n"
         "      Run the output HC/logits head after the native slice.\n"
         "  --first-token-test\n"
@@ -1256,6 +1268,15 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.dump_logprobs_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--logprobs-top-k")) {
             c.gen.dump_logprobs_top_k = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--imatrix-dataset")) {
+            c.gen.imatrix_dataset_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--imatrix-out")) {
+            c.gen.imatrix_output_path = need_arg(&i, argc, argv, arg);
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--imatrix-max-prompts")) {
+            c.gen.imatrix_max_prompts = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--imatrix-max-tokens")) {
+            c.gen.imatrix_max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
             c.gen.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
@@ -1295,6 +1316,14 @@ static cli_config parse_options(int argc, char **argv) {
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
+    if (c.gen.imatrix_output_path && !c.gen.imatrix_dataset_path) {
+        fprintf(stderr, "ds4: --imatrix-out requires --imatrix-dataset\n");
+        exit(2);
+    }
+    if (c.gen.imatrix_dataset_path && !c.gen.imatrix_output_path) {
+        fprintf(stderr, "ds4: --imatrix-dataset requires --imatrix-out\n");
+        exit(2);
+    }
 
     return c;
 }
@@ -1325,6 +1354,13 @@ int main(int argc, char **argv) {
     int rc = 0;
     if (cfg.inspect) {
         ds4_engine_summary(engine);
+    } else if (cfg.gen.imatrix_output_path) {
+        rc = ds4_engine_collect_imatrix(engine,
+                                        cfg.gen.imatrix_dataset_path,
+                                        cfg.gen.imatrix_output_path,
+                                        cfg.gen.ctx_size,
+                                        cfg.gen.imatrix_max_prompts,
+                                        cfg.gen.imatrix_max_tokens);
     } else if (cfg.gen.prompt == NULL) {
         rc = run_repl(engine, &cfg);
     } else {

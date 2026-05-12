@@ -664,7 +664,8 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                n_expert,
         float                   clamp,
         const ds4_gpu_tensor *x,
-        uint32_t                n_tokens);
+        uint32_t                n_tokens,
+        bool                   *mid_is_f16);
 
 /* =========================================================================
  * Hyper-Connection Kernels.
