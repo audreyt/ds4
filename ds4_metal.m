@@ -186,6 +186,33 @@ static void ds4_gpu_print_device_summary(void) {
     }
 }
 
+static int ds4_gpu_is_m5_device(void) {
+    static int initialized;
+    static int is_m5;
+    if (!initialized) {
+        const char *device_name = g_device.name ? [g_device.name UTF8String] : "";
+        is_m5 = strstr(device_name, "M5") != NULL;
+        initialized = 1;
+    }
+    return is_m5;
+}
+
+static int ds4_gpu_use_m5_private_scratch(void) {
+    static int initialized;
+    static int enabled;
+    if (!initialized) {
+        enabled = getenv("DS4_METAL_DISABLE_M5_PRIVATE_SCRATCH") == NULL && ds4_gpu_is_m5_device();
+        initialized = 1;
+    }
+    return enabled;
+}
+
+static int ds4_gpu_scratch_needs_cpu_access(const char *label) {
+    if (!label) return 0;
+    return strstr(label, "mask") != NULL ||
+           strcmp(label, "ds4_attention_output_group_ids") == 0;
+}
+
 #define DS4_METAL_MAX_MODEL_VIEWS 16
 #define DS4_METAL_MODEL_MAX_TENSOR_BYTES 704643072ull
 
@@ -297,7 +324,15 @@ static int ds4_gpu_ensure_scratch_buffer(
     if (bytes == 0) bytes = 1;
     if (bytes > NSUIntegerMax) return 0;
 
-    *buffer = [g_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    MTLResourceOptions options = MTLResourceStorageModeShared;
+    if (ds4_gpu_use_m5_private_scratch() && !ds4_gpu_scratch_needs_cpu_access(label)) {
+        options = MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked;
+    }
+
+    *buffer = [g_device newBufferWithLength:bytes options:options];
+    if (!*buffer && options != MTLResourceStorageModeShared) {
+        *buffer = [g_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    }
     if (!*buffer) {
         fprintf(stderr, "ds4: failed to allocate Metal scratch buffer %s (%llu bytes)\n",
                 label, (unsigned long long)bytes);
@@ -690,8 +725,7 @@ static int ds4_gpu_use_m5_simdgroup_matrix(void) {
     if (!initialized) {
         const char *disable = getenv("DS4_METAL_DISABLE_M5_SIMDGROUP_MATRIX");
         const char *force = getenv("DS4_METAL_FORCE_M5_SIMDGROUP_MATRIX");
-        const char *device_name = g_device.name ? [g_device.name UTF8String] : "";
-        enabled = disable ? 0 : (force ? 1 : (strstr(device_name, "M5") != NULL));
+        enabled = disable ? 0 : (force ? 1 : ds4_gpu_is_m5_device());
         initialized = 1;
     }
     return enabled;
