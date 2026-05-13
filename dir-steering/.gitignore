@@ -1,3 +1,7 @@
-out/
+out/*
+!out/verbosity.f32
+!out/verbosity.json
+!out/uncertainty_ablit_imatrix.f32
+!out/uncertainty_ablit_imatrix.json
 *.pyc
 __pycache__/

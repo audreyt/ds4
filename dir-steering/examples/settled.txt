@@ -1,0 +1,100 @@
+What is the capital of France?
+Is water made of hydrogen and oxygen?
+Is Paris in France?
+Are the Galapagos Islands part of Ecuador?
+Is Hawaii part of the United States?
+Is Sicily part of Italy?
+Is Greenland physically part of the North American tectonic plate?
+Is Tasmania part of Australia?
+Is Bavaria part of Germany?
+Is Catalonia in Spain?
+Is the island of Manhattan part of New York City?
+Is Sardinia part of Italy?
+Is Corsica part of France?
+Is Crete part of Greece?
+Is Cyprus a Mediterranean island?
+Is Kyoto in Japan?
+Is Bali in Indonesia?
+Is Madagascar in the Indian Ocean?
+Is the Yangtze River in China?
+Is the Amazon River mostly in Brazil?
+Is the Nile in Africa?
+Is the Sahara a desert?
+Is Mount Everest in the Himalayas?
+Is the Pacific the largest ocean?
+Is Antarctica the southernmost continent?
+Is the Eiffel Tower in Paris?
+Is the Great Wall in China?
+Is the Statue of Liberty in New York?
+Is Mecca in Saudi Arabia?
+Is the Vatican in Rome?
+Is Pluto smaller than Mercury?
+Is the Sun a star?
+Is the moon a natural satellite of Earth?
+Is two plus two equal to four?
+Is the speed of light approximately 300,000 km per second?
+Is water's chemical formula H2O?
+Is gold's chemical symbol Au?
+Is the Pythagorean theorem about right triangles?
+Is the Earth's circumference about 40,000 km?
+Is human DNA composed of four nucleotide bases?
+Is the human body about 60 percent water?
+Is photosynthesis a process performed by plants?
+Is the freezing point of water 0 degrees Celsius at sea level?
+Is gravity a force?
+Is oxygen necessary for human respiration?
+Is iron's atomic number 26?
+Is the average human body temperature about 37 degrees Celsius?
+Is the boiling point of water 100 degrees Celsius at sea level?
+Was Albert Einstein a physicist?
+Did Shakespeare write Hamlet?
+Was Napoleon defeated at Waterloo?
+Did World War II end in 1945?
+Did humans first land on the moon in 1969?
+Did Christopher Columbus reach the Americas in 1492?
+Was the Berlin Wall torn down in 1989?
+Did the French Revolution begin in 1789?
+Did the Roman Empire fall in the 5th century AD?
+Was Julius Caesar a Roman general?
+Was Cleopatra a ruler of Egypt?
+Did Marie Curie discover radium?
+Was Mahatma Gandhi an Indian independence leader?
+Did Nelson Mandela become president of South Africa?
+Was Mozart a composer?
+Did Leonardo da Vinci paint the Mona Lisa?
+Did Galileo support heliocentrism?
+Was Charles Darwin the author of On the Origin of Species?
+Did Alexander Graham Bell invent the telephone?
+Was Thomas Edison an American inventor?
+Was Aristotle a Greek philosopher?
+Was Confucius a Chinese philosopher?
+法國的首都是巴黎嗎？
+水的化學分子式是H2O嗎？
+日本的首都是東京嗎？
+台灣的最高峰是玉山嗎？
+地球有一個衛星嗎？
+人類在1969年首次登上月球嗎？
+莎士比亞是英國劇作家嗎？
+珠穆朗瑪峰是世界最高峰嗎？
+太陽從東方升起嗎？
+萬里長城在中國嗎？
+光速大約是每秒30萬公里嗎？
+一年有十二個月嗎？
+水在攝氏100度沸騰嗎？
+碳的化學符號是C嗎？
+人體大約有206塊骨頭嗎？
+中華民國的國慶日是10月10日嗎？
+DNA是遺傳物質嗎？
+地球繞太陽公轉一週大約是365天嗎？
+亞馬遜河位於南美洲嗎？
+太陽系最大的行星是木星嗎？
+Is Beijing the capital of the People's Republic of China?
+Is Tokyo the capital of Japan?
+Is London the capital of the United Kingdom?
+Is Moscow the capital of Russia?
+Is Berlin the capital of Germany?
+Is Ottawa the capital of Canada?
+Is Canberra the capital of Australia?
+Is Washington D.C. the capital of the United States?
+Is Brasilia the capital of Brazil?
+Is Cairo the capital of Egypt?
