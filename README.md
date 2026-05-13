@@ -3,17 +3,17 @@
 **Apple M5 performance note:** on an Apple M5 Max with 128 GB RAM, this `m5`
 branch is substantially faster than `main` in a single-run Metal `ds4-bench`
 sweep using `ds4flash.gguf`, `speed-bench/promessi_sposi.txt`, contexts
-2048-8192, 2048-token steps, and 64 generated tokens.
+2048-8192, 2048-token steps, 64 generated tokens, and `--warm-weights`.
 
-Geometric-mean speedup across the measured frontiers is **2.61x prefill**
-and **1.51x generation**.
+Geometric-mean speedup across the measured frontiers is **2.45x prefill**
+and **1.46x generation**.
 
 | Context | main prefill | m5 prefill | Prefill uplift | main gen | m5 gen | Gen uplift |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2048 | 188.46 t/s | 529.80 t/s | +181.1% | 20.43 t/s | 34.43 t/s | +68.5% |
-| 4096 | 168.54 t/s | 457.69 t/s | +171.6% | 20.89 t/s | 31.95 t/s | +52.9% |
-| 6144 | 175.20 t/s | 448.42 t/s | +155.9% | 21.73 t/s | 31.38 t/s | +44.4% |
-| 8192 | 182.32 t/s | 430.44 t/s | +136.1% | 22.12 t/s | 31.26 t/s | +41.3% |
+| 2048 | 188.46 t/s | 476.48 t/s | +152.8% | 20.43 t/s | 33.22 t/s | +62.6% |
+| 4096 | 168.54 t/s | 424.16 t/s | +151.7% | 20.89 t/s | 30.63 t/s | +46.6% |
+| 6144 | 175.20 t/s | 429.86 t/s | +145.4% | 21.73 t/s | 30.29 t/s | +39.4% |
+| 8192 | 182.32 t/s | 419.97 t/s | +130.3% | 22.12 t/s | 30.21 t/s | +36.6% |
 
 The `m5` branch includes M5-specific `metal_simdgroup_matrix` optimization for
 dense prefill/routed-MoE matmul kernels and GPU-private scratch buffers for hot
@@ -136,8 +136,27 @@ weights.
 `./download_model.sh mtp` fetches the optional speculative decoding support
 GGUF. It can be used with q2-imatrix, q4-imatrix, q2, and q4, but must be
 enabled explicitly with `--mtp`. The current MTP/speculative decoding path is
-still experimental: it is correctness-gated and currently provides at most a
-slight speedup, not a meaningful generation-speed win.
+still experimental. By default, non-quality MTP uses an M5-oriented turbo mode:
+it accepts a short MTP burst, then catches the target KV/logits up with batched
+prefill instead of serial decode. This is significantly faster, but it is not
+byte-identical to greedy target decoding and is best suited to loose prose. Set
+`DS4_MTP_VERIFY=1` for the older verified path, or `DS4_MTP_STRICT=1` for the
+deterministic first-draft verifier. `DS4_MTP_STRICT_DECODE2=1` profiles the
+exact two-token verifier. For JSON, tool calls, and other rigid formats, prefer
+`DS4_MTP_VERIFY=1` or `DS4_MTP_STRICT=1`; larger turbo bursts can stay readable
+while still drifting out of schema.
+
+For local MTP experiments without a downloaded support model,
+`gguf-tools/make_mtp_draft_gguf.py` can build a scratch MTP-only GGUF from the
+current target model. The layer-1 HC-projector preset is a useful first-draft
+baseline, but unchecked multi-token turbo still needs a trained or distilled MTP
+to avoid recursive repetition. Bootstrap GGUFs mark themselves with
+`ds4.mtp.bootstrap` metadata, and ds4 disables unchecked turbo for them unless
+`DS4_MTP_BOOTSTRAP_TURBO=1` or `DS4_MTP_TURBO=1` is set.
+
+For distillation work, `--mtp-distill-out FILE` writes target-model HC states
+and next-token top-k logits in a fixed binary format that can be inspected with
+`gguf-tools/inspect_mtp_distill.py`.
 
 Then build:
 
@@ -439,9 +458,12 @@ and returns to `ds4>`.
 
 The CLI defaults to thinking mode. Use `/nothink` or `--nothink` for direct
 answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional MTP speculative
-path; it is useful only for greedy decoding, currently uses a confidence gate
-(`--mtp-margin`) to avoid slow partial accepts, and should be treated as an
-experimental slight-speedup path.
+path; it is useful only for greedy decoding. The default fast path is approximate
+turbo generation with target batched-prefill catch-up. Tune its burst with
+`DS4_MTP_TURBO_CHUNK` (default 4); use `DS4_MTP_TURBO_MIN_MARGIN` to stop bursts
+on low-confidence MTP logits; use `DS4_MTP_VERIFY=1` or `DS4_MTP_STRICT=1` when
+exact target behavior matters more than speed, especially for JSON or tool-use
+payloads.
 
 ## Server
 

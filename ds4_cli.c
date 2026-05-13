@@ -34,6 +34,9 @@ typedef struct {
     bool dump_tokens;
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
+    const char *mtp_distill_path;
+    int mtp_distill_top_k;
+    int mtp_distill_records;
     const char *imatrix_dataset_path;
     const char *imatrix_output_path;
     int imatrix_max_prompts;
@@ -44,6 +47,7 @@ typedef struct {
     bool metal_graph_test;
     bool metal_graph_full_test;
     bool metal_graph_prompt_test;
+    bool n_predict_set;
 } cli_generation_options;
 
 typedef struct {
@@ -84,11 +88,11 @@ static void usage(FILE *fp) {
         "  -m, --model FILE\n"
         "      GGUF model path. Default: ds4flash.gguf\n"
         "  --mtp FILE\n"
-        "      Optional MTP support GGUF used for draft-token probes.\n"
+        "      Optional MTP support GGUF used for approximate turbo generation.\n"
         "  --mtp-draft N\n"
-        "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
+        "      Enable MTP when greater than 1. Default: 1\n"
         "  --mtp-margin F\n"
-        "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
+        "      Minimum recursive-draft confidence for the legacy verifier. Default: 3\n"
         "  -c, --ctx N\n"
         "      Context size allocated for the session. Default: 32768\n"
         "  --metal\n"
@@ -159,6 +163,12 @@ static void usage(FILE *fp) {
         "      Write greedy continuation top-logprobs as JSON without printing text.\n"
         "  --logprobs-top-k N\n"
         "      Number of local alternatives stored by --dump-logprobs. Default: 20\n"
+        "  --mtp-distill-out FILE\n"
+        "      Write greedy target HC states plus next-token top-k logits for MTP distillation.\n"
+        "  --mtp-distill-records N\n"
+        "      Records to write for --mtp-distill-out. Default: 256, or -n when -n is set\n"
+        "  --mtp-distill-top-k N\n"
+        "      Next-token alternatives stored per distillation record. Default: 32\n"
         "  --imatrix-dataset FILE\n"
         "      Rendered DS4 prompt dataset produced by misc/imatrix_dataset.\n"
         "  --imatrix-out FILE\n"
@@ -741,6 +751,19 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
         ds4_tokens_free(&prompt);
         return rc;
     }
+    if (cfg->gen.mtp_distill_path) {
+        ds4_mtp_distill_options opt = {
+            .output_path = cfg->gen.mtp_distill_path,
+            .n_records = cfg->gen.mtp_distill_records > 0 ?
+                cfg->gen.mtp_distill_records :
+                (cfg->gen.n_predict_set ? cfg->gen.n_predict : 256),
+            .ctx_size = cfg->gen.ctx_size,
+            .top_k = cfg->gen.mtp_distill_top_k,
+        };
+        rc = ds4_engine_dump_mtp_distill(engine, &prompt, &opt);
+        ds4_tokens_free(&prompt);
+        return rc;
+    }
     if (cfg->gen.dump_logprobs_path) {
         rc = run_logprob_dump(engine, cfg, &prompt);
         ds4_tokens_free(&prompt);
@@ -1210,6 +1233,7 @@ static cli_config parse_options(int argc, char **argv) {
             .temperature = 1.0f,
             .top_p = 1.0f,
             .dump_logprobs_top_k = 20,
+            .mtp_distill_top_k = 32,
             .think_mode = DS4_THINK_HIGH,
         },
     };
@@ -1245,6 +1269,7 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.mtp_margin = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen.n_predict_set = true;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.gen.ctx_size = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--temp")) {
@@ -1281,6 +1306,14 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.dump_logprobs_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--logprobs-top-k")) {
             c.gen.dump_logprobs_top_k = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--mtp-distill-out")) {
+            c.gen.mtp_distill_path = need_arg(&i, argc, argv, arg);
+            c.engine.backend = DS4_BACKEND_METAL;
+            c.gen.temperature = 0.0f;
+        } else if (!strcmp(arg, "--mtp-distill-records")) {
+            c.gen.mtp_distill_records = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--mtp-distill-top-k")) {
+            c.gen.mtp_distill_top_k = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--imatrix-dataset")) {
             c.gen.imatrix_dataset_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--imatrix-out")) {

@@ -95,6 +95,13 @@ typedef struct {
     uint64_t cap;
 } ds4_session_snapshot;
 
+typedef struct {
+    const char *output_path;
+    int n_records;
+    int ctx_size;
+    int top_k;
+} ds4_mtp_distill_options;
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
@@ -122,6 +129,9 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                int ctx_size,
                                int max_prompts,
                                int max_tokens);
+int ds4_engine_dump_mtp_distill(ds4_engine *e,
+                                const ds4_tokens *prompt,
+                                const ds4_mtp_distill_options *opt);
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);

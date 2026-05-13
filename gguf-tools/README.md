@@ -9,6 +9,9 @@ The important pieces are:
 - `quants.[ch]`: the deliberately small local quantization implementation used
   by the quantizer.  It implements the DS4 output formats we actually ship:
   `q8_0`, `q4_K`, `q2_K`, and `iq2_xxs`.
+- `make_mtp_draft_gguf.py`: bootstrap an MTP-only support GGUF from a target
+  GGUF by renaming one target block into the `mtp.0.*` layout and synthesizing
+  the MTP projector tensors.
 - `imatrix/`: dataset and instructions for collecting routed-MoE activation
   importance with `ds4`.
 - `quality-testing/`: prompts and scripts used to compare local GGUF variants
@@ -23,6 +26,66 @@ make -C gguf-tools
 The quantizer is plain C and does not link GGML.  GGUF metadata handling,
 safetensors loading, FP4/FP8 dequantization, and the quantizers used by our Q2
 and Q4 recipes live in this directory.
+
+## Build A Bootstrap MTP GGUF
+
+`make_mtp_draft_gguf.py` creates a valid ds4 MTP support GGUF directly from the
+target GGUF. This is not a trained MTP module; it is a scratch bootstrap that
+copies one target transformer block into the `mtp.0.*` names, copies the target
+HC output head, and generates Q8_0 projector matrices.
+
+The best current scratch preset is layer 1 with the token embedding projector
+disabled and the previous-HC projector set to identity:
+
+```sh
+gguf-tools/make_mtp_draft_gguf.py \
+  --source ds4flash.gguf \
+  --out gguf/cyberneurova-mtp-bootstrap-l1-hproj.gguf \
+  --layer 1 \
+  --e-proj zero \
+  --h-proj identity \
+  --overwrite
+```
+
+This preset is useful for first-draft and verifier experiments because the
+target HC already contains the current token. It is not a stable unchecked
+multi-token turbo drafter: recursive bursts need a trained or distilled MTP
+module with a real token-conditioned transition.
+
+Generated files include `ds4.mtp.bootstrap.*` metadata keys recording the source
+GGUF, copied layer, projector recipe, scales, norm source, and whether plain
+F16 tensors were upcast to F32. Use `--plain-f32` to match the trained MTP's
+precision profile for HC mixer and router-input tensors; it is useful for
+experiments, but it does not replace actual distillation. ds4 detects the
+`ds4.mtp.bootstrap` marker and disables unchecked turbo for these files by
+default; set `DS4_MTP_BOOTSTRAP_TURBO=1` only when intentionally studying the
+unstable recursive path.
+
+## Dump MTP Distillation Records
+
+`ds4 --mtp-distill-out` writes a compact binary dataset for training or auditing
+MTP draft modules. Each record is a target-model step: the token just accepted,
+the target HC state after that token, and the next-token top-k logits/logprobs.
+This is the useful supervised signal for fitting a drafter to the exact target
+model instead of tuning recursive turbo by eye.
+
+```sh
+./ds4 \
+  -m ds4flash.gguf \
+  -p "Write a concise explanation of speculative decoding." \
+  --nothink \
+  --mtp-distill-out /tmp/ds4-mtp-distill.bin \
+  --mtp-distill-records 256 \
+  --mtp-distill-top-k 32
+
+gguf-tools/inspect_mtp_distill.py /tmp/ds4-mtp-distill.bin --records 3
+```
+
+The dump format starts with a 64-byte little-endian header (`DS4MTPD1`), then
+fixed-size records. The header stores `n_hc`, `n_embd`, `vocab`, `top_k`,
+`record_bytes`, and the finalized record count. Record payloads are
+`pos/token/target/top_k/target_logit/target_logprob`, followed by `4 * 4096`
+float32 HC values and `top_k` `(token, logit, logprob)` triples.
 
 ## Generate An Imatrix
 
