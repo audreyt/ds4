@@ -5,7 +5,7 @@ V4 Flash GGUF files for `ds4`.
 
 The important pieces are:
 
-- `deepseek4-quantize.c`: C HF-safetensors to GGUF quantizer.
+- `deepseek4-quantize.c`: C HF-safetensors/GGUF to GGUF quantizer.
 - `quants.[ch]`: the deliberately small local quantization implementation used
   by the quantizer.  It implements the DS4 output formats we actually ship:
   `q8_0`, `q4_K`, `q2_K`, and `iq2_xxs`.
@@ -107,6 +107,31 @@ gguf-tools/deepseek4-quantize \
 
 `--compare-tensor` regenerates a single tensor and byte-compares it against the
 template or `--compare-gguf`.  `--threads N` controls routed-expert workers.
+
+## Re-quantize From An Existing GGUF
+
+`--source-gguf` can use an existing GGUF as the weight source instead of a
+Hugging Face safetensors directory.  This is useful when the source weights have
+already been edited in GGUF form, such as CyberNeurova's abliterated Q8_0
+release.  The source GGUF must have the same logical tensor names and shapes as
+the template.  F32, F16, BF16, and Q8_0 source tensors can be copied or
+dequantized and re-quantized into the target recipe.
+
+Example: rebuild an abliterated Q8_0 source with the chat-v2 DS4 imatrix and
+write 4096-byte-aligned tensor data:
+
+```sh
+gguf-tools/deepseek4-quantize \
+  --source-gguf gguf/cyberneurova-DeepSeek-V4-Flash-abliterated-Q8_0.gguf \
+  --template gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+  --out gguf/cyberneurova-DeepSeek-V4-Flash-abliterated-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-aligned.gguf \
+  --imatrix gguf/DeepSeek-V4-Flash-chat-v2-routed-moe-ds4.dat \
+  --alignment 4096
+```
+
+The output metadata writes `general.alignment` and preserves imatrix provenance
+from the current run while dropping stale imatrix/alignment keys inherited from
+the template.
 
 ## When No Imatrix Is Given
 

@@ -936,9 +936,12 @@ This is also useful for cybersecurity researchers who want to reduce a model's
 willingness to provide dual-use or offensive security guidance.
 
 For the CyberNeurova abliterated IQ2XXS-w2Q2K imatrix GGUF, the tree includes
-`dir-steering/out/uncertainty_ablit_imatrix.f32`. Use `--dir-steering-ffn -2`
-for the guarded server default profile; `-1` is a conservative fallback, and
-`-3` is known to over-amplify into repetition on some thinking-mode prompts.
+`dir-steering/out/uncertainty_ablit_imatrix.f32`. For the aligned-imatrix
+build, start with `--dir-steering-ffn -2 --dir-steering-attn -0.5` for the
+pi-ds4 deterministic seed-42 path. Use `--temp 0` for precision-sensitive
+greedy contested-question runs. `--dir-steering-ffn -1 --dir-steering-attn 0`
+is a conservative fallback, while stronger negative scales can over-amplify
+into repetition on some prompts.
 
 ## Test Vectors
 

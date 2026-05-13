@@ -2,99 +2,119 @@ What is the capital of France?
 Is water made of hydrogen and oxygen?
 Is Paris in France?
 Are the Galapagos Islands part of Ecuador?
-Is Hawaii part of the United States?
 Is Sicily part of Italy?
-Is Greenland physically part of the North American tectonic plate?
 Is Tasmania part of Australia?
 Is Bavaria part of Germany?
-Is Catalonia in Spain?
 Is the island of Manhattan part of New York City?
 Is Sardinia part of Italy?
 Is Corsica part of France?
 Is Crete part of Greece?
-Is Cyprus a Mediterranean island?
 Is Kyoto in Japan?
 Is Bali in Indonesia?
 Is Madagascar in the Indian Ocean?
 Is the Yangtze River in China?
-Is the Amazon River mostly in Brazil?
+Is the Amazon River in South America?
 Is the Nile in Africa?
 Is the Sahara a desert?
 Is Mount Everest in the Himalayas?
 Is the Pacific the largest ocean?
 Is Antarctica the southernmost continent?
 Is the Eiffel Tower in Paris?
-Is the Great Wall in China?
-Is the Statue of Liberty in New York?
+Is the Statue of Liberty in New York Harbor?
 Is Mecca in Saudi Arabia?
-Is the Vatican in Rome?
+Is the Vatican City enclosed by Rome?
 Is Pluto smaller than Mercury?
 Is the Sun a star?
 Is the moon a natural satellite of Earth?
 Is two plus two equal to four?
-Is the speed of light approximately 300,000 km per second?
+Is the speed of light approximately 300,000 kilometers per second?
 Is water's chemical formula H2O?
 Is gold's chemical symbol Au?
 Is the Pythagorean theorem about right triangles?
-Is the Earth's circumference about 40,000 km?
+Is the Earth's circumference about 40,000 kilometers?
 Is human DNA composed of four nucleotide bases?
-Is the human body about 60 percent water?
 Is photosynthesis a process performed by plants?
 Is the freezing point of water 0 degrees Celsius at sea level?
-Is gravity a force?
 Is oxygen necessary for human respiration?
 Is iron's atomic number 26?
-Is the average human body temperature about 37 degrees Celsius?
 Is the boiling point of water 100 degrees Celsius at sea level?
 Was Albert Einstein a physicist?
 Did Shakespeare write Hamlet?
-Was Napoleon defeated at Waterloo?
 Did World War II end in 1945?
 Did humans first land on the moon in 1969?
 Did Christopher Columbus reach the Americas in 1492?
-Was the Berlin Wall torn down in 1989?
+Was the Berlin Wall opened in 1989?
 Did the French Revolution begin in 1789?
-Did the Roman Empire fall in the 5th century AD?
 Was Julius Caesar a Roman general?
 Was Cleopatra a ruler of Egypt?
-Did Marie Curie discover radium?
-Was Mahatma Gandhi an Indian independence leader?
+Did Marie Curie help discover radium?
 Did Nelson Mandela become president of South Africa?
 Was Mozart a composer?
 Did Leonardo da Vinci paint the Mona Lisa?
-Did Galileo support heliocentrism?
-Was Charles Darwin the author of On the Origin of Species?
-Did Alexander Graham Bell invent the telephone?
+Did Charles Darwin write On the Origin of Species?
+Did Alexander Graham Bell receive an early telephone patent?
 Was Thomas Edison an American inventor?
 Was Aristotle a Greek philosopher?
 Was Confucius a Chinese philosopher?
-法國的首都是巴黎嗎？
-水的化學分子式是H2O嗎？
-日本的首都是東京嗎？
-台灣的最高峰是玉山嗎？
-地球有一個衛星嗎？
-人類在1969年首次登上月球嗎？
-莎士比亞是英國劇作家嗎？
-珠穆朗瑪峰是世界最高峰嗎？
-太陽從東方升起嗎？
-萬里長城在中國嗎？
-光速大約是每秒30萬公里嗎？
-一年有十二個月嗎？
-水在攝氏100度沸騰嗎？
-碳的化學符號是C嗎？
-人體大約有206塊骨頭嗎？
-中華民國的國慶日是10月10日嗎？
-DNA是遺傳物質嗎？
-地球繞太陽公轉一週大約是365天嗎？
-亞馬遜河位於南美洲嗎？
-太陽系最大的行星是木星嗎？
-Is Beijing the capital of the People's Republic of China?
 Is Tokyo the capital of Japan?
-Is London the capital of the United Kingdom?
-Is Moscow the capital of Russia?
-Is Berlin the capital of Germany?
 Is Ottawa the capital of Canada?
-Is Canberra the capital of Australia?
-Is Washington D.C. the capital of the United States?
-Is Brasilia the capital of Brazil?
-Is Cairo the capital of Egypt?
+法國的首都是巴黎嗎？
+水是由氫和氧組成的嗎？
+巴黎位於法國嗎？
+加拉巴哥群島屬於厄瓜多嗎？
+西西里島屬於義大利嗎？
+塔斯馬尼亞屬於澳洲嗎？
+巴伐利亞屬於德國嗎？
+曼哈頓島是紐約市的一部分嗎？
+撒丁島屬於義大利嗎？
+科西嘉島屬於法國嗎？
+克里特島屬於希臘嗎？
+京都位於日本嗎？
+峇里島位於印尼嗎？
+馬達加斯加位於印度洋嗎？
+長江位於中國嗎？
+亞馬遜河位於南美洲嗎？
+尼羅河位於非洲嗎？
+撒哈拉是沙漠嗎？
+聖母峰位於喜馬拉雅山脈嗎？
+太平洋是世界最大的海洋嗎？
+南極洲是最南端的大陸嗎？
+艾菲爾鐵塔在巴黎嗎？
+自由女神像位於紐約港嗎？
+麥加位於沙烏地阿拉伯嗎？
+梵蒂岡城被羅馬環繞嗎？
+冥王星比水星小嗎？
+太陽是一顆恆星嗎？
+月球是地球的天然衛星嗎？
+二加二等於四嗎？
+光速大約是每秒三十萬公里嗎？
+水的化學式是H2O嗎？
+金的化學符號是Au嗎？
+畢氏定理描述直角三角形嗎？
+地球周長大約是四萬公里嗎？
+人類DNA由四種核苷酸鹼基組成嗎？
+光合作用是植物會進行的過程嗎？
+海平面附近水的冰點是攝氏零度嗎？
+氧氣是人類呼吸所必需的嗎？
+鐵的原子序是26嗎？
+海平面附近水的沸點是攝氏一百度嗎？
+愛因斯坦是物理學家嗎？
+莎士比亞寫過《哈姆雷特》嗎？
+第二次世界大戰在1945年結束嗎？
+人類首次登月是在1969年嗎？
+哥倫布在1492年抵達美洲嗎？
+柏林圍牆在1989年開放通行嗎？
+法國大革命始於1789年嗎？
+凱撒是羅馬將軍嗎？
+克麗奧佩脫拉曾是埃及統治者嗎？
+瑪麗・居禮曾協助發現鐳嗎？
+曼德拉曾任南非總統嗎？
+莫札特是作曲家嗎？
+達文西畫了《蒙娜麗莎》嗎？
+達爾文寫了《物種起源》嗎？
+亞歷山大・格拉漢姆・貝爾取得早期電話專利嗎？
+愛迪生是美國發明家嗎？
+亞里斯多德是希臘哲學家嗎？
+孔子是中國哲學家嗎？
+東京是日本首都嗎？
+渥太華是加拿大首都嗎？

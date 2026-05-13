@@ -45,6 +45,24 @@ def read_prompt_file(path: Path) -> list[str]:
     return prompts
 
 
+def contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
+def apply_language_prefixes(
+    prompts: list[str],
+    english_prefix: str,
+    cjk_prefix: str,
+) -> list[str]:
+    if not english_prefix and not cjk_prefix:
+        return prompts
+    out: list[str] = []
+    for prompt in prompts:
+        prefix = cjk_prefix if contains_cjk(prompt) else english_prefix
+        out.append(f"{prefix}{prompt}" if prefix else prompt)
+    return out
+
+
 def render_ds4_prompt(system: str, user: str, think: bool) -> str:
     """Render the minimal DS4 chat prefix used for activation capture."""
     pieces = [SPECIALS["bos"]]
@@ -133,6 +151,14 @@ def main() -> None:
                     help="metadata JSON path; .f32 is written next to it")
     ap.add_argument("--ctx", type=int, default=512)
     ap.add_argument("--system", default="You are a helpful assistant.")
+    ap.add_argument("--good-prefix-en", default="",
+                    help="prefix added to non-CJK target prompts before capture")
+    ap.add_argument("--good-prefix-zh", default="",
+                    help="prefix added to CJK target prompts before capture")
+    ap.add_argument("--bad-prefix-en", default="",
+                    help="prefix added to non-CJK contrast prompts before capture")
+    ap.add_argument("--bad-prefix-zh", default="",
+                    help="prefix added to CJK contrast prompts before capture")
     ap.add_argument("--component", default="ffn_out",
                     choices=("ffn_out", "attn_out"),
                     help="runtime-editable 4096-wide activation stream")
@@ -148,6 +174,12 @@ def main() -> None:
     model = Path(args.model).resolve()
     good_prompts = read_prompt_file(Path(args.good_file))
     bad_prompts = read_prompt_file(Path(args.bad_file))
+    good_prompts = apply_language_prefixes(
+        good_prompts, args.good_prefix_en, args.good_prefix_zh
+    )
+    bad_prompts = apply_language_prefixes(
+        bad_prompts, args.bad_prefix_en, args.bad_prefix_zh
+    )
     n = min(len(good_prompts), len(bad_prompts))
     good_prompts = good_prompts[:n]
     bad_prompts = bad_prompts[:n]
@@ -205,11 +237,17 @@ def main() -> None:
         "format": "ds4-directional-steering-v1",
         "shape": [N_LAYER, N_EMBD],
         "component": args.component,
+        "ctx": args.ctx,
+        "system": args.system,
         "thinking": bool(args.think),
         "pair_normalize": bool(args.pair_normalize),
         "orthogonalize_control_mean": not args.no_orthogonalize,
         "good_file": str(Path(args.good_file)),
         "bad_file": str(Path(args.bad_file)),
+        "good_prefix_en": args.good_prefix_en,
+        "good_prefix_zh": args.good_prefix_zh,
+        "bad_prefix_en": args.bad_prefix_en,
+        "bad_prefix_zh": args.bad_prefix_zh,
         "model": str(model),
         "note": "runtime positive scale suppresses this direction; negative scale amplifies it",
     }

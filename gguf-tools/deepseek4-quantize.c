@@ -43,6 +43,7 @@
 #define DS4_KV_QUANTIZE_IMATRIX_DATASET   "quantize.imatrix.dataset"
 #define DS4_KV_QUANTIZE_IMATRIX_N_ENTRIES "quantize.imatrix.entries_count"
 #define DS4_KV_QUANTIZE_IMATRIX_N_CHUNKS  "quantize.imatrix.chunks_count"
+#define DS4_KV_GENERAL_ALIGNMENT          "general.alignment"
 #define DS4_GGUF_DEFAULT_ALIGNMENT 32
 
 typedef enum {
@@ -880,7 +881,9 @@ static expert_tensor parse_expert_tensor(const char *name) {
     expert_tensor e = {0};
     int layer = -1;
     char kind[16];
-    if (sscanf(name, "blk.%d.ffn_%15[^_]_exps.weight", &layer, kind) == 2) {
+    int consumed = 0;
+    if (sscanf(name, "blk.%d.ffn_%15[^_]_exps.weight%n", &layer, kind, &consumed) == 2 &&
+        name[consumed] == '\0') {
         if (strcmp(kind, "gate") == 0 || strcmp(kind, "down") == 0 || strcmp(kind, "up") == 0) {
             e.is_expert = true;
             e.layer = layer;
@@ -1013,6 +1016,19 @@ typedef struct {
     size_t size;
 } tensor_meta;
 
+typedef struct gguf_file {
+    char *path;
+    uint32_t version;
+    uint64_t n_kv;
+    uint64_t n_tensors;
+    uint8_t *kv_raw;
+    size_t kv_raw_len;
+    size_t alignment;
+    size_t data_offset;
+    tensor_meta *tensors;
+    hmap tensor_map;
+} gguf_file;
+
 static int tensor_n_dims(const tensor_meta *t) {
     int n = t->n_dims;
     while (n > 1 && t->ne[n - 1] == 1) n--;
@@ -1082,6 +1098,21 @@ typedef struct {
     size_t size;
 } byte_buf;
 
+static byte_buf read_gguf_tensor_data(const gguf_file *g, const char *path, const char *name);
+static byte_buf read_gguf_tensor_data_range(const gguf_file *g, const tensor_meta *t,
+                                            uint64_t rel_offset, size_t size);
+
+typedef enum {
+    MODEL_SOURCE_HF,
+    MODEL_SOURCE_GGUF,
+} model_source_kind;
+
+typedef struct {
+    model_source_kind kind;
+    st_db *hf;
+    gguf_file *gguf;
+} model_source;
+
 static byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t ncols, const float *imat) {
     if (ncols <= 0 || n % ncols != 0) die("bad ncols for tensor conversion");
     byte_buf out = {0};
@@ -1145,6 +1176,79 @@ static size_t tensor_nbytes(ds4q_type type, const int64_t *ne, int n_dims) {
     return nbytes;
 }
 
+static int64_t meta_nelements(const tensor_meta *t) {
+    int64_t n = 1;
+    for (int i = 0; i < t->n_dims; i++) n *= t->ne[i];
+    return n;
+}
+
+static const tensor_meta *gguf_find_tensor(const gguf_file *g, const char *name) {
+    int idx = hmap_get(&g->tensor_map, name);
+    if (idx < 0) {
+        fprintf(stderr, "error: tensor not found in source GGUF: %s\n", name);
+        exit(1);
+    }
+    return &g->tensors[idx];
+}
+
+static void check_same_gguf_shape(const char *name, const tensor_meta *src, const tensor_meta *tmpl) {
+    const int snd = tensor_n_dims(src);
+    const int tnd = tensor_n_dims(tmpl);
+    if (snd != tnd) {
+        fprintf(stderr, "error: source/template rank mismatch for %s\n", name);
+        exit(1);
+    }
+    for (int i = 0; i < tnd; i++) {
+        if (src->ne[i] != tmpl->ne[i]) {
+            fprintf(stderr, "error: source/template shape mismatch for %s\n", name);
+            exit(1);
+        }
+    }
+}
+
+static float *gguf_tensor_to_f32(const byte_buf *src, const tensor_meta *meta, int64_t *n_out) {
+    const int64_t ncols = meta->ne[0];
+    const int64_t n = meta_nelements(meta);
+    if (ncols <= 0 || n % ncols != 0) die("bad GGUF tensor shape for dequantization");
+    const int64_t nrows = n / ncols;
+    float *out = xmalloc((size_t)n * sizeof(float));
+
+    if (meta->type == DS4Q_TYPE_F32) {
+        if (src->size != (size_t)n * sizeof(float)) die("bad GGUF F32 byte size");
+        memcpy(out, src->data, src->size);
+    } else if (meta->type == DS4Q_TYPE_F16) {
+        if (src->size != (size_t)n * sizeof(uint16_t)) die("bad GGUF F16 byte size");
+        for (int64_t i = 0; i < n; i++) {
+            out[i] = ds4q_f16_to_f32(load_u16_le(src->data + (size_t)i * 2));
+        }
+    } else if (meta->type == DS4Q_TYPE_BF16) {
+        if (src->size != (size_t)n * sizeof(uint16_t)) die("bad GGUF BF16 byte size");
+        for (int64_t i = 0; i < n; i++) {
+            out[i] = ds4q_bf16_to_f32(load_u16_le(src->data + (size_t)i * 2));
+        }
+    } else if (meta->type == DS4Q_TYPE_Q8_0) {
+        if (ncols % ds4q_block_size(DS4Q_TYPE_Q8_0) != 0) die("bad Q8_0 column count");
+        const size_t row_size = ds4q_row_size(DS4Q_TYPE_Q8_0, ncols);
+        if (src->size != (size_t)nrows * row_size) die("bad GGUF Q8_0 byte size");
+        const uint8_t *p = src->data;
+        for (int64_t r = 0; r < nrows; r++) {
+            float *row = out + (size_t)r * (size_t)ncols;
+            for (int64_t b = 0; b < ncols / 32; b++) {
+                const float d = ds4q_f16_to_f32(load_u16_le(p));
+                p += sizeof(uint16_t);
+                const int8_t *qs = (const int8_t *)p;
+                for (int j = 0; j < 32; j++) row[(size_t)b * 32u + (size_t)j] = d * (float)qs[j];
+                p += 32;
+            }
+        }
+    } else {
+        fprintf(stderr, "error: cannot dequantize source GGUF tensor type %s\n", ds4q_type_name(meta->type));
+        exit(1);
+    }
+    if (n_out) *n_out = n;
+    return out;
+}
+
 static void check_reversed_shape(const char *gguf_name, const st_info *info, const tensor_meta *tmpl) {
     int nd = tensor_n_dims(tmpl);
     if (info->n_dims != nd) {
@@ -1159,8 +1263,8 @@ static void check_reversed_shape(const char *gguf_name, const st_info *info, con
     }
 }
 
-static byte_buf generate_regular(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
-                                 ds4q_type target, const imatrix_store *imatrix) {
+static byte_buf generate_regular_hf(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
+                                    ds4q_type target, const imatrix_store *imatrix) {
     char *hf_name = hf_name_for_regular(gguf_name);
     tensor_entry *te = db_tensor(db, hf_name, NULL);
     check_reversed_shape(gguf_name, &te->info, tmpl);
@@ -1195,6 +1299,30 @@ static byte_buf generate_regular(st_db *db, const char *gguf_name, const tensor_
     byte_buf b = f32_to_type(f32, n, target, tmpl->ne[0], imat);
     free(f32);
     free(hf_name);
+    return b;
+}
+
+static byte_buf generate_regular_gguf(const gguf_file *src, const char *gguf_name,
+                                      const tensor_meta *tmpl, ds4q_type target,
+                                      const imatrix_store *imatrix) {
+    const tensor_meta *src_meta = gguf_find_tensor(src, gguf_name);
+    check_same_gguf_shape(gguf_name, src_meta, tmpl);
+    if (target == src_meta->type) {
+        byte_buf b = read_gguf_tensor_data(src, src->path, gguf_name);
+        if (b.size != tensor_nbytes(target, tmpl->ne, tmpl->n_dims)) die("source copy size mismatch");
+        return b;
+    }
+    if (target == DS4Q_TYPE_I32) die("cannot convert GGUF source tensor to I32");
+    if (!is_quantizable_target(target)) die("unsupported regular target type");
+
+    byte_buf raw = read_gguf_tensor_data(src, src->path, gguf_name);
+    int64_t n = 0;
+    float *f32 = gguf_tensor_to_f32(&raw, src_meta, &n);
+    free(raw.data);
+    const char *names[1] = { gguf_name };
+    const float *imat = imatrix_find(imatrix, names, 1, tmpl->ne[0], -1, 0);
+    byte_buf b = f32_to_type(f32, n, target, tmpl->ne[0], imat);
+    free(f32);
     return b;
 }
 
@@ -1258,9 +1386,9 @@ static void *expert_worker(void *arg) {
     return NULL;
 }
 
-static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
-                                ds4q_type target, int n_experts, int n_threads,
-                                const imatrix_store *imatrix) {
+static byte_buf generate_expert_hf(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
+                                   ds4q_type target, int n_experts, int n_threads,
+                                   const imatrix_store *imatrix) {
     expert_tensor e = parse_expert_tensor(gguf_name);
     if (!e.is_expert) die("not an expert tensor");
     if (!is_quantizable_target(target)) die("unsupported expert target type");
@@ -1290,13 +1418,118 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
     return out;
 }
 
-static byte_buf generate_tensor(st_db *db, const char *name, const tensor_meta *tmpl,
+typedef struct {
+    const gguf_file *src;
+    const char *gguf_name;
+    const tensor_meta *src_meta;
+    const tensor_meta *tmpl;
+    ds4q_type target;
+    int n_experts;
+    const imatrix_store *imatrix;
+    expert_tensor expert;
+    int64_t ncols;
+    int64_t nrows;
+    size_t src_per_expert;
+    size_t dst_per_expert;
+    byte_buf *out;
+    int next;
+    int done;
+    pthread_mutex_t lock;
+} gguf_expert_job;
+
+static void generate_one_expert_gguf(gguf_expert_job *j, int xid) {
+    byte_buf raw = read_gguf_tensor_data_range(j->src, j->src_meta,
+                                               (uint64_t)xid * (uint64_t)j->src_per_expert,
+                                               j->src_per_expert);
+    tensor_meta one = *j->src_meta;
+    one.n_dims = 2;
+    one.ne[0] = j->ncols;
+    one.ne[1] = j->nrows;
+    for (int i = 2; i < DS4Q_MAX_DIMS; i++) one.ne[i] = 1;
+    one.size = j->src_per_expert;
+
+    int64_t n = 0;
+    float *f32 = gguf_tensor_to_f32(&raw, &one, &n);
+    free(raw.data);
+    const char *names[1] = { j->gguf_name };
+    const float *imat = imatrix_find(j->imatrix, names, 1, j->ncols, xid, j->n_experts);
+    byte_buf q = f32_to_type(f32, n, j->target, j->ncols, imat);
+    if (q.size != j->dst_per_expert) die("expert quantized size mismatch");
+    memcpy(j->out->data + (size_t)xid * j->dst_per_expert, q.data, q.size);
+    free(q.data);
+    free(f32);
+}
+
+static void *gguf_expert_worker(void *arg) {
+    gguf_expert_job *j = arg;
+    for (;;) {
+        pthread_mutex_lock(&j->lock);
+        int xid = j->next++;
+        pthread_mutex_unlock(&j->lock);
+        if (xid >= j->n_experts) break;
+        generate_one_expert_gguf(j, xid);
+        pthread_mutex_lock(&j->lock);
+        int done = ++j->done;
+        if (done % 32 == 0 || done == j->n_experts) {
+            fprintf(stderr, "generate_expert_tensor_from_gguf: layer %d %d/%d experts\n",
+                    j->expert.layer, done, j->n_experts);
+        }
+        pthread_mutex_unlock(&j->lock);
+    }
+    return NULL;
+}
+
+static byte_buf generate_expert_gguf(const gguf_file *src, const char *gguf_name, const tensor_meta *tmpl,
+                                     ds4q_type target, int n_experts, int n_threads,
+                                     const imatrix_store *imatrix) {
+    expert_tensor e = parse_expert_tensor(gguf_name);
+    if (!e.is_expert) die("not an expert tensor");
+    if (!is_quantizable_target(target)) die("unsupported expert target type");
+    const tensor_meta *src_meta = gguf_find_tensor(src, gguf_name);
+    check_same_gguf_shape(gguf_name, src_meta, tmpl);
+    if (src_meta->n_dims < 3 || src_meta->ne[2] != n_experts) die("source expert tensor shape mismatch");
+    const int64_t ncols = tmpl->ne[0];
+    const int64_t nrows = tmpl->ne[1];
+    const size_t src_per_expert = (size_t)nrows * ds4q_row_size(src_meta->type, ncols);
+    const size_t dst_per_expert = (size_t)nrows * ds4q_row_size(target, ncols);
+    if (src_per_expert * (size_t)n_experts != src_meta->size) die("source expert size mismatch");
+
+    byte_buf out = { .size = dst_per_expert * (size_t)n_experts, .data = xmalloc(dst_per_expert * (size_t)n_experts) };
+    ds4q_quantize_init(target);
+    int worker_count = n_threads > 0 ? n_threads : 8;
+    if (worker_count < 1) worker_count = 1;
+    if (worker_count > n_experts) worker_count = n_experts;
+    fprintf(stderr, "generate_expert_tensor_from_gguf: layer %d using %d worker%s\n",
+            e.layer, worker_count, worker_count == 1 ? "" : "s");
+    gguf_expert_job job = {
+        .src = src, .gguf_name = gguf_name, .src_meta = src_meta, .tmpl = tmpl, .target = target,
+        .n_experts = n_experts, .imatrix = imatrix, .expert = e,
+        .ncols = ncols, .nrows = nrows, .src_per_expert = src_per_expert,
+        .dst_per_expert = dst_per_expert, .out = &out,
+    };
+    pthread_mutex_init(&job.lock, NULL);
+    pthread_t *threads = xcalloc((size_t)worker_count, sizeof(threads[0]));
+    for (int i = 1; i < worker_count; i++) pthread_create(&threads[i], NULL, gguf_expert_worker, &job);
+    gguf_expert_worker(&job);
+    for (int i = 1; i < worker_count; i++) pthread_join(threads[i], NULL);
+    pthread_mutex_destroy(&job.lock);
+    free(threads);
+    return out;
+}
+
+static byte_buf generate_tensor(model_source *source, const char *name, const tensor_meta *tmpl,
                                 ds4q_type target, int n_experts, int n_threads,
                                 const imatrix_store *imatrix) {
     if (parse_expert_tensor(name).is_expert) {
-        return generate_expert(db, name, tmpl, target, n_experts, n_threads, imatrix);
+        if (source->kind == MODEL_SOURCE_GGUF) {
+            return generate_expert_gguf(source->gguf, name, tmpl, target, n_experts, n_threads, imatrix);
+        }
+        return generate_expert_hf(source->hf, name, tmpl, target, n_experts, n_threads, imatrix);
     }
-    return generate_regular(db, name, tmpl, target, imatrix);
+    if (source->kind == MODEL_SOURCE_GGUF) {
+        return generate_regular_gguf(source->gguf, name, tmpl, target, imatrix);
+    }
+    return generate_regular_hf(source->hf, name, tmpl, target, imatrix);
 }
 
 /* =====
@@ -1311,19 +1544,6 @@ typedef struct {
     size_t start;
     size_t end;
 } byte_span;
-
-typedef struct {
-    char *path;
-    uint32_t version;
-    uint64_t n_kv;
-    uint64_t n_tensors;
-    uint8_t *kv_raw;
-    size_t kv_raw_len;
-    size_t alignment;
-    size_t data_offset;
-    tensor_meta *tensors;
-    hmap tensor_map;
-} gguf_file;
 
 typedef struct {
     tensor_meta *tensors;
@@ -1412,6 +1632,14 @@ static bool is_imatrix_kv_key(const char *key) {
     return str_starts(key, "quantize.imatrix.");
 }
 
+static bool is_dropped_template_kv_key(const char *key) {
+    return is_imatrix_kv_key(key) || strcmp(key, DS4_KV_GENERAL_ALIGNMENT) == 0;
+}
+
+static size_t extra_alignment_kv_size(void) {
+    return gguf_string_size(DS4_KV_GENERAL_ALIGNMENT) + 4 + 4;
+}
+
 static size_t extra_imatrix_kv_size(const imatrix_store *im) {
     if (!imatrix_enabled(im)) return 0;
     size_t n = 0;
@@ -1425,6 +1653,13 @@ static size_t extra_imatrix_kv_size(const imatrix_store *im) {
 static uint64_t extra_imatrix_kv_count(const imatrix_store *im) {
     if (!imatrix_enabled(im)) return 0;
     return 2 + (im->dataset ? 1 : 0) + (im->chunks > 0 ? 1 : 0);
+}
+
+static void write_alignment_kv(FILE *fp, size_t alignment) {
+    if (alignment > UINT32_MAX) die("GGUF alignment does not fit in uint32");
+    write_gguf_string(fp, DS4_KV_GENERAL_ALIGNMENT);
+    write_u32(fp, GGUF_TYPE_UINT32);
+    write_u32(fp, (uint32_t)alignment);
 }
 
 static void write_imatrix_kvs(FILE *fp, const imatrix_store *im) {
@@ -1487,7 +1722,7 @@ static gguf_file load_gguf_metadata(const char *path) {
          * otherwise the output can contain duplicate GGUF metadata with stale
          * and new values.
          */
-        if (!is_imatrix_kv_key(key)) {
+        if (!is_dropped_template_kv_key(key)) {
             kv_keep[n_kv_keep++] = (byte_span){
                 .start = (size_t)(rec_start - kv_start),
                 .end = (size_t)(rec_end - kv_start),
@@ -1553,6 +1788,20 @@ static byte_buf read_gguf_tensor_data(const gguf_file *g, const char *path, cons
     return b;
 }
 
+static byte_buf read_gguf_tensor_data_range(const gguf_file *g, const tensor_meta *t,
+                                            uint64_t rel_offset, size_t size) {
+    if (rel_offset > t->size || size > t->size - rel_offset) die("GGUF tensor range out of bounds");
+    byte_buf b = { .size = size, .data = xmalloc(size) };
+    FILE *fp = fopen(g->path, "rb");
+    if (!fp) die_errno("open GGUF", g->path);
+    if (fseeko(fp, (off_t)(g->data_offset + t->old_offset + rel_offset), SEEK_SET) != 0) {
+        die_errno("seek GGUF", g->path);
+    }
+    if (size && fread(b.data, 1, size, fp) != size) die_errno("read GGUF tensor range", g->path);
+    fclose(fp);
+    return b;
+}
+
 static uint64_t fnv1a64_bytes(const uint8_t *data, size_t n) {
     uint64_t h = 1469598103934665603ull;
     for (size_t i = 0; i < n; i++) {
@@ -1565,7 +1814,7 @@ static uint64_t fnv1a64_bytes(const uint8_t *data, size_t n) {
 static output_context build_output_context(const gguf_file *tmpl, const quant_policy *policy, const imatrix_store *im) {
     output_context out = {0};
     out.n_tensors = tmpl->n_tensors;
-    out.n_kv_extra = extra_imatrix_kv_count(im);
+    out.n_kv_extra = 1 + extra_imatrix_kv_count(im);
     out.alignment = tmpl->alignment;
     out.tensors = xcalloc((size_t)out.n_tensors, sizeof(out.tensors[0]));
     size_t tensor_info = 0;
@@ -1586,7 +1835,8 @@ static output_context build_output_context(const gguf_file *tmpl, const quant_po
         tensor_info += gguf_string_size(dst->name) + 4 + (size_t)dst->n_dims * 8 + 4 + 8;
     }
     out.tensor_bytes = off;
-    out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len + extra_imatrix_kv_size(im) + tensor_info;
+    out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len +
+                    extra_alignment_kv_size() + extra_imatrix_kv_size(im) + tensor_info;
     out.data_offset = ds4q_pad(out.meta_size, tmpl->alignment);
     return out;
 }
@@ -1600,7 +1850,7 @@ static void write_padding(FILE *fp, size_t n) {
     }
 }
 
-static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
+static void write_full_gguf(model_source *source, const gguf_file *tmpl, const output_context *out_ctx,
                             const char *out_path, int n_experts, int n_threads,
                             const imatrix_store *imatrix) {
     FILE *fp = fopen(out_path, "wb");
@@ -1610,6 +1860,7 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
     write_u64(fp, tmpl->n_tensors);
     write_u64(fp, tmpl->n_kv + out_ctx->n_kv_extra);
     if (fwrite(tmpl->kv_raw, 1, tmpl->kv_raw_len, fp) != tmpl->kv_raw_len) die("write GGUF KV failed");
+    write_alignment_kv(fp, out_ctx->alignment);
     write_imatrix_kvs(fp, imatrix);
     for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
         const tensor_meta *t = &out_ctx->tensors[i];
@@ -1628,7 +1879,7 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
         const tensor_meta *src = &tmpl->tensors[i];
         const tensor_meta *dst = &out_ctx->tensors[i];
         fprintf(stderr, "[%4" PRIu64 "/%4" PRIu64 "] %s -> %s\n", i + 1, out_ctx->n_tensors, dst->name, ds4q_type_name(dst->type));
-        byte_buf data = generate_tensor(db, dst->name, src, dst->type, n_experts, n_threads, imatrix);
+        byte_buf data = generate_tensor(source, dst->name, src, dst->type, n_experts, n_threads, imatrix);
         size_t expected = dst->size;
         if (data.size != expected) {
             fprintf(stderr, "error: generated size mismatch for %s: got %zu expected %zu\n", dst->name, data.size, expected);
@@ -1668,6 +1919,7 @@ static void print_plan(const gguf_file *tmpl, const output_context *out_ctx) {
 
 typedef struct {
     char *hf_dir;
+    char *source_gguf;
     char *template_gguf;
     char *out_gguf;
     char *compare_gguf;
@@ -1676,16 +1928,18 @@ typedef struct {
     quant_policy policy;
     int n_experts;
     int n_threads;
+    size_t alignment;
     bool dry_run;
     bool overwrite;
     bool imatrix_strict;
 } params;
 
 static void usage(const char *argv0) {
-    printf("usage: %s --hf DIR --template MODEL.gguf --out OUT.gguf [options]\n", argv0);
-    printf("\nDeepSeek V4 Flash safetensors -> GGUF quantizer in plain C.\n\n");
+    printf("usage: %s (--hf DIR | --source-gguf MODEL.gguf) --template MODEL.gguf --out OUT.gguf [options]\n", argv0);
+    printf("\nDeepSeek V4 Flash safetensors/GGUF -> GGUF quantizer in plain C.\n\n");
     printf("options:\n");
     printf("  --hf DIR               Hugging Face model directory with model.safetensors.index.json\n");
+    printf("  --source-gguf FILE     source GGUF to re-quantize from, e.g. an abliterated Q8_0 GGUF\n");
     printf("  --template FILE        existing DS4 GGUF used for metadata, tensor order, shapes\n");
     printf("  --out FILE             output GGUF path\n");
     printf("  --compare-gguf FILE    reference GGUF for --compare-tensor, default template\n");
@@ -1705,6 +1959,7 @@ static void usage(const char *argv0) {
     printf("  --output TYPE          output.* tensor type\n");
     printf("  --dense TYPE           remaining 2D+ non-routed tensor type\n");
     printf("  --tensor-type PFX=TYPE exact tensor-name or prefix override; may repeat\n");
+    printf("  --alignment N          write GGUF tensor-data alignment, default from template\n");
     printf("  --n-experts N          routed expert count, default 256\n");
     printf("  --threads N            expert worker count, default 8\n");
     printf("\nTYPE examples: f16, f32, bf16, q8_0, q4_k, q2_k, iq2_xxs\n");
@@ -1740,6 +1995,8 @@ static params parse_args(int argc, char **argv) {
             exit(0);
         } else if (strcmp(arg, "--hf") == 0) {
             p.hf_dir = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--source-gguf") == 0) {
+            p.source_gguf = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--template") == 0) {
             p.template_gguf = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--out") == 0) {
@@ -1784,6 +2041,11 @@ static params parse_args(int argc, char **argv) {
             *eq = '\0';
             p.policy.overrides = xrealloc(p.policy.overrides, (size_t)(p.policy.n_overrides + 1) * sizeof(p.policy.overrides[0]));
             p.policy.overrides[p.policy.n_overrides++] = (type_override){ xstrdup(spec), parse_type(eq + 1) };
+        } else if (strcmp(arg, "--alignment") == 0) {
+            char *end = NULL;
+            unsigned long long v = strtoull(need_value(argc, argv, &i, arg), &end, 10);
+            if (!v || (end && *end)) die("bad --alignment value");
+            p.alignment = (size_t)v;
         } else if (strcmp(arg, "--n-experts") == 0) {
             p.n_experts = atoi(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--threads") == 0) {
@@ -1793,7 +2055,7 @@ static params parse_args(int argc, char **argv) {
             exit(1);
         }
     }
-    if (!p.hf_dir) die("--hf is required");
+    if ((p.hf_dir != NULL) == (p.source_gguf != NULL)) die("exactly one of --hf or --source-gguf is required");
     if (!p.template_gguf) die("--template is required");
     if (!p.dry_run && !p.compare_tensor && !p.out_gguf) die("--out is required unless --dry-run or --compare-tensor is used");
     if (p.compare_tensor && !p.compare_gguf) p.compare_gguf = p.template_gguf;
@@ -1810,7 +2072,7 @@ static void free_gguf_file(gguf_file *g) {
     memset(g, 0, sizeof(*g));
 }
 
-static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
+static void compare_one_tensor(model_source *source, const gguf_file *tmpl, const output_context *out_ctx,
                                const params *p, const imatrix_store *imatrix) {
     int idx = hmap_get(&tmpl->tensor_map, p->compare_tensor);
     if (idx < 0) {
@@ -1819,7 +2081,7 @@ static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_co
     }
     fprintf(stderr, "regenerating %s as %s\n",
             p->compare_tensor, ds4q_type_name(out_ctx->tensors[idx].type));
-    byte_buf generated = generate_tensor(db, p->compare_tensor, &tmpl->tensors[idx],
+    byte_buf generated = generate_tensor(source, p->compare_tensor, &tmpl->tensors[idx],
                                          out_ctx->tensors[idx].type, p->n_experts, p->n_threads, imatrix);
     gguf_file ref = load_gguf_metadata(p->compare_gguf);
     byte_buf reference = read_gguf_tensor_data(&ref, p->compare_gguf, p->compare_tensor);
@@ -1858,24 +2120,37 @@ int main(int argc, char **argv) {
     if (p.imatrix_file) imatrix_load(&imatrix, p.imatrix_file, p.imatrix_strict);
 
     gguf_file tmpl = load_gguf_metadata(p.template_gguf);
+    if (p.alignment) tmpl.alignment = p.alignment;
     output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix);
     print_plan(&tmpl, &out_ctx);
     if (p.dry_run) return 0;
 
     st_db db;
-    db_open(&db, p.hf_dir);
+    gguf_file source_gguf = {0};
+    model_source source = {0};
+    if (p.hf_dir) {
+        db_open(&db, p.hf_dir);
+        source.kind = MODEL_SOURCE_HF;
+        source.hf = &db;
+    } else {
+        source_gguf = load_gguf_metadata(p.source_gguf);
+        source.kind = MODEL_SOURCE_GGUF;
+        source.gguf = &source_gguf;
+    }
     if (p.compare_tensor) {
-        compare_one_tensor(&db, &tmpl, &out_ctx, &p, &imatrix);
-        db_close(&db);
+        compare_one_tensor(&source, &tmpl, &out_ctx, &p, &imatrix);
+        if (p.hf_dir) db_close(&db);
+        else free_gguf_file(&source_gguf);
         imatrix_free(&imatrix);
         free_gguf_file(&tmpl);
         free(out_ctx.tensors);
         return 0;
     }
-    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix);
+    write_full_gguf(&source, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix);
     fprintf(stderr, "wrote %s\n", p.out_gguf);
 
-    db_close(&db);
+    if (p.hf_dir) db_close(&db);
+    else free_gguf_file(&source_gguf);
     imatrix_free(&imatrix);
     free_gguf_file(&tmpl);
     free(out_ctx.tensors);

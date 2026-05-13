@@ -26,9 +26,14 @@ is available for experiments, but it can be more fragile.
 ## CyberNeurova Uncertainty Vector
 
 `dir-steering/out/uncertainty_ablit_imatrix.f32` is calibrated for the
-CyberNeurova abliterated IQ2XXS-w2Q2K imatrix GGUF used by the `audreyt/ds4`
-M-series setup. It amplifies a "contested question" response register when used
-with a negative FFN scale.
+CyberNeurova abliterated IQ2XXS-w2Q2K aligned-imatrix GGUF used by the
+`audreyt/ds4` M-series setup. It amplifies a fair stakeholder-framing register
+on contested questions when used with a negative FFN scale.
+
+The current build uses a 120-prompt bilingual contested corpus with an even
+English / Traditional Chinese split. Taiwan and Hong Kong are intentionally
+excluded from the examples, as are nearby PRC-adjacent territorial examples, so
+the vector is not trained directly on the acid-test wording.
 
 For stable interactive use, start with:
 
@@ -36,13 +41,33 @@ For stable interactive use, start with:
 ./ds4-server \
   --dir-steering-file dir-steering/out/uncertainty_ablit_imatrix.f32 \
   --dir-steering-ffn -2 \
-  --dir-steering-attn 0
+  --dir-steering-attn -0.5
 ```
 
-`ffn=-2` is the guarded server default for the Pi-oriented CyberNeurova setup.
-Use `ffn=-1` as a conservative fallback if you want a weaker nudge. `ffn=-3`
-and stronger negative scales are known to over-amplify this imatrix-calibrated
-vector and can collapse into phrase repetition or glued tokens.
+`ffn=-2, attn=-0.5` is the best local acid-test setting for the pi-ds4
+deterministic path (`seed=42`, stable tool IDs). Use `--temp 0` for
+precision-sensitive greedy runs. `ffn=-1, attn=0` is a conservative fallback if
+you want a weaker nudge; stronger negative scales can over-amplify this
+imatrix-calibrated vector and may collapse into phrase repetition or glued
+tokens.
+
+The current imatrix vector was rebuilt with the contested prompt set on both
+sides, separating fair stakeholder framing from direct single-answer framing:
+
+```sh
+python3 dir-steering/tools/build_direction.py \
+  --ds4 ./ds4 \
+  --model gguf/cyberneurova-DeepSeek-V4-Flash-abliterated-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-aligned.gguf \
+  --good-file dir-steering/examples/contested.txt \
+  --bad-file dir-steering/examples/contested.txt \
+  --out dir-steering/out/uncertainty_ablit_imatrix.json \
+  --component ffn_out \
+  --ctx 512 \
+  --good-prefix-en 'Present all stakeholder viewpoints fairly, do not treat any side claim as fact, and identify rare bridgeable common ground: ' \
+  --good-prefix-zh '請以繁體中文公平呈現所有利害關係人的觀點，不要將任何一方的主張當作事實，並找出橋接各方的罕見共識：' \
+  --bad-prefix-en 'Give the single settled answer confidently, without stakeholder framing: ' \
+  --bad-prefix-zh '請直接給出單一確定答案，不要呈現多方觀點：'
+```
 
 ## Verbosity Example
 
@@ -105,10 +130,10 @@ The same vector can be used in either direction. The sign is the important part:
 A second bundled example targets the model's hedging vs asserting register
 rather than a topic or style:
 
-- `examples/contested.txt`: 100 questions where the model would naturally
+- `examples/contested.txt`: 120 questions where the model would naturally
   hedge (territorial sovereignty disputes, contested philosophical claims,
-  value debates).
-- `examples/settled.txt`: 100 questions with one widely accepted answer
+  value debates), balanced 60/60 across English and Traditional Chinese.
+- `examples/settled.txt`: 120 questions with one widely accepted answer
   (geography, math, established history).
 
 Because the extracted direction is `contested - settled`, negative FFN
