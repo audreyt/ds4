@@ -2,8 +2,9 @@
 set -e
 
 REPO="antirez/deepseek-v4-gguf"
+Q2_IMATRIX_REPO="audreyt/CyberNeurova-DeepSeek-V4-Flash-abliterated-GGUF"
 Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf"
-Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
+Q2_IMATRIX_FILE="cyberneurova-DeepSeek-V4-Flash-abliterated-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
 Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf"
 Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
 MTP_FILE="DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
@@ -31,7 +32,7 @@ Targets:
   *** PREFERRED GGUF FILES: USE THE IMATRIX VERSIONS BELOW ***
 
   q2-imatrix
-       2-bit routed experts, about 81 GB on disk.
+       CyberNeurova abliterated 2-bit routed experts, about 81 GB on disk.
        Recommended model for 96 and 128 GB RAM machines.
 
   q4-imatrix
@@ -81,11 +82,11 @@ MODEL=$1
 shift
 
 case "$MODEL" in
-    q2-imatrix) MODEL_FILE=$Q2_IMATRIX_FILE ;;
-    q4-imatrix) MODEL_FILE=$Q4_IMATRIX_FILE ;;
-    q2) MODEL_FILE=$Q2_FILE ;;
-    q4) MODEL_FILE=$Q4_FILE ;;
-    mtp) MODEL_FILE=$MTP_FILE ;;
+    q2-imatrix) MODEL_REPO=$Q2_IMATRIX_REPO; MODEL_FILE=$Q2_IMATRIX_FILE ;;
+    q4-imatrix) MODEL_REPO=$REPO; MODEL_FILE=$Q4_IMATRIX_FILE ;;
+    q2) MODEL_REPO=$REPO; MODEL_FILE=$Q2_FILE ;;
+    q4) MODEL_REPO=$REPO; MODEL_FILE=$Q4_FILE ;;
+    mtp) MODEL_REPO=$REPO; MODEL_FILE=$MTP_FILE ;;
     -h|--help|help)
         usage
         exit 0
@@ -121,11 +122,12 @@ if [ -z "$TOKEN" ] && [ -s "$HOME/.cache/huggingface/token" ]; then
 fi
 
 download_one() {
-    file=$1
+    repo=$1
+    file=$2
     out="$OUT_DIR/$file"
     part="$out.part"
     aria2_part="$out.aria2"
-    url="https://huggingface.co/$REPO/resolve/main/$file"
+    url="https://huggingface.co/$repo/resolve/main/$file"
 
     mkdir -p "$OUT_DIR"
 
@@ -141,7 +143,7 @@ download_one() {
     fi
 
     echo "Downloading $file"
-    echo "from https://huggingface.co/$REPO"
+    echo "from https://huggingface.co/$repo"
     echo "If the download stops, run the same command again to resume it."
 
     if [ -n "$TOKEN" ]; then
@@ -153,7 +155,7 @@ download_one() {
     mv "$part" "$out"
 }
 
-download_one "$MODEL_FILE"
+download_one "$MODEL_REPO" "$MODEL_FILE"
 
 if [ "$MODEL" = "mtp" ]; then
     echo
