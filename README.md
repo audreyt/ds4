@@ -1,4 +1,23 @@
-# DwarfStar 4
+# DwarfStar 4 with M5 optimizations
+
+**Apple M5 performance note:** on an Apple M5 Max with 128 GB RAM, this `m5`
+branch is substantially faster than `main` in a single-run Metal `ds4-bench`
+sweep using `ds4flash.gguf`, `speed-bench/promessi_sposi.txt`, contexts
+2048-8192, 2048-token steps, and 64 generated tokens.
+
+Geometric-mean speedup across the measured frontiers is **1.86x prefill**
+and **1.45x generation**.
+
+| Context | main prefill | m5 prefill | Prefill uplift | main gen | m5 gen | Gen uplift |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2048 | 188.46 t/s | 369.98 t/s | +96.3% | 20.43 t/s | 31.35 t/s | +53.5% |
+| 4096 | 168.54 t/s | 336.40 t/s | +99.6% | 20.89 t/s | 30.97 t/s | +48.3% |
+| 6144 | 175.20 t/s | 328.10 t/s | +87.3% | 21.73 t/s | 30.62 t/s | +40.9% |
+| 8192 | 182.32 t/s | 300.43 t/s | +64.8% | 22.12 t/s | 30.46 t/s | +37.7% |
+
+The `m5` branch includes M5-specific `metal_simdgroup_matrix` optimization for
+dense prefill/routed-MoE matmul kernels and GPU-private scratch buffers for hot
+Metal intermediates.
 
 DrawfStar 4 is a small native inference engine for DeepSeek V4 Flash. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
@@ -627,6 +646,31 @@ Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
   "defaultModel": "deepseek-v4-flash"
 }
 ```
+
+For **swival.dev**, point its generic OpenAI-compatible provider at the running server:
+
+```sh
+swival --provider generic \
+       --base-url http://127.0.0.1:8000/v1 \
+       --model deepseek-v4-flash \
+       --max-context-tokens 100000 \
+       --max-output-tokens 100000
+```
+
+`max-output-tokens` must be less than or equal to `max-context-tokens`.
+
+To toggle thinking mode, pass it through `--extra-body` rather than
+`--reasoning-effort` (ds4-server rejects swival's `none` and `minimal` levels
+and has no `max` choice in swival's enum):
+
+```sh
+swival --extra-body '{"thinking": false}' ...         # non-thinking
+swival --extra-body '{"thinking": true}' ...          # normal thinking (default)
+swival --extra-body '{"reasoning_effort": "max"}' ... # Think Max (server must be started with --ctx >= 393216, else it falls back to normal thinking)
+```
+
+Using `--model deepseek-chat` or `--model deepseek-reasoner` works as a
+shorthand for the first two.
 
 For **Claude Code**, use the Anthropic-compatible endpoint. A wrapper like this
 matches the local `~/bin/claude-ds4` setup:
