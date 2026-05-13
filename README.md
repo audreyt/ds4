@@ -8,7 +8,7 @@ sweep using `ds4flash.gguf`, `speed-bench/promessi_sposi.txt`, contexts
 Geometric-mean speedup across the measured frontiers is **2.61x prefill**
 and **1.51x generation**.
 
-| Context | main prefill | m5 prefill | Prefill uplift | main gen | m5 gen | Gen uplift |
+| Context | main prefill | m5+MPP prefill | Prefill uplift | main gen | m5 gen | Gen uplift |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 2048 | 188.46 t/s | 529.80 t/s | +181.1% | 20.43 t/s | 34.43 t/s | +68.5% |
 | 4096 | 168.54 t/s | 457.69 t/s | +171.6% | 20.89 t/s | 31.95 t/s | +52.9% |
