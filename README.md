@@ -125,7 +125,10 @@ slight speedup, not a meaningful generation-speed win.
 Then build:
 
 ```sh
-make
+make                  # macOS Metal
+make cuda-spark       # Linux CUDA, DGX Spark / GB10
+make cuda-generic     # Linux CUDA, other local CUDA GPUs
+make cpu              # CPU-only diagnostics build
 ```
 
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
@@ -635,19 +638,22 @@ the kv cache files include the verbatim prompt cached.
 
 ## Backends
 
-The default graph backend is Metal on macOS and CUDA on Linux CUDA builds:
+The default graph backend is Metal on macOS and CUDA in CUDA builds:
 
 ```sh
 ./ds4 -p "Hello" --metal
 ./ds4 -p "Hello" --cuda
 ```
 
-CUDA builds default to `CUDA_ARCH=native`, so `nvcc` targets the visible GPU.
-Set `CUDA_ARCH` explicitly when cross-building or when you need a known target:
+On Linux, plain `make` prints the available build targets instead of selecting a
+CUDA target implicitly. Use `make cuda-spark` for DGX Spark / GB10. It omits an
+explicit `nvcc -arch` because that is currently the fastest path on GB10. Use
+`make cuda-generic` for a normal local CUDA build, or set `CUDA_ARCH` explicitly
+when cross-building or when you need a known target:
 
 ```sh
-make CUDA_ARCH=sm_120
-make CUDA_ARCH=        # old nvcc default target behavior
+make cuda CUDA_ARCH=sm_120
+make cuda CUDA_ARCH=native
 ```
 
 There is also a CPU reference/debug path:
