@@ -39,6 +39,12 @@ static volatile sig_atomic_t g_listen_fd = -1;
 
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
+#define DS4_THINKING_STABLE_TEMPERATURE 0.6f
+#define DS4_THINKING_STABLE_TOP_K 40
+#define DS4_THINKING_STABLE_TOP_P 0.95f
+#define DS4_THINKING_STABLE_MIN_P 0.03f
+#define DS4_REPEAT_GUARD_MIN_TOKENS 32
+#define DS4_REPEAT_GUARD_MAX_NGRAM 64
 
 static void stop_signal_handler(int sig) {
     (void)sig;
@@ -6596,6 +6602,20 @@ typedef struct {
     int tail_len;
 } thinking_state;
 
+typedef struct {
+    float temperature;
+    int top_k;
+    float top_p;
+    float min_p;
+} decode_sampling;
+
+typedef struct {
+    int *tokens;
+    size_t *ends;
+    int len;
+    int cap;
+} decode_repetition_guard;
+
 static bool thinking_tail_ends_with(const thinking_state *st, const char *s) {
     int n = (int)strlen(s);
     return st->tail_len >= n && !memcmp(st->tail + st->tail_len - n, s, (size_t)n);
@@ -6612,6 +6632,104 @@ static void thinking_state_feed(thinking_state *st, const char *p, size_t len) {
         if (thinking_tail_ends_with(st, "<think>")) st->inside = true;
         else if (thinking_tail_ends_with(st, "</think>")) st->inside = false;
     }
+}
+
+static decode_sampling effective_decode_sampling(const request *r,
+                                                 dsml_decode_state dsml_state) {
+    decode_sampling p = {
+        .temperature = r ? r->temperature : 1.0f,
+        .top_k = r ? r->top_k : 0,
+        .top_p = r ? r->top_p : 1.0f,
+        .min_p = r ? r->min_p : 0.0f,
+    };
+
+    if (r && ds4_think_mode_enabled(r->think_mode)) {
+        if (p.temperature <= 0.0f || p.temperature > DS4_THINKING_STABLE_TEMPERATURE) {
+            p.temperature = DS4_THINKING_STABLE_TEMPERATURE;
+        }
+        if (p.top_k <= 0 || p.top_k > DS4_THINKING_STABLE_TOP_K) {
+            p.top_k = DS4_THINKING_STABLE_TOP_K;
+        }
+        if (p.top_p <= 0.0f || p.top_p > DS4_THINKING_STABLE_TOP_P) {
+            p.top_p = DS4_THINKING_STABLE_TOP_P;
+        }
+        if (p.min_p < DS4_THINKING_STABLE_MIN_P) {
+            p.min_p = DS4_THINKING_STABLE_MIN_P;
+        }
+    }
+
+    if (dsml_decode_state_is_tool(dsml_state) &&
+        !dsml_decode_state_uses_payload_sampling(dsml_state))
+    {
+        p.temperature = 0.0f;
+        p.top_k = 0;
+        p.top_p = 1.0f;
+        p.min_p = 0.0f;
+    }
+
+    return p;
+}
+
+static void decode_repetition_guard_free(decode_repetition_guard *g) {
+    if (!g) return;
+    free(g->tokens);
+    free(g->ends);
+    memset(g, 0, sizeof(*g));
+}
+
+static void decode_repetition_guard_push(decode_repetition_guard *g,
+                                         int token,
+                                         size_t text_end) {
+    if (g->len == g->cap) {
+        int new_cap = g->cap ? g->cap * 2 : 128;
+        g->tokens = xrealloc(g->tokens, (size_t)new_cap * sizeof(g->tokens[0]));
+        g->ends = xrealloc(g->ends, (size_t)new_cap * sizeof(g->ends[0]));
+        g->cap = new_cap;
+    }
+    g->tokens[g->len] = token;
+    g->ends[g->len] = text_end;
+    g->len++;
+}
+
+static int decode_repetition_required_repeats(int width) {
+    if (width <= 1) return 8;
+    if (width <= 3) return 6;
+    return 4;
+}
+
+static bool decode_repetition_guard_observe(
+        decode_repetition_guard *g,
+        int token,
+        size_t text_end,
+        int *out_width,
+        int *out_repeats,
+        size_t *out_trim_len) {
+    if (!g) return false;
+    decode_repetition_guard_push(g, token, text_end);
+    if (g->len < DS4_REPEAT_GUARD_MIN_TOKENS) return false;
+
+    int max_width = g->len / 2;
+    if (max_width > DS4_REPEAT_GUARD_MAX_NGRAM) max_width = DS4_REPEAT_GUARD_MAX_NGRAM;
+    for (int width = 1; width <= max_width; width++) {
+        int repeats = 1;
+        while ((repeats + 1) * width <= g->len &&
+               memcmp(g->tokens + g->len - width,
+                      g->tokens + g->len - (repeats + 1) * width,
+                      (size_t)width * sizeof(g->tokens[0])) == 0)
+        {
+            repeats++;
+        }
+        const int required = decode_repetition_required_repeats(width);
+        if (repeats >= required) {
+            const int keep = g->len - width * (repeats - 1);
+            if (out_width) *out_width = width;
+            if (out_repeats) *out_repeats = repeats;
+            if (out_trim_len) *out_trim_len = keep > 0 ? g->ends[keep - 1] : 0;
+            return true;
+        }
+    }
+
+    return false;
 }
 
 static thinking_state thinking_state_from_prompt(const request *r) {
@@ -7105,6 +7223,7 @@ static void generate_job(server *s, job *j) {
     thinking_state thinking = thinking_state_from_prompt(&j->req);
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
+    decode_repetition_guard repeat_guard = {0};
 
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
@@ -7114,20 +7233,13 @@ static void generate_job(server *s, job *j) {
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
             kv_cache_maybe_store_continued(s);
         }
-        float temperature = j->req.temperature;
-        int top_k = j->req.top_k;
-        float top_p = j->req.top_p;
-        float min_p = j->req.min_p;
-        if (ds4_think_mode_enabled(j->req.think_mode)) {
-            temperature = 1.0f;
-            top_k = 0;
-            top_p = 1.0f;
-            min_p = 0.0f;
-        }
-        if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
-            temperature = 0.0f;
-        }
-        int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
+        decode_sampling sampling = effective_decode_sampling(&j->req, dsml_state);
+        int token = ds4_session_sample(s->session,
+                                       sampling.temperature,
+                                       sampling.top_k,
+                                       sampling.top_p,
+                                       sampling.min_p,
+                                       &rng);
         if (token == ds4_token_eos(s->engine)) {
             finish = "stop";
             break;
@@ -7135,7 +7247,7 @@ static void generate_job(server *s, job *j) {
 
         int toks[17];
         int ntok = 0;
-        if (temperature <= 0.0f &&
+        if (sampling.temperature <= 0.0f &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -7178,6 +7290,49 @@ static void generate_job(server *s, job *j) {
             thinking_state_feed(&thinking, piece, piece_len);
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
+            }
+
+            int repeat_width = 0;
+            int repeat_count = 0;
+            size_t repeat_trim_len = text.len;
+            if (decode_repetition_guard_observe(&repeat_guard,
+                                                token,
+                                                text.len,
+                                                &repeat_width,
+                                                &repeat_count,
+                                                &repeat_trim_len)) {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: %s ctx=%s stopped repetitive decode after %d generated tokens ngram=%d repeats=%d",
+                           j->req.kind == REQ_CHAT ? "chat" : "completion",
+                           ctx_span,
+                           completion,
+                           repeat_width,
+                           repeat_count);
+                trace_event(s, trace_id,
+                            "repetition guard stopped decode: gen=%d ngram=%d repeats=%d",
+                            completion,
+                            repeat_width,
+                            repeat_count);
+                size_t min_trim_len = 0;
+                if (j->req.stream) {
+                    min_trim_len = plain_stream_pos;
+                    if (openai_live_chat && openai_live.emit_pos > min_trim_len) {
+                        min_trim_len = openai_live.emit_pos;
+                    }
+                    if (j->req.api == API_ANTHROPIC && anthropic_live.emit_pos > min_trim_len) {
+                        min_trim_len = anthropic_live.emit_pos;
+                    }
+                }
+                if (repeat_trim_len < min_trim_len) repeat_trim_len = min_trim_len;
+                if (repeat_trim_len < text.len) {
+                    text.len = repeat_trim_len;
+                    text.ptr[text.len] = '\0';
+                }
+                ds4_session_invalidate(s->session);
+                finish = "stop";
+                free(piece);
+                stop_decode = true;
+                break;
             }
 
             size_t stop_pos = 0, stop_len = 0;
@@ -7477,6 +7632,7 @@ static void generate_job(server *s, job *j) {
     openai_stream_free(&openai_live);
     buf_free(&text);
     ds4_tokens_free(&effective_prompt);
+    decode_repetition_guard_free(&repeat_guard);
 }
 
 static bool enqueue(server *s, job *j) {
@@ -9561,6 +9717,92 @@ static void test_stop_list_streaming_holds_and_trims_stop_text(void) {
     free(stops.v);
 }
 
+static void test_thinking_sampling_uses_stable_profile(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+    r.temperature = 1.0f;
+    r.top_k = 0;
+    r.top_p = 1.0f;
+    r.min_p = 0.0f;
+
+    decode_sampling p = effective_decode_sampling(&r, DSML_DECODE_OUTSIDE);
+    TEST_ASSERT(p.temperature == DS4_THINKING_STABLE_TEMPERATURE);
+    TEST_ASSERT(p.top_k == DS4_THINKING_STABLE_TOP_K);
+    TEST_ASSERT(p.top_p == DS4_THINKING_STABLE_TOP_P);
+    TEST_ASSERT(p.min_p == DS4_THINKING_STABLE_MIN_P);
+
+    r.temperature = 0.2f;
+    r.top_k = 8;
+    r.top_p = 0.5f;
+    r.min_p = 0.1f;
+    p = effective_decode_sampling(&r, DSML_DECODE_OUTSIDE);
+    TEST_ASSERT(p.temperature == 0.2f);
+    TEST_ASSERT(p.top_k == 8);
+    TEST_ASSERT(p.top_p == 0.5f);
+    TEST_ASSERT(p.min_p == 0.1f);
+
+    p = effective_decode_sampling(&r, DSML_DECODE_STRUCTURAL);
+    TEST_ASSERT(p.temperature == 0.0f);
+    TEST_ASSERT(p.top_k == 0);
+    TEST_ASSERT(p.top_p == 1.0f);
+    TEST_ASSERT(p.min_p == 0.0f);
+
+    request_free(&r);
+}
+
+static void test_repetition_guard_stops_phrase_loop(void) {
+    decode_repetition_guard g = {0};
+    int width = 0;
+    int repeats = 0;
+    size_t trim_len = 0;
+    bool stopped = false;
+    size_t text_len = 0;
+
+    for (int i = 0; i < 20; i++) {
+        text_len++;
+        TEST_ASSERT(!decode_repetition_guard_observe(&g, 1000 + i, text_len,
+                                                     &width, &repeats, &trim_len));
+    }
+    for (int r = 0; r < 4 && !stopped; r++) {
+        for (int i = 0; i < 4; i++) {
+            text_len++;
+            stopped = decode_repetition_guard_observe(&g, 7 + i, text_len,
+                                                      &width, &repeats, &trim_len);
+            if (stopped) break;
+        }
+    }
+
+    TEST_ASSERT(stopped);
+    TEST_ASSERT(width == 4);
+    TEST_ASSERT(repeats == 4);
+    TEST_ASSERT(trim_len == 24);
+    decode_repetition_guard_free(&g);
+}
+
+static void test_repetition_guard_allows_short_repeat(void) {
+    decode_repetition_guard g = {0};
+    int width = 0;
+    int repeats = 0;
+    size_t trim_len = 0;
+    size_t text_len = 0;
+
+    for (int i = 0; i < 24; i++) {
+        text_len++;
+        TEST_ASSERT(!decode_repetition_guard_observe(&g, 2000 + i, text_len,
+                                                     &width, &repeats, &trim_len));
+    }
+    for (int r = 0; r < 3; r++) {
+        for (int i = 0; i < 4; i++) {
+            text_len++;
+            TEST_ASSERT(!decode_repetition_guard_observe(&g, 11 + i, text_len,
+                                                         &width, &repeats, &trim_len));
+        }
+    }
+
+    decode_repetition_guard_free(&g);
+}
+
 static char *test_nested_json_array(int depth) {
     buf b = {0};
     for (int i = 0; i < depth; i++) buf_putc(&b, '[');
@@ -10332,6 +10574,9 @@ static void ds4_server_unit_tests_run(void) {
     test_dsml_prompt_escapes_tool_supplied_text();
     test_stop_list_parses_all_sequences();
     test_stop_list_streaming_holds_and_trims_stop_text();
+    test_thinking_sampling_uses_stable_profile();
+    test_repetition_guard_stops_phrase_loop();
+    test_repetition_guard_allows_short_repeat();
     test_json_skip_has_nesting_limit();
     test_model_metadata_clamps_completion_to_context();
     test_client_socket_nonblocking_flag();

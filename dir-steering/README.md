@@ -35,14 +35,14 @@ For stable interactive use, start with:
 ```sh
 ./ds4-server \
   --dir-steering-file dir-steering/out/uncertainty_ablit_imatrix.f32 \
-  --dir-steering-ffn -1 \
+  --dir-steering-ffn -2 \
   --dir-steering-attn 0
 ```
 
-`ffn=-2` is stronger and may be useful for targeted evaluations, but it has less
-headroom on long thinking-mode generations. `ffn=-3` and stronger negative
-scales are known to over-amplify this imatrix-calibrated vector and can collapse
-into phrase repetition or glued tokens.
+`ffn=-2` is the guarded server default for the Pi-oriented CyberNeurova setup.
+Use `ffn=-1` as a conservative fallback if you want a weaker nudge. `ffn=-3`
+and stronger negative scales are known to over-amplify this imatrix-calibrated
+vector and can collapse into phrase repetition or glued tokens.
 
 ## Verbosity Example
 

@@ -936,10 +936,9 @@ This is also useful for cybersecurity researchers who want to reduce a model's
 willingness to provide dual-use or offensive security guidance.
 
 For the CyberNeurova abliterated IQ2XXS-w2Q2K imatrix GGUF, the tree includes
-`dir-steering/out/uncertainty_ablit_imatrix.f32`. Use `--dir-steering-ffn -1`
-for the stable default profile; stronger negative scales such as `-2` are
-experimental, and `-3` is known to over-amplify into repetition on some
-thinking-mode prompts.
+`dir-steering/out/uncertainty_ablit_imatrix.f32`. Use `--dir-steering-ffn -2`
+for the guarded server default profile; `-1` is a conservative fallback, and
+`-3` is known to over-amplify into repetition on some thinking-mode prompts.
 
 ## Test Vectors
 
