@@ -1,10 +1,18 @@
 # DwarfStar 4
 
-DrawfStar 4 is a small native inference engine for DeepSeek V4 Flash. It is
+DrawfStar 4 is a small native inference engine specific for **DeepSeek V4 Flash**. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
-runtime, and not a framework. The main path is a DeepSeek V4 Flash-specific
-Metal and CUDA graph executor with DS4-specific loading, prompt rendering,
-KV state, and server API glue.
+runtime: it is completely self-contained. Other than running the model in a
+correct and fast way, the project goal is to provide DS4 specific loading,
+prompt rendering, tool calling, KV state handling (RAM and on-disk), and server
+API, all ready to work with coding agents or with the provided CLI interface.
+There are also tools for GGUF and imatrix generation, and for quality and
+speed testing.
+
+We support the following backends:
+* **Metal** is our primary target. Starting from MacBooks with 96GB of RAM.
+* **NVIDIA CUDA** with special care for the DGX Spark.
+* **AMD ROCm** is only supported in the [rocm](https://github.com/antirez/ds4/tree/rocm) branch. It is kept separate from main since I (antirez) don't have direct hardware access, so the community rebases the branch as needed.
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
