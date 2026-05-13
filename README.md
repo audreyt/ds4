@@ -1,21 +1,21 @@
 # DwarfStar 4 with M5 optimizations
 
-**Apple M5 performance note:** on an Apple M5 Max with 128 GB RAM, this `m5`
-branch is substantially faster than `antirez/main` in a single-run Metal `ds4-bench`
-sweep using `ds4flash.gguf`, `speed-bench/promessi_sposi.txt`, contexts
-2048-8192, 2048-token steps, and 64 generated tokens.
+**Apple M5 performance note:** on an Apple M5 Max with 128 GB RAM, this fork's
+`main` branch is substantially faster than `antirez/main` in a single-run Metal
+`ds4-bench` sweep using `ds4flash.gguf`, `speed-bench/promessi_sposi.txt`,
+contexts 2048-8192, 2048-token steps, and 64 generated tokens.
 
-Geometric-mean speedup across the measured frontiers is **2.61x prefill**
-and **1.51x generation**.
+Geometric-mean speedup across the measured frontiers is **2.09x prefill**
+and **1.54x generation**.
 
-| Context | main prefill | m5+MPP prefill | Prefill uplift | main gen | m5 gen | Gen uplift |
+| Context | main prefill | m5+Tensor prefill | Prefill uplift | main gen | m5 gen | Gen uplift |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2048 | 188.46 t/s | 529.80 t/s | +181.1% | 20.43 t/s | 34.43 t/s | +68.5% |
-| 4096 | 168.54 t/s | 457.69 t/s | +171.6% | 20.89 t/s | 31.95 t/s | +52.9% |
-| 6144 | 175.20 t/s | 448.42 t/s | +155.9% | 21.73 t/s | 31.38 t/s | +44.4% |
-| 8192 | 182.32 t/s | 430.44 t/s | +136.1% | 22.12 t/s | 31.26 t/s | +41.3% |
+| 2048 | 188.46 t/s | 412.34 t/s | +118.8% | 20.43 t/s | 35.72 t/s | +74.8% |
+| 4096 | 168.54 t/s | 370.04 t/s | +119.6% | 20.89 t/s | 32.25 t/s | +54.4% |
+| 6144 | 175.20 t/s | 365.62 t/s | +108.7% | 21.73 t/s | 31.42 t/s | +44.6% |
+| 8192 | 182.32 t/s | 348.01 t/s | +90.9% | 22.12 t/s | 31.94 t/s | +44.4% |
 
-The `m5` branch includes M5-specific `metal_simdgroup_matrix` optimization for
+This fork includes M5-specific `metal_simdgroup_matrix` optimization for
 dense prefill/routed-MoE matmul kernels and GPU-private scratch buffers for hot
 Metal intermediates.
 
