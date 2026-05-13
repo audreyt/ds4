@@ -1,7 +1,7 @@
 # DwarfStar 4 with M5 optimizations
 
 **Apple M5 performance note:** on an Apple M5 Max with 128 GB RAM, this `m5`
-branch is substantially faster than `main` in a single-run Metal `ds4-bench`
+branch is substantially faster than `antirez/main` in a single-run Metal `ds4-bench`
 sweep using `ds4flash.gguf`, `speed-bench/promessi_sposi.txt`, contexts
 2048-8192, 2048-token steps, and 64 generated tokens.
 
