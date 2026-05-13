@@ -467,7 +467,7 @@ static void ds4_gpu_mpp_compare_drain(const char *finish_label) {
         const int exceeds_target = (nonfinite != 0 || max_abs > 1.0e-3f || rms > 1.0e-4f);
         if (ds4_gpu_mpp_compare_verbose() || exceeds_target) {
             fprintf(stderr,
-                    "ds4: Metal MPP compare route=%s module=%s shape=%llux%llux%llu max_abs=%g rms=%g nonfinite=%d max_index=%llu\n",
+                    "ds4: Metal Tensor compare route=%s module=%s shape=%llux%llux%llu max_abs=%g rms=%g nonfinite=%d max_index=%llu\n",
                     item->route,
                     item->label,
                     (unsigned long long)item->dim0,
@@ -477,7 +477,7 @@ static void ds4_gpu_mpp_compare_drain(const char *finish_label) {
                     rms,
                     nonfinite,
                     (unsigned long long)max_index);
-            fprintf(stderr, "ds4: Metal MPP compare route=%s module=%s largest deltas:",
+            fprintf(stderr, "ds4: Metal Tensor compare route=%s module=%s largest deltas:",
                     item->route, item->label);
             for (int j = 0; j < DS4_METAL_MPP_COMPARE_DELTAS && delta_idx[j] != UINT64_MAX; j++) {
                 fprintf(stderr, " idx=%llu ref=%g cand=%g abs=%g",
@@ -492,7 +492,7 @@ static void ds4_gpu_mpp_compare_drain(const char *finish_label) {
         g_mpp_compare_done_count++;
         if (exceeds_target) {
             fprintf(stderr,
-                    "ds4: Metal MPP compare route=%s module=%s exceeded target max_abs<=0.001 rms<=0.0001; stopping comparisons\n",
+                    "ds4: Metal Tensor compare route=%s module=%s exceeded target max_abs<=0.001 rms<=0.0001; stopping comparisons\n",
                     item->route,
                     item->label);
             g_mpp_compare_stopped = 1;
@@ -501,7 +501,7 @@ static void ds4_gpu_mpp_compare_drain(const char *finish_label) {
     if (!g_mpp_compare_stopped && !g_mpp_compare_limit_reported &&
         g_mpp_compare_done_count >= max_reports) {
         fprintf(stderr,
-                "ds4: Metal MPP compare reached DS4_METAL_MPP_COMPARE_MAX=%d without a target breach\n",
+                "ds4: Metal Tensor compare reached DS4_METAL_MPP_COMPARE_MAX=%d without a target breach\n",
                 max_reports);
         g_mpp_compare_limit_reported = 1;
     }
@@ -1029,6 +1029,21 @@ static int ds4_gpu_use_m5_simdgroup_matrix(void) {
 }
 
 static int ds4_gpu_mpp_q8_0_default_target(void) {
+    // The Metal 4 cooperative-tensor Q8_0 matmul on M5 Max produces logprob
+    // drift versus the legacy simdgroup_multiply_accumulate path (measured
+    // rms=0.150, max_abs=0.75 on the short reasoning prompt; bit-exact match
+    // recovered by disabling just this route). The other Tensor routes
+    // (F16 compressor, attention-output, MoE) are bit-clean. Default the
+    // Q8_0 Tensor matmul to OFF on M5; opt back in with DS4_METAL_MPP_Q8_0_ENABLE=1.
+    if (ds4_gpu_device_name_contains("M5")) return 0;
+    return 1;
+}
+
+// F16 compressor Tensor matmul default. Bit-clean on M5 vs the legacy
+// simdgroup path, so this stays default-on independent of device.
+// Kept as a separate helper to avoid coupling the F16 default to the
+// Q8_0 carve-out above.
+static int ds4_gpu_mpp_f16_default_target(void) {
     return 1;
 }
 
@@ -1065,7 +1080,7 @@ static int ds4_gpu_env_bool(const char *name) {
 
     if (!g_mpp_invalid_env_reported) {
         fprintf(stderr,
-                "ds4: invalid Metal MPP boolean environment value %s=%.*s; treating presence as enabled\n",
+                "ds4: invalid Metal Tensor boolean environment value %s=%.*s; treating presence as enabled\n",
                 name, (int)n, v);
         g_mpp_invalid_env_reported = 1;
     }
@@ -1092,7 +1107,7 @@ static int ds4_gpu_mpp_low_power_profile(void) {
     }
     if (detected && !reported) {
         fprintf(stderr,
-                "ds4: Metal low-power MPP profile active; widening Q8_0 prefill route\n");
+                "ds4: Metal low-power Tensor profile active; widening Q8_0 prefill route\n");
         reported = 1;
     }
     return detected;
@@ -1155,7 +1170,7 @@ static int ds4_gpu_mpp_fast_profile(void) {
 }
 
 static const char *ds4_gpu_mpp_enabled_reason(void) {
-    if (g_mpp_mode == DS4_MPP_ON) return " by --mpp on";
+    if (g_mpp_mode == DS4_MPP_ON) return " by -mt on";
     if (ds4_gpu_mpp_fast_profile()) return " by DS4_METAL_MPP_FAST";
     if (ds4_gpu_env_bool("DS4_METAL_MPP_ENABLE") > 0) return " by DS4_METAL_MPP_ENABLE";
     return " by default";
@@ -1170,7 +1185,7 @@ static int ds4_gpu_mpp_q8_0_policy_enabled(void) {
 static int ds4_gpu_use_mpp_q8_0_matmul(void) {
     const int enabled = ds4_gpu_mpp_q8_0_policy_enabled();
     if (enabled && !g_mpp_q8_reported) {
-        fprintf(stderr, "ds4: Metal MPP Q8_0 prefill matmul enabled%s\n",
+        fprintf(stderr, "ds4: Metal Tensor Q8_0 prefill matmul enabled%s\n",
                 ds4_gpu_mpp_enabled_reason());
         g_mpp_q8_reported = 1;
     }
@@ -1290,14 +1305,6 @@ static int ds4_gpu_mpp_q8_0_late_safe_context(void) {
     return 0;
 }
 
-static int ds4_gpu_mpp_q8_0_default_context(uint64_t n_tok) {
-    if (strstr(g_mpp_compare_context, "attn_q_b") != NULL &&
-        n_tok <= 2048u) {
-        return 1;
-    }
-    return ds4_gpu_mpp_q8_0_late_safe_context();
-}
-
 static int ds4_gpu_mpp_attn_out_late_safe_context(void) {
     return ds4_gpu_mpp_late_safe_context_range(32);
 }
@@ -1396,13 +1403,14 @@ static int ds4_gpu_mpp_context_matches_filter(
 }
 
 static int ds4_gpu_mpp_q8_0_context_matches_filter(uint64_t n_tok) {
+    (void)n_tok;
     const char *filter = getenv("DS4_METAL_MPP_Q8_0_FILTER");
     const int filter_set = filter && filter[0];
     const int default_match =
         (ds4_gpu_mpp_fast_profile() ||
          (!filter_set && ds4_gpu_mpp_low_power_profile()))
             ? 1
-            : ds4_gpu_mpp_q8_0_default_context(n_tok);
+            : ds4_gpu_mpp_q8_0_late_safe_context();
     return ds4_gpu_mpp_context_matches_filter("DS4_METAL_MPP_Q8_0_FILTER",
                                                 default_match,
                                                 ds4_gpu_mpp_q8_0_late_safe_context());
@@ -1416,7 +1424,7 @@ static int ds4_gpu_can_use_mpp_q8_0_matmul(uint64_t n_tok) {
 
     if (!g_mpp_q8_partial_skip_reported) {
         fprintf(stderr,
-                "ds4: Metal MPP Q8_0 prefill matmul skipping partial token tiles; "
+                "ds4: Metal Tensor Q8_0 prefill matmul skipping partial token tiles; "
                 "set DS4_METAL_MPP_Q8_0_PARTIAL_ENABLE=1 to test them\n");
         g_mpp_q8_partial_skip_reported = 1;
     }
@@ -1424,11 +1432,11 @@ static int ds4_gpu_can_use_mpp_q8_0_matmul(uint64_t n_tok) {
 }
 
 static int ds4_gpu_use_mpp_f16_compressor_matmul(void) {
-    const int enabled = ds4_gpu_mpp_route_enabled(ds4_gpu_mpp_q8_0_default_target(),
+    const int enabled = ds4_gpu_mpp_route_enabled(ds4_gpu_mpp_f16_default_target(),
                                                     "DS4_METAL_MPP_F16_ENABLE",
                                                     "DS4_METAL_MPP_F16_DISABLE");
     if (enabled && !g_mpp_f16_reported) {
-        fprintf(stderr, "ds4: Metal MPP F16 compressor prefill matmul enabled%s\n",
+        fprintf(stderr, "ds4: Metal Tensor F16 compressor prefill matmul enabled%s\n",
                 ds4_gpu_mpp_enabled_reason());
         g_mpp_f16_reported = 1;
     }
@@ -1447,7 +1455,7 @@ static int ds4_gpu_use_mpp_attn_out_low_matmul(void) {
                                              default_match,
                                              ds4_gpu_mpp_attn_out_late_safe_context());
     if (enabled && !g_mpp_attn_out_reported) {
-        fprintf(stderr, "ds4: Metal MPP attention-output low projection enabled%s\n",
+        fprintf(stderr, "ds4: Metal Tensor attention-output low projection enabled%s\n",
                 ds4_gpu_mpp_enabled_reason());
         g_mpp_attn_out_reported = 1;
     }
@@ -1459,9 +1467,9 @@ enum {
     DS4_METAL_MOE_MPP_UP   = 1 << 1,
     DS4_METAL_MOE_MPP_DOWN = 1 << 2,
 
-    DS4_METAL_MOE_MPP_DEFAULT_GATE_LAYER = 0,
-    DS4_METAL_MOE_MPP_DEFAULT_UP_LAYER   = 0,
-    DS4_METAL_MOE_MPP_DEFAULT_DOWN_LAYER = 0,
+    DS4_METAL_MOE_MPP_DEFAULT_GATE_LAYER = 20,
+    DS4_METAL_MOE_MPP_DEFAULT_UP_LAYER   = 20,
+    DS4_METAL_MOE_MPP_DEFAULT_DOWN_LAYER = 22,
     DS4_METAL_MOE_MPP_FAST_GATE_LAYER    = 0,
     DS4_METAL_MOE_MPP_FAST_UP_LAYER      = 0,
     DS4_METAL_MOE_MPP_FAST_DOWN_LAYER    = 0,
@@ -1513,7 +1521,7 @@ static int ds4_gpu_mpp_routed_moe_stage_mask(void) {
         mask |= DS4_METAL_MOE_MPP_DOWN;
     }
     if (mask && !g_mpp_moe_reported) {
-        fprintf(stderr, "ds4: Metal MPP routed MoE projections enabled%s\n",
+        fprintf(stderr, "ds4: Metal Tensor routed MoE projections enabled%s\n",
                 ds4_gpu_mpp_enabled_reason());
         g_mpp_moe_reported = 1;
     }
@@ -1565,7 +1573,7 @@ static int ds4_gpu_mpp_routed_moe_mask_for_layer(uint32_t layer_index) {
                 gate_fallback);
         if (!g_mpp_moe_ranges_reported) {
             fprintf(stderr,
-                    "ds4: Metal MPP routed MoE default ranges down=%d..end up=%d..end gate=%d..end\n",
+                    "ds4: Metal Tensor routed MoE default ranges down=%d..end up=%d..end gate=%d..end\n",
                     down_start,
                     up_start,
                     gate_start);
@@ -1599,7 +1607,7 @@ static int ds4_gpu_mpp_routed_moe_mask_for_layer(uint32_t layer_index) {
 static void ds4_gpu_warn_mpp_fallback(void) {
     static int warned;
     if (!warned) {
-        fprintf(stderr, "ds4: Metal MPP prefill matmul unavailable; falling back to legacy kernel\n");
+        fprintf(stderr, "ds4: Metal Tensor prefill matmul unavailable; falling back to legacy kernel\n");
         warned = 1;
     }
 }
@@ -2163,7 +2171,7 @@ void ds4_gpu_print_memory_report(const char *label) {
                 (g_metal4_tensor_api_compile_supported ? "available" : "disabled"),
             g_metal4_m5_neural_accelerators_hint ? "likely" : "not detected");
     const int mpp_q8 = ds4_gpu_mpp_q8_0_policy_enabled();
-    const int mpp_f16 = ds4_gpu_mpp_route_enabled(ds4_gpu_mpp_q8_0_default_target(),
+    const int mpp_f16 = ds4_gpu_mpp_route_enabled(ds4_gpu_mpp_f16_default_target(),
                                                     "DS4_METAL_MPP_F16_ENABLE",
                                                     "DS4_METAL_MPP_F16_DISABLE");
     const int mpp_attn_out = ds4_gpu_mpp_route_enabled(0,
@@ -2171,12 +2179,12 @@ void ds4_gpu_print_memory_report(const char *label) {
                                                          "DS4_METAL_MPP_ATTN_OUT_DISABLE");
     const int mpp_moe = ds4_gpu_mpp_routed_moe_stage_mask();
     fprintf(stderr,
-            "ds4:   MPP policy %s%s%s\n",
+            "ds4:   Metal Tensor policy %s%s%s\n",
             ds4_mpp_mode_name(g_mpp_mode),
             g_quality_mode ? " (disabled by --quality)" : "",
             !g_metal4_tensor_api_enabled ? " (tensor API unavailable)" : "");
     fprintf(stderr,
-            "ds4:   MPP routes q8_0=%s f16_compressor=%s attn_out=%s moe_gate=%s moe_up=%s moe_down=%s\n",
+            "ds4:   Metal Tensor routes q8_0=%s f16_compressor=%s attn_out=%s moe_gate=%s moe_up=%s moe_down=%s\n",
             mpp_q8 ? "on" : "off",
             mpp_f16 ? "on" : "off",
             mpp_attn_out ? "on" : "off",
@@ -3846,10 +3854,65 @@ int ds4_gpu_init(void) {
             return 0;
         }
         MTLCompileOptions *options = [MTLCompileOptions new];
+        NSMutableDictionary *macros = [NSMutableDictionary new];
         if (g_metal4_tensor_api_enabled) {
-            options.preprocessorMacros = @{ @"DS4_METAL_HAS_TENSOR": @"1" };
-            fprintf(stderr, "ds4: Metal 4 tensor API enabled for MPP tensor kernels\n");
+            macros[@"DS4_METAL_HAS_TENSOR"] = @"1";
+            fprintf(stderr, "ds4: Metal 4 tensor API enabled for Tensor kernels\n");
         }
+
+        const int drift_hc_stable        = ds4_gpu_env_bool("DS4_METAL_HC_STABLE")          != 0; // default ON
+        const int drift_norm_unify       = ds4_gpu_env_bool("DS4_METAL_NORM_RSQRT_DISABLE") != 0; // default ON
+        const int drift_kv_raw_f32       = ds4_gpu_env_bool("DS4_METAL_KV_RAW_F32")         >  0; // default OFF
+        const int drift_rope_exp2_log2   = ds4_gpu_env_bool("DS4_METAL_ROPE_EXP2_LOG2")     >  0; // default OFF
+        const int drift_math_safe        = ds4_gpu_env_bool("DS4_METAL_MATH_SAFE")          >  0; // default OFF
+        const int drift_tensor_matmul_off = g_metal4_tensor_api_enabled &&
+                                            ds4_gpu_env_bool("DS4_METAL_TENSOR_MATMUL_DISABLE") > 0;
+
+        if (drift_math_safe) {
+            // MTLCompileOptions.fastMathEnabled defaults to YES and Apple's
+            // headers explicitly say this "may violate the IEEE 754 standard".
+            // Different fast-math optimizations get applied across the
+            // matmul2d cooperative-tensor path and the legacy
+            // simdgroup_multiply_accumulate path on M5, amplifying the
+            // mismatch. MTLMathModeSafe pins the entire library to strict
+            // IEEE-754 semantics. Diagnostic-only: it also moves the
+            // -mt off output away from the fast-math reference, so this is
+            // useful to localize drift sources but not to ship as a default.
+            if (@available(macOS 15.0, *)) {
+                options.mathMode = MTLMathModeSafe;
+                fprintf(stderr, "ds4: Metal shader library math mode = safe (strict IEEE-754) by DS4_METAL_MATH_SAFE\n");
+            } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                options.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+                fprintf(stderr, "ds4: Metal shader library fast-math disabled by DS4_METAL_MATH_SAFE (pre-macOS 15)\n");
+            }
+        }
+
+        if (drift_hc_stable)      macros[@"DS4_METAL_HC_STABLE"]          = @"1";
+        if (drift_norm_unify)     macros[@"DS4_METAL_NORM_RSQRT_DISABLE"] = @"1";
+        if (drift_kv_raw_f32)     macros[@"DS4_METAL_KV_RAW_F32"]         = @"1";
+        if (drift_rope_exp2_log2) macros[@"DS4_METAL_ROPE_EXP2_LOG2"]     = @"1";
+        if (drift_tensor_matmul_off) {
+            // Recompile without DS4_METAL_HAS_TENSOR so the cooperative-tensor
+            // matmul branches are excluded from this build, isolating the
+            // simdgroup_float8x8 path for an A/B vs the Tensor matmul on M5.
+            // Also flip g_metal4_tensor_api_enabled so the host dispatch
+            // skips _mpp kernel lookups that are no longer compiled.
+            [macros removeObjectForKey:@"DS4_METAL_HAS_TENSOR"];
+            g_metal4_tensor_api_enabled = 0;
+            fprintf(stderr, "ds4: Metal 4 cooperative-tensor matmul disabled by DS4_METAL_TENSOR_MATMUL_DISABLE\n");
+        }
+        fprintf(stderr,
+                "ds4: drift-patch flags hc_stable=%s norm_unify=%s kv_raw_f32=%s rope_exp2_log2=%s math_safe=%s tensor_matmul=%s\n",
+                drift_hc_stable      ? "on"  : "off",
+                drift_norm_unify     ? "on"  : "off",
+                drift_kv_raw_f32     ? "on"  : "off",
+                drift_rope_exp2_log2 ? "on"  : "off",
+                drift_math_safe      ? "on"  : "off",
+                (g_metal4_tensor_api_enabled && !drift_tensor_matmul_off) ? "on" : "off");
+        options.preprocessorMacros = macros;
         id<MTLLibrary> library = [g_device newLibraryWithSource:source options:options error:&error];
         if (!library) {
             fprintf(stderr, "ds4: Metal shader compilation failed: %s\n",
@@ -6324,7 +6387,7 @@ int ds4_gpu_matmul_q8_0_mpp_tensor(
         if (!xbuf || !outbuf ||
             ds4_gpu_tensor_bytes(x) < x_bytes ||
             ds4_gpu_tensor_bytes(out) < out_bytes) {
-            fprintf(stderr, "ds4: Metal MPP Q8_0 matmul received undersized activation buffers\n");
+            fprintf(stderr, "ds4: Metal Tensor Q8_0 matmul received undersized activation buffers\n");
             return 0;
         }
 
@@ -6332,7 +6395,7 @@ int ds4_gpu_matmul_q8_0_mpp_tensor(
         const uint64_t row_bytes = blocks * 34;
         const uint64_t weight_bytes = out_dim * row_bytes;
         if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
-            fprintf(stderr, "ds4: Metal MPP Q8_0 matmul range is outside the mapped model\n");
+            fprintf(stderr, "ds4: Metal Tensor Q8_0 matmul range is outside the mapped model\n");
             return 0;
         }
 
@@ -6376,7 +6439,7 @@ int ds4_gpu_matmul_q8_0_mpp_tensor(
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
-        if (!ds4_gpu_finish_command_buffer(cb, owned, "Metal MPP Q8_0 matmul")) return 0;
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Metal Tensor Q8_0 matmul")) return 0;
     }
 
     return 1;
@@ -6603,7 +6666,7 @@ int ds4_gpu_matmul_f16_tensor(
                      threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                 ds4_gpu_end_compute_encoder(cb, enc);
 
-                if (!ds4_gpu_finish_command_buffer(cb, owned, "Metal MPP F16 compressor matmul")) return 0;
+                if (!ds4_gpu_finish_command_buffer(cb, owned, "Metal Tensor F16 compressor matmul")) return 0;
                 return 1;
             }
         }
@@ -6668,7 +6731,7 @@ int ds4_gpu_matmul_f16_pair_tensor(
                 ds4_gpu_tensor_bytes(x) < x_bytes ||
                 ds4_gpu_tensor_bytes(out_a) < out_bytes ||
                 ds4_gpu_tensor_bytes(out_b) < out_bytes) {
-                fprintf(stderr, "ds4: Metal F16 paired MPP matmul received undersized activation buffers\n");
+                fprintf(stderr, "ds4: Metal F16 paired Tensor matmul received undersized activation buffers\n");
                 return 0;
             }
 
@@ -6676,7 +6739,7 @@ int ds4_gpu_matmul_f16_pair_tensor(
             const uint64_t weight_bytes = row_bytes * out_dim;
             if (weight_a_offset > model_size || weight_bytes > model_size - weight_a_offset ||
                 weight_b_offset > model_size || weight_bytes > model_size - weight_b_offset) {
-                fprintf(stderr, "ds4: Metal F16 paired MPP matmul range is outside the mapped model\n");
+                fprintf(stderr, "ds4: Metal F16 paired Tensor matmul range is outside the mapped model\n");
                 return 0;
             }
 
@@ -6700,7 +6763,7 @@ int ds4_gpu_matmul_f16_pair_tensor(
             if (!pipeline) return 0;
             if (!g_mpp_f16_pair_reported) {
                 fprintf(stderr, "ds4: Metal paired F16 compressor matmul enabled%s\n",
-                        use_wide_mpp_pair ? " with MPP wide route" : "");
+                        use_wide_mpp_pair ? " with Tensor wide route" : "");
                 g_mpp_f16_pair_reported = 1;
             }
 
