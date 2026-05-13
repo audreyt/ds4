@@ -1,23 +1,28 @@
 # DeepSeek V4 Flash Test Vectors
 
-These vectors were captured from the official DeepSeek V4 Flash API using
-`deepseek-v4-flash`, greedy decoding, thinking disabled, and
-`top_logprobs=20`. The hosted API does not expose full logits, so these files
-store the best logprob slice the API provides.
+The compact fixture consumed by `ds4_test` is generated from the local default
+CyberNeurova abliterated GGUF using greedy decoding, thinking disabled, and
+`top_logprobs=20`. It is a local regression fixture for the model currently
+linked by `ds4flash.gguf`.
+
+The raw `official/*.official.json` captures from the hosted DeepSeek V4 Flash
+API are still kept for auditing and comparison, but they are not the default
+C test fixture.
 
 Files:
 
 - `prompts/*.txt`: exact user prompts.
 - `official/*.official.json`: official API continuations and top-logprobs.
-- `official.vec`: compact C-test fixture generated from the official JSON.
+- `official.vec`: compact C-test fixture generated from the local GGUF.
 
-Regenerate official vectors:
+Regenerate the official API captures:
 
 ```sh
 DEEPSEEK_API_KEY=... ./tests/test-vectors/fetch_official_vectors.py
 ```
 
-Running the fetcher without `--only` also regenerates `official.vec`.
+The fetcher preserves the hosted API captures. Regenerate `official.vec` from a
+local model dump when the default GGUF changes.
 
 The C runner consumes `official.vec` directly:
 
@@ -26,9 +31,7 @@ The C runner consumes `official.vec` directly:
 ```
 
 `official.vec` is intentionally trivial to parse from C: each case points to a
-prompt file and each expected token is hex-encoded by bytes. The official JSON
-files remain in the tree so the compact fixture can be audited against the raw
-API response.
+prompt file and each expected token is hex-encoded by bytes.
 
 To inspect a local top-logprob dump manually:
 

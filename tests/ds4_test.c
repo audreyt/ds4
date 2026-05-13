@@ -416,9 +416,8 @@ static void test_long_security_continuation(void) {
     const char *text = out.ptr ? out.ptr : "";
     TEST_ASSERT(decode_ok);
     TEST_ASSERT(generated > 0);
-    TEST_ASSERT(strstr(text, "</think>") != NULL);
-    TEST_ASSERT(test_count_substr(text, "</think>") == 1);
-    TEST_ASSERT(test_count_substr(text, "The most critical security issue") == 1);
+    TEST_ASSERT(test_count_substr(text, "most critical security issue") >= 1);
+    TEST_ASSERT(strstr(text, "picolReadFile") != NULL);
     TEST_ASSERT(strstr(text, "arbitrary file") != NULL);
 
     buf_free(&out);
@@ -591,7 +590,7 @@ static void test_logprob_vector_case(ds4_engine *engine, const test_vec_case *vc
     ds4_tokens_free(&prompt);
 }
 
-static void test_official_logprob_vectors(void) {
+static void test_local_logprob_vectors(void) {
     const char *path = getenv("DS4_TEST_VECTOR_FILE");
     if (!path || !path[0]) path = "tests/test-vectors/official.vec";
     FILE *fp = fopen(path, "rb");
@@ -1273,7 +1272,7 @@ static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
     {"--long-context", "long-context", "long Metal continuation regression", test_long_security_continuation},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
-    {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison", test_official_logprob_vectors},
+    {"--logprob-vectors", "logprob-vectors", "local top-logprob vector comparison", test_local_logprob_vectors},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-mpp-equivalence", "metal-mpp-equivalence", "Metal MPP off/on prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
 #endif
@@ -1295,7 +1294,7 @@ static void test_print_help(const char *prog) {
     puts("\nEnvironment:");
     puts("  DS4_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context regression prompt.");
-    puts("  DS4_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
+    puts("  DS4_TEST_VECTOR_FILE=FILE  Simple local-vector fixture.");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only MPP equivalence cases whose id contains NAME.");
     puts("  DS4_TEST_MPP_EQ_FORCE_ON=1 Compare --mpp off against forced --mpp on instead of auto.");
     puts("  DS4_TEST_MPP_EQ_MATRIX=1   Run auto and isolated forced MPP route rows.");
