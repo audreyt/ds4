@@ -526,6 +526,9 @@ typedef struct {
     char *name;
     char *wire_name;
     char *namespace;
+    /* Distinguish the Responses hosted tool from a normal function that
+     * happens to be named "tool_search". */
+    bool responses_tool_search;
     char **prop;
     int len;
     int cap;
@@ -1328,7 +1331,8 @@ static bool parse_schema_properties(const char *json, tool_schema_order *order) 
 static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
                                              const char *json,
                                              const char *namespace,
-                                             const char *wire_name) {
+                                             const char *wire_name,
+                                             bool responses_tool_search) {
     if (!orders || !json) return;
     const char *p = json;
     json_ws(&p);
@@ -1371,6 +1375,7 @@ static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
     if (order.name) {
         if (namespace && namespace[0]) order.namespace = xstrdup(namespace);
         if (wire_name && wire_name[0]) order.wire_name = xstrdup(wire_name);
+        order.responses_tool_search = responses_tool_search;
         tool_schema_orders_push(orders, order);
         memset(&order, 0, sizeof(order));
     }
@@ -1379,7 +1384,7 @@ done:
 }
 
 static void tool_schema_orders_add_json(tool_schema_orders *orders, const char *json) {
-    tool_schema_orders_add_json_wire(orders, json, NULL, NULL);
+    tool_schema_orders_add_json_wire(orders, json, NULL, NULL, false);
 }
 
 static bool append_responses_namespace_tool_schemas(buf *schemas,
@@ -1448,7 +1453,7 @@ static bool append_responses_namespace_tool_schemas(buf *schemas,
             responses_namespace_function_schema_from_tool(tool_raw, name, &wire_name);
         if (schema) {
             append_raw_json_line(schemas, schema);
-            tool_schema_orders_add_json_wire(orders, schema, name, wire_name);
+            tool_schema_orders_add_json_wire(orders, schema, name, wire_name, false);
             appended = true;
         }
         free(schema);
@@ -1492,9 +1497,14 @@ static bool parse_tools_value(const char **p, char **out, tool_schema_orders *or
             tool_schema_orders_add_json(orders, function);
         } else if (!append_responses_namespace_tool_schemas(&schemas, orders, raw)) {
             char *special = responses_special_schema_from_tool(raw);
-            const char *schema = special ? special : raw;
-            append_raw_json_line(&schemas, schema);
-            tool_schema_orders_add_json(orders, schema);
+            if (special) {
+                append_raw_json_line(&schemas, special);
+                tool_schema_orders_add_json_wire(orders, special,
+                                                 NULL, NULL, true);
+            } else {
+                append_raw_json_line(&schemas, raw);
+                tool_schema_orders_add_json(orders, raw);
+            }
             free(special);
         }
         free(function);
@@ -2770,9 +2780,9 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
         char *output = NULL;
         char *input_str = NULL;
         char *summary = NULL;
-        char *reasoning_content = NULL;
         char *action = NULL;
         char *result = NULL;
+        char *tools_json = NULL;
         char *status_str = NULL;
         json_ws(p);
         while (**p && **p != '}') {
@@ -2899,10 +2909,11 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                 }
             } else if (!strcmp(key, "tools")) {
                 /* tool_search_output items carry their discovered tool list
-                 * here instead of in `output`. We keep the raw JSON so the
-                 * downstream renderer can show the model what was found. */
-                free(result);
-                if (!json_raw_value(p, &result)) {
+                 * here instead of in `output` / `result`. Keep it separate
+                 * from the human-visible result body so malformed tool lists
+                 * never get mistaken for normal tool output. */
+                free(tools_json);
+                if (!json_raw_value(p, &tools_json)) {
                     free(key);
                     goto item_fail;
                 }
@@ -2927,9 +2938,9 @@ item_fail:
             free(output);
             free(input_str);
             free(summary);
-            free(reasoning_content);
             free(action);
             free(result);
+            free(tools_json);
             free(status_str);
             buf_free(&pending_reasoning);
             return false;
@@ -2946,9 +2957,9 @@ item_fail:
             free(output);
             free(input_str);
             free(summary);
-            free(reasoning_content);
             free(action);
             free(result);
+            free(tools_json);
             free(status_str);
             goto fail;
         }
@@ -2973,9 +2984,9 @@ item_fail:
             free(output);
             free(input_str);
             free(summary);
-            free(reasoning_content);
             free(action);
             free(result);
+            free(tools_json);
             free(status_str);
             buf_free(&pending_reasoning);
             return false;
@@ -3114,14 +3125,32 @@ item_fail:
                    !strcmp(t, "tool_search_call_output") ||
                    !strcmp(t, "image_generation_call_output"))
         {
-            if (!strcmp(t, "tool_search_output") && result &&
+            if (!strcmp(t, "tool_search_output") && tools_json &&
                 loaded_tool_schemas && orders)
             {
-                const char *tools_p = result;
+                const char *tools_p = tools_json;
                 char *schemas = NULL;
-                if (parse_tools_value(&tools_p, &schemas, orders) &&
-                    schemas && schemas[0])
-                {
+                if (!parse_tools_value(&tools_p, &schemas, orders)) {
+                    free(schemas);
+                    free(type);
+                    free(role);
+                    free(content);
+                    free(name);
+                    free(namespace);
+                    free(call_id);
+                    free(item_id);
+                    free(arguments);
+                    free(output);
+                    free(input_str);
+                    free(summary);
+                    free(action);
+                    free(result);
+                    free(tools_json);
+                    free(status_str);
+                    buf_free(&pending_reasoning);
+                    return false;
+                }
+                if (schemas && schemas[0]) {
                     if (loaded_tool_schemas->len) buf_putc(loaded_tool_schemas, '\n');
                     buf_puts(loaded_tool_schemas, schemas);
                 }
@@ -3129,7 +3158,9 @@ item_fail:
             }
             chat_msg msg = {0};
             msg.role = xstrdup("tool");
-            const char *body = output ? output : result ? result : "";
+            const char *body = output ? output :
+                               result ? result :
+                               tools_json ? tools_json : "";
             msg.content = xstrdup(body);
             if (call_id || item_id) {
                 msg.tool_call_id = call_id ? call_id : item_id;
@@ -3154,9 +3185,9 @@ item_fail:
             free(output);
             free(input_str);
             free(summary);
-            free(reasoning_content);
             free(action);
             free(result);
+            free(tools_json);
             free(status_str);
             buf_free(&pending_reasoning);
             return false;
@@ -3173,9 +3204,9 @@ item_fail:
         free(output);
         free(input_str);
         free(summary);
-        free(reasoning_content);
         free(action);
         free(result);
+        free(tools_json);
         free(status_str);
         json_ws(p);
         if (**p == ',') (*p)++;
@@ -5646,8 +5677,10 @@ typedef struct {
     int output_index;
 } responses_tool_item;
 
-static bool responses_tool_name_is_tool_search(const char *name) {
-    return name && !strcmp(name, "tool_search");
+static bool responses_tool_call_is_tool_search(const tool_call *tc,
+                                               const tool_schema_order *order) {
+    return tc && tc->name && !strcmp(tc->name, "tool_search") &&
+           (!order || order->responses_tool_search);
 }
 
 /* The internal tool_call doesn't track whether it came from a function_call or
@@ -5682,7 +5715,7 @@ static void responses_append_function_call_item(buf *b, const tool_call *tc,
                                                 bool with_args,
                                                 const tool_schema_orders *orders) {
     const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
-    if (responses_tool_name_is_tool_search(tc->name)) {
+    if (responses_tool_call_is_tool_search(tc, order)) {
         buf_printf(b,
             "{\"id\":\"%s\",\"type\":\"tool_search_call\",\"status\":\"%s\","
             "\"call_id\":\"%s\",\"execution\":\"client\",\"arguments\":",
@@ -5748,8 +5781,8 @@ static bool responses_sse_function_call_arguments_done(int fd, responses_stream 
                                                        const tool_call *tc,
                                                        const responses_tool_item *item,
                                                        const tool_schema_orders *orders) {
-    if (item->is_custom || responses_tool_name_is_tool_search(tc->name)) return true;
     const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
+    if (item->is_custom || responses_tool_call_is_tool_search(tc, order)) return true;
     buf args = {0};
     append_json_object_string(&args, tc->arguments);
     buf b = {0};
@@ -10292,9 +10325,49 @@ static void test_tool_schema_order_from_responses_tool_search(void) {
     TEST_ASSERT(schemas && strstr(schemas, "\"description\":\"Search deferred tools\""));
     const tool_schema_order *order = tool_schema_orders_find(&orders, "tool_search");
     TEST_ASSERT(order != NULL);
+    TEST_ASSERT(order && order->responses_tool_search);
     TEST_ASSERT(order && order->len == 2);
     TEST_ASSERT(order && !strcmp(order->prop[0], "query"));
     TEST_ASSERT(order && !strcmp(order->prop[1], "limit"));
+    free(schemas);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_responses_function_named_tool_search_stays_function_call(void) {
+    const char *json =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"tool_search\","
+        "\"description\":\"A normal user function that happens to use a reserved name\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"query\":{\"type\":\"string\"}}}}}]";
+    const char *p = json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
+    const tool_schema_order *order = tool_schema_orders_find(&orders, "tool_search");
+    TEST_ASSERT(order != NULL);
+    TEST_ASSERT(order && !order->responses_tool_search);
+
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.id = xstrdup("call_user_tool_search");
+    tc.name = xstrdup("tool_search");
+    tc.arguments = xstrdup("{\"query\":\"plain function\"}");
+    tool_calls_push(&calls, tc);
+    responses_tool_item item = {
+        .fc_id = "fc_user_tool_search",
+        .call_id = "call_user_tool_search",
+        .is_custom = false,
+        .output_index = 0,
+    };
+
+    buf out = {0};
+    responses_append_function_call_item(&out, &calls.v[0], &item,
+                                        "completed", true, &orders);
+    TEST_ASSERT(strstr(out.ptr, "\"type\":\"function_call\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"type\":\"tool_search_call\"") == NULL);
+
+    buf_free(&out);
+    tool_calls_free(&calls);
     free(schemas);
     tool_schema_orders_free(&orders);
 }
@@ -10382,6 +10455,20 @@ static void test_responses_input_tool_search_output_loads_tools(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_responses_input_tool_search_output_rejects_bad_tools(void) {
+    const char *json =
+        "[{\"type\":\"tool_search_output\",\"call_id\":\"call_search\","
+        "\"status\":\"completed\",\"tools\":{\"not\":\"a tool array\"}}]";
+    const char *p = json;
+    chat_msgs msgs = {0};
+    buf loaded = {0};
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(!parse_responses_input(&p, &msgs, &loaded, &orders));
+    buf_free(&loaded);
+    tool_schema_orders_free(&orders);
+    chat_msgs_free(&msgs);
+}
+
 static void test_responses_input_function_call_namespace_round_trips_to_dsml(void) {
     const char *tools_json =
         "[{\"type\":\"namespace\",\"name\":\"mcp__perplexity__\","
@@ -10424,10 +10511,14 @@ static void test_responses_output_sends_tool_search_call_item(void) {
     tc.name = xstrdup("tool_search");
     tc.arguments = xstrdup("{\"limit\":3,\"query\":\"perplexity\"}");
     tool_calls_push(&calls, tc);
+    const char *tools_json =
+        "[{\"type\":\"tool_search\",\"execution\":\"client\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"query\":{\"type\":\"string\"},\"limit\":{\"type\":\"number\"}}}}]";
+    const char *tools_p = tools_json;
+    char *schemas = NULL;
     tool_schema_orders orders = {0};
-    tool_schema_orders_add_json(&orders,
-        "{\"name\":\"tool_search\",\"parameters\":{\"type\":\"object\",\"properties\":{"
-        "\"query\":{\"type\":\"string\"},\"limit\":{\"type\":\"number\"}}}}");
+    TEST_ASSERT(parse_tools_value(&tools_p, &schemas, &orders));
     responses_tool_item item = {
         .fc_id = "fc_search",
         .call_id = "call_search",
@@ -10445,6 +10536,7 @@ static void test_responses_output_sends_tool_search_call_item(void) {
     TEST_ASSERT(strstr(out.ptr, "\"type\":\"function_call\"") == NULL);
 
     buf_free(&out);
+    free(schemas);
     tool_schema_orders_free(&orders);
     tool_calls_free(&calls);
 }
@@ -12472,8 +12564,10 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
     test_tool_schema_order_from_responses_tool_search();
+    test_responses_function_named_tool_search_stays_function_call();
     test_responses_namespace_tool_schemas_restore_wire_namespace();
     test_responses_input_tool_search_output_loads_tools();
+    test_responses_input_tool_search_output_rejects_bad_tools();
     test_responses_input_function_call_namespace_round_trips_to_dsml();
     test_responses_output_sends_tool_search_call_item();
     test_dsml_tool_args_preserve_call_order();
