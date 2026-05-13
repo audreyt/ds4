@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "ds4.h"
+
 /* =========================================================================
  * GPU Tensor and Command Lifetime.
  * =========================================================================
@@ -40,6 +42,9 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 void ds4_gpu_set_quality(bool quality);
+void ds4_gpu_set_mpp_mode(ds4_mpp_mode mode);
+void ds4_gpu_set_mpp_compare_context(const char *module, uint32_t layer_index, uint32_t pos0);
+void ds4_gpu_clear_mpp_compare_context(void);
 void ds4_gpu_print_memory_report(const char *label);
 
 /* =========================================================================
@@ -129,6 +134,16 @@ int ds4_gpu_dsv4_topk_mask_tensor(
  */
 
 int ds4_gpu_matmul_q8_0_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
+int ds4_gpu_matmul_q8_0_mpp_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -664,6 +679,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                n_expert,
         float                   clamp,
         const ds4_gpu_tensor *x,
+        uint32_t                layer_index,
         uint32_t                n_tokens,
         bool                   *mid_is_f16);
 
