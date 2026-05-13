@@ -59,6 +59,8 @@ If you are looking for very specific things, we have other
 sub-README files. Otherwise for normal usage keep reading the
 next sections.
 
+- [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
+  guide for contributors. **Read this before sending a pull request**.
 - [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
   imatrix collection, quantization tooling, and quality checks.
 - [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): how the
