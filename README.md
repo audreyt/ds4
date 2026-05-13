@@ -19,15 +19,25 @@ The `m5` branch includes M5-specific `metal_simdgroup_matrix` optimization for
 dense prefill/routed-MoE matmul kernels and GPU-private scratch buffers for hot
 Metal intermediates.
 
-DrawfStar 4 is a small native inference engine for DeepSeek V4 Flash. It is
+DrawfStar 4 is a small native inference engine specific for **DeepSeek V4 Flash**. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
-runtime, and not a framework. The main path is a DeepSeek V4 Flash-specific
-Metal and CUDA graph executor with DS4-specific loading, prompt rendering,
-KV state, and server API glue.
+runtime: it is completely self-contained. Other than running the model in a
+correct and fast way, the project goal is to provide DS4 specific loading,
+prompt rendering, tool calling, KV state handling (RAM and on-disk), and server
+API, all ready to work with coding agents or with the provided CLI interface.
+There are also tools for GGUF and imatrix generation, and for quality and
+speed testing.
+
+We support the following backends:
+* **Metal** is our primary target. Starting from MacBooks with 96GB of RAM.
+* **NVIDIA CUDA** with special care for the DGX Spark.
+* **AMD ROCm** is only supported in the [rocm](https://github.com/antirez/ds4/tree/rocm) branch. It is kept separate from main since I (antirez) don't have direct hardware access, so the community rebases the branch as needed.
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
 other contributors.
+
+## Motivations
 
 Now, back at this project. Why we believe DeepSeek v4 Flash to be a pretty special
 model deserving a stand alone engine? Because after comparing it with powerful smaller
@@ -78,6 +88,8 @@ If you are looking for very specific things, we have other
 sub-README files. Otherwise for normal usage keep reading the
 next sections.
 
+- [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
+  guide for contributors. **Read this before sending a pull request**.
 - [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
   imatrix collection, quantization tooling, and quality checks.
 - [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): how the
@@ -142,7 +154,10 @@ slight speedup, not a meaningful generation-speed win.
 Then build:
 
 ```sh
-make
+make                  # macOS Metal
+make cuda-spark       # Linux CUDA, DGX Spark / GB10
+make cuda-generic     # Linux CUDA, other local CUDA GPUs
+make cpu              # CPU-only diagnostics build
 ```
 
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
@@ -895,19 +910,22 @@ the kv cache files include the verbatim prompt cached.
 
 ## Backends
 
-The default graph backend is Metal on macOS and CUDA on Linux CUDA builds:
+The default graph backend is Metal on macOS and CUDA in CUDA builds:
 
 ```sh
 ./ds4 -p "Hello" --metal
 ./ds4 -p "Hello" --cuda
 ```
 
-CUDA builds default to `CUDA_ARCH=native`, so `nvcc` targets the visible GPU.
-Set `CUDA_ARCH` explicitly when cross-building or when you need a known target:
+On Linux, plain `make` prints the available build targets instead of selecting a
+CUDA target implicitly. Use `make cuda-spark` for DGX Spark / GB10. It omits an
+explicit `nvcc -arch` because that is currently the fastest path on GB10. Use
+`make cuda-generic` for a normal local CUDA build, or set `CUDA_ARCH` explicitly
+when cross-building or when you need a known target:
 
 ```sh
-make CUDA_ARCH=sm_120
-make CUDA_ARCH=        # old nvcc default target behavior
+make cuda CUDA_ARCH=sm_120
+make cuda CUDA_ARCH=native
 ```
 
 There is also a CPU reference/debug path:

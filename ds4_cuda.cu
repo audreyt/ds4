@@ -2,6 +2,7 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <cublas_v2.h>
+#include <cub/block/block_radix_sort.cuh>
 
 #include <stdint.h>
 #include <errno.h>
@@ -1286,11 +1287,13 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
 }
 
+__global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
+
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
-    if (!cuda_ok(cudaMallocManaged(&t->ptr, (size_t)bytes), "tensor alloc")) {
+    if (!cuda_ok(cudaMalloc(&t->ptr, (size_t)bytes), "tensor alloc")) {
         free(t);
         return NULL;
     }
@@ -1323,6 +1326,13 @@ extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
     (void)cudaDeviceSynchronize();
     return tensor->ptr;
+}
+
+extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
+    if (!tensor || count > tensor->bytes / sizeof(float)) return 0;
+    if (count == 0) return 1;
+    fill_f32_kernel<<<(count + 255u) / 256u, 256>>>((float *)tensor->ptr, count, value);
+    return cuda_ok(cudaGetLastError(), "tensor fill f32 launch");
 }
 
 extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
@@ -3235,6 +3245,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
     }
 }
 
+template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP>
 __global__ static void attention_indexed_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
@@ -3258,15 +3269,13 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     if (t >= n_tokens || head_dim != 512u) return;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t head = head_group * 8u + warp;
+    const uint32_t head = head_group * HEADS_PER_GROUP + warp;
     const bool valid_head = head < n_head;
 
     __shared__ uint32_t raw_rows[256];
-    __shared__ uint32_t comp_rows[512];
     __shared__ uint32_t raw_count;
     __shared__ uint32_t raw_first_idx;
-    __shared__ uint32_t comp_count;
-    __shared__ float4 kv_shared[4 * 128];
+    __shared__ float4 kv_shared[ROWS_PER_STAGE * 128];
 
     uint32_t qpos = pos0 + t;
     uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
@@ -3279,7 +3288,6 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     if (threadIdx.x == 0) {
         raw_count = 0;
         raw_first_idx = 0;
-        comp_count = 0;
         if (n_raw != 0) {
             const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
             if (qpos >= first_raw_pos) {
@@ -3301,14 +3309,10 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
         raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
     }
-    if (threadIdx.x == 0) {
-        for (uint32_t i = 0; i < top_k && comp_count < 512u; i++) {
-            int32_t c = topk[(uint64_t)t * top_k + i];
-            if (c >= 0 && (uint32_t)c < visible_comp) comp_rows[comp_count++] = (uint32_t)c;
-        }
-    }
     __syncthreads();
 
+    uint32_t comp_count = top_k < visible_comp ? top_k : visible_comp;
+    if (comp_count > 512u) comp_count = 512u;
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)head_dim);
     const float4 *q4 = valid_head
@@ -3328,15 +3332,18 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 o1 = o0, o2 = o0, o3 = o0;
 
-    for (uint32_t row0 = 0; row0 < n_score; row0 += 4u) {
-        const uint32_t nr = n_score - row0 < 4u ? n_score - row0 : 4u;
+    for (uint32_t row0 = 0; row0 < n_score; row0 += ROWS_PER_STAGE) {
+        const uint32_t nr = n_score - row0 < ROWS_PER_STAGE ? n_score - row0 : ROWS_PER_STAGE;
         for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
+            const uint32_t comp_idx = sr < raw_count
+                ? 0u
+                : (uint32_t)topk[(uint64_t)t * top_k + (sr - raw_count)];
             const float4 *src = sr < raw_count
                 ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_rows[sr - raw_count] * head_dim);
+                : (const float4 *)(comp_kv + (uint64_t)comp_idx * head_dim);
             kv_shared[off] = src[c4];
         }
         __syncthreads();
@@ -4478,6 +4485,14 @@ __global__ static void indexer_scores_wmma_kernel(
     __shared__ float acc_sh[16 * 16];
 
     for (uint32_t i = tid; i < 16u * 16u; i += 32u) acc_sh[i] = 0.0f;
+    for (uint32_t i = tid; i < 16u * 128u; i += 32u) {
+        const uint32_t c = i >> 7u;
+        const uint32_t d = i & 127u;
+        const uint32_t comp = tile_c + c;
+        float v = 0.0f;
+        if (comp < n_comp) v = index_comp[(uint64_t)comp * head_dim + d];
+        b_sh[d + c * 128u] = __float2half(v);
+    }
     __syncthreads();
 
     for (uint32_t h = 0; h < n_head; h++) {
@@ -4490,14 +4505,6 @@ __global__ static void indexer_scores_wmma_kernel(
                 v = q[((uint64_t)token * n_head + h) * head_dim + d];
             }
             a_sh[i] = __float2half(v);
-        }
-        for (uint32_t i = tid; i < 16u * 128u; i += 32u) {
-            const uint32_t c = i >> 7u;
-            const uint32_t d = i & 127u;
-            const uint32_t comp = tile_c + c;
-            float v = 0.0f;
-            if (comp < n_comp) v = index_comp[(uint64_t)comp * head_dim + d];
-            b_sh[d + c * 128u] = __float2half(v);
         }
         __syncthreads();
 
@@ -4541,6 +4548,360 @@ __global__ static void indexer_scores_wmma_kernel(
 #endif
 }
 
+__global__ static void indexer_scores_wmma32_kernel(
+        float *scores,
+        const float *q,
+        const float *weights,
+        const float *index_comp,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t ratio,
+        float scale,
+        int causal) {
+#if __CUDA_ARCH__ >= 700
+    namespace wmma = nvcuda::wmma;
+    const uint32_t tile_c = blockIdx.x * 32u;
+    const uint32_t tile_t = blockIdx.y * 16u;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    if (tid >= 64u || head_dim != 128u) return;
+
+    if (causal) {
+        const uint32_t last_token = min(tile_t + 16u, n_tokens);
+        const uint32_t max_visible = last_token > tile_t
+            ? min((pos0 + last_token) / ratio, n_comp)
+            : 0u;
+        if (tile_c >= max_visible) {
+            for (uint32_t i = tid; i < 16u * 32u; i += 64u) {
+                const uint32_t r = i >> 5u;
+                const uint32_t c = i & 31u;
+                const uint32_t token = tile_t + r;
+                const uint32_t comp = tile_c + c;
+                if (token < n_tokens && comp < n_comp) {
+                    scores[(uint64_t)token * n_comp + comp] = -INFINITY;
+                }
+            }
+            return;
+        }
+    }
+
+    __shared__ __half a_sh[16 * 128];
+    __shared__ __half b_sh[32 * 128];
+    __shared__ float c_sh[2 * 16 * 16];
+    __shared__ float acc_sh[2 * 16 * 16];
+
+    for (uint32_t i = tid; i < 2u * 16u * 16u; i += 64u) acc_sh[i] = 0.0f;
+    for (uint32_t i = tid; i < 32u * 128u; i += 64u) {
+        const uint32_t c = i >> 7u;
+        const uint32_t d = i & 127u;
+        const uint32_t comp = tile_c + c;
+        float v = 0.0f;
+        if (comp < n_comp) v = index_comp[(uint64_t)comp * head_dim + d];
+        b_sh[d + c * 128u] = __float2half(v);
+    }
+    __syncthreads();
+
+    for (uint32_t h = 0; h < n_head; h++) {
+        for (uint32_t i = tid; i < 16u * 128u; i += 64u) {
+            const uint32_t r = i >> 7u;
+            const uint32_t d = i & 127u;
+            const uint32_t token = tile_t + r;
+            float v = 0.0f;
+            if (token < n_tokens) {
+                v = q[((uint64_t)token * n_head + h) * head_dim + d];
+            }
+            a_sh[i] = __float2half(v);
+        }
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+        wmma::fill_fragment(c_frag, 0.0f);
+        const uint32_t col0 = warp * 16u;
+        for (uint32_t k0 = 0; k0 < 128u; k0 += 16u) {
+            wmma::load_matrix_sync(a_frag, a_sh + k0, 128);
+            wmma::load_matrix_sync(b_frag, b_sh + col0 * 128u + k0, 128);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+        wmma::store_matrix_sync(c_sh + warp * 16u * 16u, c_frag, 16, wmma::mem_row_major);
+        __syncthreads();
+
+        for (uint32_t i = tid; i < 2u * 16u * 16u; i += 64u) {
+            const uint32_t wtile = i >> 8u;
+            const uint32_t local = i & 255u;
+            const uint32_t r = local >> 4u;
+            const uint32_t c = local & 15u;
+            const uint32_t token = tile_t + r;
+            const uint32_t comp = tile_c + wtile * 16u + c;
+            if (token < n_tokens && comp < n_comp) {
+                const float w = weights[(uint64_t)token * n_head + h];
+                acc_sh[i] += fmaxf(c_sh[i], 0.0f) * w;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (uint32_t i = tid; i < 2u * 16u * 16u; i += 64u) {
+        const uint32_t wtile = i >> 8u;
+        const uint32_t local = i & 255u;
+        const uint32_t r = local >> 4u;
+        const uint32_t c = local & 15u;
+        const uint32_t token = tile_t + r;
+        const uint32_t comp = tile_c + wtile * 16u + c;
+        if (token < n_tokens && comp < n_comp) {
+            float out = acc_sh[i] * scale;
+            if (causal) {
+                const uint32_t visible = (pos0 + token + 1u) / ratio;
+                if (comp >= visible) out = -INFINITY;
+            }
+            scores[(uint64_t)token * n_comp + comp] = out;
+        }
+    }
+#endif
+}
+
+__global__ static void indexer_scores_wmma64_kernel(
+        float *scores,
+        const float *q,
+        const float *weights,
+        const float *index_comp,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t ratio,
+        float scale,
+        int causal) {
+#if __CUDA_ARCH__ >= 700
+    namespace wmma = nvcuda::wmma;
+    const uint32_t tile_c = blockIdx.x * 64u;
+    const uint32_t tile_t = blockIdx.y * 16u;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    if (tid >= 128u || head_dim != 128u) return;
+
+    if (causal) {
+        const uint32_t last_token = min(tile_t + 16u, n_tokens);
+        const uint32_t max_visible = last_token > tile_t
+            ? min((pos0 + last_token) / ratio, n_comp)
+            : 0u;
+        if (tile_c >= max_visible) {
+            for (uint32_t i = tid; i < 16u * 64u; i += 128u) {
+                const uint32_t r = i >> 6u;
+                const uint32_t c = i & 63u;
+                const uint32_t token = tile_t + r;
+                const uint32_t comp = tile_c + c;
+                if (token < n_tokens && comp < n_comp) {
+                    scores[(uint64_t)token * n_comp + comp] = -INFINITY;
+                }
+            }
+            return;
+        }
+    }
+
+    __shared__ __half a_sh[16 * 128];
+    __shared__ __half b_sh[64 * 128];
+    __shared__ float c_sh[4 * 16 * 16];
+    __shared__ float acc_sh[4 * 16 * 16];
+
+    for (uint32_t i = tid; i < 4u * 16u * 16u; i += 128u) acc_sh[i] = 0.0f;
+    for (uint32_t i = tid; i < 64u * 128u; i += 128u) {
+        const uint32_t c = i >> 7u;
+        const uint32_t d = i & 127u;
+        const uint32_t comp = tile_c + c;
+        float v = 0.0f;
+        if (comp < n_comp) v = index_comp[(uint64_t)comp * head_dim + d];
+        b_sh[d + c * 128u] = __float2half(v);
+    }
+    __syncthreads();
+
+    for (uint32_t h = 0; h < n_head; h++) {
+        for (uint32_t i = tid; i < 16u * 128u; i += 128u) {
+            const uint32_t r = i >> 7u;
+            const uint32_t d = i & 127u;
+            const uint32_t token = tile_t + r;
+            float v = 0.0f;
+            if (token < n_tokens) {
+                v = q[((uint64_t)token * n_head + h) * head_dim + d];
+            }
+            a_sh[i] = __float2half(v);
+        }
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+        wmma::fill_fragment(c_frag, 0.0f);
+        const uint32_t col0 = warp * 16u;
+        for (uint32_t k0 = 0; k0 < 128u; k0 += 16u) {
+            wmma::load_matrix_sync(a_frag, a_sh + k0, 128);
+            wmma::load_matrix_sync(b_frag, b_sh + col0 * 128u + k0, 128);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+        wmma::store_matrix_sync(c_sh + warp * 16u * 16u, c_frag, 16, wmma::mem_row_major);
+        __syncthreads();
+
+        for (uint32_t i = tid; i < 4u * 16u * 16u; i += 128u) {
+            const uint32_t wtile = i >> 8u;
+            const uint32_t local = i & 255u;
+            const uint32_t r = local >> 4u;
+            const uint32_t c = local & 15u;
+            const uint32_t token = tile_t + r;
+            const uint32_t comp = tile_c + wtile * 16u + c;
+            if (token < n_tokens && comp < n_comp) {
+                const float w = weights[(uint64_t)token * n_head + h];
+                acc_sh[i] += fmaxf(c_sh[i], 0.0f) * w;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (uint32_t i = tid; i < 4u * 16u * 16u; i += 128u) {
+        const uint32_t wtile = i >> 8u;
+        const uint32_t local = i & 255u;
+        const uint32_t r = local >> 4u;
+        const uint32_t c = local & 15u;
+        const uint32_t token = tile_t + r;
+        const uint32_t comp = tile_c + wtile * 16u + c;
+        if (token < n_tokens && comp < n_comp) {
+            float out = acc_sh[i] * scale;
+            if (causal) {
+                const uint32_t visible = (pos0 + token + 1u) / ratio;
+                if (comp >= visible) out = -INFINITY;
+            }
+            scores[(uint64_t)token * n_comp + comp] = out;
+        }
+    }
+#endif
+}
+
+__global__ static void indexer_scores_wmma128_kernel(
+        float *scores,
+        const float *q,
+        const float *weights,
+        const float *index_comp,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t ratio,
+        float scale,
+        int causal) {
+#if __CUDA_ARCH__ >= 700
+    namespace wmma = nvcuda::wmma;
+    const uint32_t tile_c = blockIdx.x * 128u;
+    const uint32_t tile_t = blockIdx.y * 16u;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    if (tid >= 256u || head_dim != 128u) return;
+
+    if (causal) {
+        const uint32_t last_token = min(tile_t + 16u, n_tokens);
+        const uint32_t max_visible = last_token > tile_t
+            ? min((pos0 + last_token) / ratio, n_comp)
+            : 0u;
+        if (tile_c >= max_visible) {
+            for (uint32_t i = tid; i < 16u * 128u; i += 256u) {
+                const uint32_t r = i >> 7u;
+                const uint32_t c = i & 127u;
+                const uint32_t token = tile_t + r;
+                const uint32_t comp = tile_c + c;
+                if (token < n_tokens && comp < n_comp) {
+                    scores[(uint64_t)token * n_comp + comp] = -INFINITY;
+                }
+            }
+            return;
+        }
+    }
+
+    __shared__ __half a_sh[16 * 128];
+    __shared__ __half b_sh[128 * 128];
+    __shared__ float c_sh[8 * 16 * 16];
+
+    float acc[8];
+#pragma unroll
+    for (uint32_t i = 0; i < 8u; i++) acc[i] = 0.0f;
+
+    for (uint32_t i = tid; i < 128u * 128u; i += 256u) {
+        const uint32_t c = i >> 7u;
+        const uint32_t d = i & 127u;
+        const uint32_t comp = tile_c + c;
+        float v = 0.0f;
+        if (comp < n_comp) v = index_comp[(uint64_t)comp * head_dim + d];
+        b_sh[d + c * 128u] = __float2half(v);
+    }
+    __syncthreads();
+
+    for (uint32_t h = 0; h < n_head; h++) {
+        for (uint32_t i = tid; i < 16u * 128u; i += 256u) {
+            const uint32_t r = i >> 7u;
+            const uint32_t d = i & 127u;
+            const uint32_t token = tile_t + r;
+            float v = 0.0f;
+            if (token < n_tokens) {
+                v = q[((uint64_t)token * n_head + h) * head_dim + d];
+            }
+            a_sh[i] = __float2half(v);
+        }
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+        wmma::fill_fragment(c_frag, 0.0f);
+        const uint32_t col0 = warp * 16u;
+        for (uint32_t k0 = 0; k0 < 128u; k0 += 16u) {
+            wmma::load_matrix_sync(a_frag, a_sh + k0, 128);
+            wmma::load_matrix_sync(b_frag, b_sh + col0 * 128u + k0, 128);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+        wmma::store_matrix_sync(c_sh + warp * 16u * 16u, c_frag, 16, wmma::mem_row_major);
+        __syncthreads();
+
+        const uint32_t local0 = tid & 255u;
+        const uint32_t token0 = tile_t + (local0 >> 4u);
+        const float w0 = token0 < n_tokens ? weights[(uint64_t)token0 * n_head + h] : 0.0f;
+        uint32_t slot = 0;
+        for (uint32_t i = tid; i < 8u * 16u * 16u; i += 256u, slot++) {
+            const uint32_t wtile = i >> 8u;
+            const uint32_t local = i & 255u;
+            const uint32_t r = local >> 4u;
+            const uint32_t c = local & 15u;
+            const uint32_t token = tile_t + r;
+            const uint32_t comp = tile_c + wtile * 16u + c;
+            if (token < n_tokens && comp < n_comp) {
+                acc[slot] += fmaxf(c_sh[i], 0.0f) * w0;
+            }
+        }
+        __syncthreads();
+    }
+
+    uint32_t slot = 0;
+    for (uint32_t i = tid; i < 8u * 16u * 16u; i += 256u, slot++) {
+        const uint32_t wtile = i >> 8u;
+        const uint32_t local = i & 255u;
+        const uint32_t r = local >> 4u;
+        const uint32_t c = local & 15u;
+        const uint32_t token = tile_t + r;
+        const uint32_t comp = tile_c + wtile * 16u + c;
+        if (token < n_tokens && comp < n_comp) {
+            float out = acc[slot] * scale;
+            if (causal) {
+                const uint32_t visible = (pos0 + token + 1u) / ratio;
+                if (comp >= visible) out = -INFINITY;
+            }
+            scores[(uint64_t)token * n_comp + comp] = out;
+        }
+    }
+#endif
+}
+
 __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
@@ -4561,6 +4922,55 @@ __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scor
 
 __device__ __forceinline__ static bool topk_score_better(float av, uint32_t ai, float bv, uint32_t bi) {
     return av > bv || (av == bv && ai < bi);
+}
+
+__device__ __forceinline__ static uint32_t topk_float_ordered_key(float v) {
+    const uint32_t u = __float_as_uint(v);
+    return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
+}
+
+__device__ __forceinline__ static uint64_t topk_pack_key(float v, uint32_t idx) {
+    return ((uint64_t)topk_float_ordered_key(v) << 32u) | (uint64_t)(0xffffffffu - idx);
+}
+
+__global__ static void indexer_topk_8192_cub_kernel(
+        uint32_t *selected,
+        const float *scores,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t top_k) {
+    constexpr uint32_t BLOCK_THREADS = 512u;
+    constexpr uint32_t ITEMS_PER_THREAD = 16u;
+    using BlockSort = cub::BlockRadixSort<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>;
+    extern __shared__ __align__(16) unsigned char sort_smem[];
+    typename BlockSort::TempStorage &sort_storage =
+        *reinterpret_cast<typename BlockSort::TempStorage *>(sort_smem);
+
+    const uint32_t t = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (t >= n_tokens || tid >= BLOCK_THREADS) return;
+
+    const float *row = scores + (uint64_t)t * n_comp;
+    uint64_t keys[ITEMS_PER_THREAD];
+#pragma unroll
+    for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
+        const uint32_t i = tid * ITEMS_PER_THREAD + item;
+        if (i < n_comp) {
+            keys[item] = topk_pack_key(row[i], i);
+        } else {
+            keys[item] = topk_pack_key(-INFINITY, UINT32_MAX);
+        }
+    }
+
+    BlockSort(sort_storage).SortDescending(keys);
+
+#pragma unroll
+    for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
+        const uint32_t i = tid * ITEMS_PER_THREAD + item;
+        if (i < top_k) {
+            selected[(uint64_t)t * top_k + i] = 0xffffffffu - (uint32_t)keys[item];
+        }
+    }
 }
 
 __global__ static void indexer_topk_1024_kernel(
@@ -4654,6 +5064,61 @@ __global__ static void indexer_topk_pow2_kernel(
                         idxs[i] = bi;
                         vals[other] = av;
                         idxs[other] = ai;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    for (uint32_t i = tid; i < top_k; i += blockDim.x) {
+        selected[(uint64_t)t * top_k + i] = idxs[i];
+    }
+}
+
+template <uint32_t SORT_N>
+__global__ static void indexer_topk_pow2_u16_kernel(
+        uint32_t *selected,
+        const float *scores,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t top_k) {
+    uint32_t t = blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    if (t >= n_tokens) return;
+    __shared__ float vals[SORT_N];
+    __shared__ uint16_t idxs[SORT_N];
+
+    const float *row = scores + (uint64_t)t * n_comp;
+    for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
+        if (i < n_comp) {
+            vals[i] = row[i];
+            idxs[i] = (uint16_t)i;
+        } else {
+            vals[i] = -INFINITY;
+            idxs[i] = UINT16_MAX;
+        }
+    }
+    __syncthreads();
+
+    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
+        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
+            for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
+                uint32_t other = i ^ j;
+                if (other > i && other < SORT_N) {
+                    const float av = vals[i];
+                    const float bv = vals[other];
+                    const uint32_t ai = idxs[i];
+                    const uint32_t bi = idxs[other];
+                    const bool desc_half = (i & k) == 0u;
+                    const bool swap = desc_half
+                        ? topk_score_better(bv, bi, av, ai)
+                        : topk_score_better(av, ai, bv, bi);
+                    if (swap) {
+                        vals[i] = bv;
+                        idxs[i] = (uint16_t)bi;
+                        vals[other] = av;
+                        idxs[other] = (uint16_t)ai;
                     }
                 }
             }
@@ -4859,6 +5324,39 @@ __global__ static void indexer_topk_tree_merge_pow2_kernel(
     }
 }
 
+__global__ static void indexed_topk_sort_512_asc_kernel(
+        int32_t *dst,
+        const int32_t *src,
+        uint32_t n_tokens) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (t >= n_tokens || tid >= 512u) return;
+    __shared__ int32_t rows[512];
+
+    const int32_t *src_row = src + (uint64_t)t * 512u;
+    int32_t *dst_row = dst + (uint64_t)t * 512u;
+    rows[tid] = src_row[tid];
+    __syncthreads();
+
+    for (uint32_t k = 2u; k <= 512u; k <<= 1u) {
+        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
+            const uint32_t other = tid ^ j;
+            if (other > tid && other < 512u) {
+                const int32_t a = rows[tid];
+                const int32_t b = rows[other];
+                const bool up = (tid & k) == 0u;
+                if ((up && a > b) || (!up && a < b)) {
+                    rows[tid] = b;
+                    rows[other] = a;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    dst_row[tid] = rows[tid];
+}
+
 __global__ static void topk_mask_kernel(float *mask, const uint32_t *topk, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * n_comp;
@@ -4951,14 +5449,43 @@ static int indexer_scores_launch(
     }
     if (!g_quality_mode && head_dim == 128u && n_head == 64u &&
         getenv("DS4_CUDA_NO_INDEXER_WMMA") == NULL) {
-        dim3 grid((n_comp + 15u) / 16u, (n_tokens + 15u) / 16u, 1);
-        indexer_scores_wmma_kernel<<<grid, 32>>>((float *)scores->ptr,
-                                                 (const float *)q->ptr,
-                                                 (const float *)weights->ptr,
-                                                 (const float *)index_comp->ptr,
-                                                 n_comp, n_tokens, pos0, n_head,
-                                                 head_dim, ratio, scale, causal ? 1 : 0);
-        return cuda_ok(cudaGetLastError(), "indexer scores wmma launch");
+        if (getenv("DS4_CUDA_NO_INDEXER_WMMA128") == NULL) {
+            dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1);
+            indexer_scores_wmma128_kernel<<<grid, 256>>>((float *)scores->ptr,
+                                                         (const float *)q->ptr,
+                                                         (const float *)weights->ptr,
+                                                         (const float *)index_comp->ptr,
+                                                         n_comp, n_tokens, pos0, n_head,
+                                                         head_dim, ratio, scale, causal ? 1 : 0);
+            return cuda_ok(cudaGetLastError(), "indexer scores wmma128 launch");
+        } else if (getenv("DS4_CUDA_NO_INDEXER_WMMA64") == NULL) {
+            dim3 grid((n_comp + 63u) / 64u, (n_tokens + 15u) / 16u, 1);
+            indexer_scores_wmma64_kernel<<<grid, 128>>>((float *)scores->ptr,
+                                                        (const float *)q->ptr,
+                                                        (const float *)weights->ptr,
+                                                        (const float *)index_comp->ptr,
+                                                        n_comp, n_tokens, pos0, n_head,
+                                                        head_dim, ratio, scale, causal ? 1 : 0);
+            return cuda_ok(cudaGetLastError(), "indexer scores wmma64 launch");
+        } else if (getenv("DS4_CUDA_NO_INDEXER_WMMA32") == NULL) {
+            dim3 grid((n_comp + 31u) / 32u, (n_tokens + 15u) / 16u, 1);
+            indexer_scores_wmma32_kernel<<<grid, 64>>>((float *)scores->ptr,
+                                                       (const float *)q->ptr,
+                                                       (const float *)weights->ptr,
+                                                       (const float *)index_comp->ptr,
+                                                       n_comp, n_tokens, pos0, n_head,
+                                                       head_dim, ratio, scale, causal ? 1 : 0);
+            return cuda_ok(cudaGetLastError(), "indexer scores wmma32 launch");
+        } else {
+            dim3 grid((n_comp + 15u) / 16u, (n_tokens + 15u) / 16u, 1);
+            indexer_scores_wmma_kernel<<<grid, 32>>>((float *)scores->ptr,
+                                                     (const float *)q->ptr,
+                                                     (const float *)weights->ptr,
+                                                     (const float *)index_comp->ptr,
+                                                     n_comp, n_tokens, pos0, n_head,
+                                                     head_dim, ratio, scale, causal ? 1 : 0);
+            return cuda_ok(cudaGetLastError(), "indexer scores wmma launch");
+        }
     }
     dim3 grid(n_comp, n_tokens, 1);
     indexer_scores_kernel<<<grid, 256>>>((float *)scores->ptr,
@@ -5042,10 +5569,64 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     }
     if (top_k == 512u && n_comp <= 4096u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
+        if (n_comp == 4096u) {
+            using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
+            const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
+            int dev = 0;
+            int max_optin_smem = 0;
+            cudaError_t attr_err = cudaGetDevice(&dev);
+            if (attr_err == cudaSuccess) {
+                attr_err = cudaDeviceGetAttribute(&max_optin_smem,
+                                                  cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                                  dev);
+            }
+            if (attr_err == cudaSuccess && max_optin_smem >= smem) {
+                attr_err = cudaFuncSetAttribute(indexer_topk_8192_cub_kernel,
+                                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                smem);
+                if (attr_err == cudaSuccess) {
+                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
+                                                                                 (const float *)scores->ptr,
+                                                                                 n_comp, n_tokens, top_k);
+                    return cuda_ok(cudaGetLastError(), "indexer topk 4096 cub launch");
+                }
+            }
+        }
         indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
+    }
+    if (top_k == 512u && n_comp <= 8192u &&
+        getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK8192") == NULL) {
+        if (n_comp > 4096u) {
+            using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
+            const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
+            int dev = 0;
+            int max_optin_smem = 0;
+            cudaError_t attr_err = cudaGetDevice(&dev);
+            if (attr_err == cudaSuccess) {
+                attr_err = cudaDeviceGetAttribute(&max_optin_smem,
+                                                  cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                                  dev);
+            }
+            if (attr_err == cudaSuccess && max_optin_smem >= smem) {
+                attr_err = cudaFuncSetAttribute(indexer_topk_8192_cub_kernel,
+                                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                smem);
+                if (attr_err == cudaSuccess) {
+                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
+                                                                                 (const float *)scores->ptr,
+                                                                                 n_comp, n_tokens, top_k);
+                    return cuda_ok(cudaGetLastError(), "indexer topk 8192 cub launch");
+                }
+            }
+        }
+        indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+                                                               (const float *)scores->ptr,
+                                                               n_comp, n_tokens, top_k);
+        return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
     }
     if (top_k == 512u && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK_CHUNKED") == NULL) {
@@ -5864,8 +6445,8 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
     if (!ape) return 0;
 
     uint64_t state_n = (uint64_t)state_rows * width;
-    fill_f32_kernel<<<(state_n + 255) / 256, 256>>>((float *)state_kv->ptr, state_n, 0.0f);
-    if (!cuda_ok(cudaGetLastError(), "compressor state kv fill launch")) return 0;
+    if (!cuda_ok(cudaMemsetAsync(state_kv->ptr, 0, (size_t)(state_n * sizeof(float))),
+                 "compressor state kv zero")) return 0;
     fill_f32_kernel<<<(state_n + 255) / 256, 256>>>((float *)state_score->ptr, state_n, -INFINITY);
     if (!cuda_ok(cudaGetLastError(), "compressor state score fill launch")) return 0;
 
@@ -5989,8 +6570,8 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
     if (quantize_fp8 && !ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) return 0;
 
     uint64_t state_n = (uint64_t)state_rows * width;
-    fill_f32_kernel<<<(state_n + 255) / 256, 256>>>((float *)state_kv->ptr, state_n, 0.0f);
-    if (!cuda_ok(cudaGetLastError(), "compressor replay state kv fill launch")) return 0;
+    if (!cuda_ok(cudaMemsetAsync(state_kv->ptr, 0, (size_t)(state_n * sizeof(float))),
+                 "compressor replay state kv zero")) return 0;
     fill_f32_kernel<<<(state_n + 255) / 256, 256>>>((float *)state_score->ptr, state_n, -INFINITY);
     if (!cuda_ok(cudaGetLastError(), "compressor replay state score fill launch")) return 0;
     uint32_t prev_start = n_tokens - ratio;
@@ -6032,8 +6613,8 @@ extern "C" int ds4_gpu_compressor_prefill_state_ratio4_tensor(
     const char *ape = cuda_model_range_ptr(model_map, ape_offset, ape_bytes, "compressor_ape");
     if (!ape) return 0;
     uint64_t state_n = (uint64_t)state_rows * width;
-    fill_f32_kernel<<<(state_n + 255) / 256, 256>>>((float *)state_kv->ptr, state_n, 0.0f);
-    if (!cuda_ok(cudaGetLastError(), "compressor state kv fill launch")) return 0;
+    if (!cuda_ok(cudaMemsetAsync(state_kv->ptr, 0, (size_t)(state_n * sizeof(float))),
+                 "compressor state kv zero")) return 0;
     fill_f32_kernel<<<(state_n + 255) / 256, 256>>>((float *)state_score->ptr, state_n, -INFINITY);
     if (!cuda_ok(cudaGetLastError(), "compressor state score fill launch")) return 0;
     uint64_t n = (uint64_t)ratio * width;
@@ -6385,35 +6966,46 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    const int32_t *topk_ptr = (const int32_t *)topk->ptr;
+    if (n_tokens > 1u && top_k == 512u &&
+        getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
+        const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
+        int32_t *sorted = (int32_t *)cuda_tmp_alloc(sort_bytes, "indexed attention topk sort");
+        if (!sorted) return 0;
+        indexed_topk_sort_512_asc_kernel<<<n_tokens, 512>>>(sorted, topk_ptr, n_tokens);
+        if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
+        topk_ptr = sorted;
+    }
     if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
-        dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
-            attention_indexed_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
-                                                                        sinks,
-                                                                        (const float *)q->ptr,
-                                                                        (const float *)raw_kv->ptr,
-                                                                        (const float *)comp_kv->ptr,
-                                                                        (const int32_t *)topk->ptr,
-                                                                        n_tokens,
-                                                                        pos0,
-                                                                        n_raw,
-                                                                        raw_cap,
-                                                                        raw_start,
-                                                                        n_comp,
-                                                                        top_k,
-                                                                        window,
-                                                                        ratio,
-                                                                        n_head,
-                                                                        head_dim);
+            dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
+            attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
+                                                                               sinks,
+                                                                               (const float *)q->ptr,
+                                                                               (const float *)raw_kv->ptr,
+                                                                               (const float *)comp_kv->ptr,
+                                                                               topk_ptr,
+                                                                               n_tokens,
+                                                                               pos0,
+                                                                               n_raw,
+                                                                               raw_cap,
+                                                                               raw_start,
+                                                                               n_comp,
+                                                                               top_k,
+                                                                               window,
+                                                                               ratio,
+                                                                               n_head,
+                                                                               head_dim);
             return cuda_ok(cudaGetLastError(), "attention indexed online launch");
         }
+        dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_indexed_mixed_heads8_rb4_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                  sinks,
                                                                  (const float *)q->ptr,
                                                                  (const float *)raw_kv->ptr,
                                                                  (const float *)comp_kv->ptr,
-                                                                 (const int32_t *)topk->ptr,
+                                                                 topk_ptr,
                                                                  n_tokens,
                                                                  pos0,
                                                                  n_raw,
@@ -6433,7 +7025,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                   (const float *)q->ptr,
                                                   (const float *)raw_kv->ptr,
                                                   (const float *)comp_kv->ptr,
-                                                  (const int32_t *)topk->ptr,
+                                                  topk_ptr,
                                                   n_tokens,
                                                   pos0,
                                                   n_raw,
@@ -7360,63 +7952,6 @@ __device__ static void dev_dot_q2_K_q8_K_block8(
     for (uint32_t p = 0; p < n; p++) {
         for (int j = 0; j < 16; j++) summs[p] += ys[p]->bsums[j] * (sc[j] >> 4);
     }
-    for (uint32_t p = 0; p < n; p++) {
-        const uint8_t *q2 = x->qs;
-        const int8_t *q8 = ys[p]->qs;
-        int is = 0;
-        for (int k = 0; k < CUDA_QK_K / 128; k++) {
-            int shift = 0;
-            for (int j = 0; j < 4; j++) {
-                int d = sc[is++] & 0x0f;
-                isum[p] += d * dev_dot_q2_16(q2, q8, shift);
-                d = sc[is++] & 0x0f;
-                isum[p] += d * dev_dot_q2_16(q2 + 16, q8 + 16, shift);
-                shift += 2;
-                q8 += 32;
-            }
-            q2 += 32;
-        }
-    }
-    for (uint32_t p = 0; p < n; p++) {
-        const float yd = ys[p]->d;
-        acc[p] += yd * xd * (float)isum[p] - yd * xmin * (float)summs[p];
-    }
-}
-
-__device__ static void dev_dot_q2_K_q8_K_block16(
-        const cuda_block_q2_K *x,
-        const cuda_block_q8_K *y0,
-        const cuda_block_q8_K *y1,
-        const cuda_block_q8_K *y2,
-        const cuda_block_q8_K *y3,
-        const cuda_block_q8_K *y4,
-        const cuda_block_q8_K *y5,
-        const cuda_block_q8_K *y6,
-        const cuda_block_q8_K *y7,
-        const cuda_block_q8_K *y8,
-        const cuda_block_q8_K *y9,
-        const cuda_block_q8_K *y10,
-        const cuda_block_q8_K *y11,
-        const cuda_block_q8_K *y12,
-        const cuda_block_q8_K *y13,
-        const cuda_block_q8_K *y14,
-        const cuda_block_q8_K *y15,
-        uint32_t n,
-        float acc[16]) {
-    const uint8_t *sc = x->scales;
-    const float xd = dev_f16_to_f32(x->d);
-    const float xmin = dev_f16_to_f32(x->dmin);
-    const cuda_block_q8_K *ys[16] = {
-        y0, y1, y2, y3, y4, y5, y6, y7,
-        y8, y9, y10, y11, y12, y13, y14, y15,
-    };
-    int isum[16] = {0};
-    int summs[16] = {0};
-    for (uint32_t p = 0; p < n; p++) {
-        #pragma unroll
-        for (int j = 0; j < 16; j++) summs[p] += ys[p]->bsums[j] * (sc[j] >> 4);
-    }
-
     for (uint32_t p = 0; p < n; p++) {
         const uint8_t *q2 = x->qs;
         const int8_t *q8 = ys[p]->qs;
@@ -8994,80 +9529,6 @@ __global__ static void moe_down_expert_tile16_rowspan_kernel(
     }
 }
 
-template <uint32_t ROW_SPAN>
-__global__ static void moe_down_expert_tile16_rowspan_block16_kernel(
-        float *down_out,
-        const char *down_base,
-        const cuda_block_q8_K *midq,
-        const uint32_t *sorted_pairs,
-        const uint32_t *offsets,
-        const uint32_t *counts,
-        const uint32_t *tile_total,
-        const uint32_t *tile_experts,
-        const uint32_t *tile_starts,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t midq_blocks,
-        uint32_t out_dim,
-        uint32_t n_expert,
-        uint32_t atomic_out) {
-    uint32_t tile = blockIdx.y;
-    if (tile >= *tile_total) return;
-    uint32_t local_start = tile_starts[tile];
-    if (local_start & 8u) return;
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row_lane = threadIdx.x >> 3u;
-    uint32_t expert = tile_experts[tile];
-    __shared__ cuda_block_q8_K sxq[16][8];
-    uint32_t pair[16] = {0};
-    const cuda_block_q8_K *xqb[16] = {NULL};
-    uint32_t np = 0;
-    for (; np < 16u; np++) {
-        uint32_t local_pair = local_start + np;
-        if (local_pair >= counts[expert]) break;
-        pair[np] = sorted_pairs[offsets[expert] + local_pair];
-        xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
-    }
-    if (midq_blocks <= 8u) {
-        for (uint32_t i = threadIdx.x; i < np * midq_blocks; i += blockDim.x) {
-            uint32_t p = i / midq_blocks;
-            uint32_t b = i - p * midq_blocks;
-            sxq[p][b] = xqb[p][b];
-        }
-        __syncthreads();
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
-    }
-    for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
-        uint32_t row = blockIdx.x * ROW_SPAN + row_lane + rr * 32u;
-        if (row >= out_dim) continue;
-        const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
-        float acc[16] = {0.0f};
-        for (uint32_t b = lane; b < midq_blocks; b += 8u) {
-            dev_dot_q2_K_q8_K_block16(wr + b,
-                                      xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                      xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                      xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                      xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL,
-                                      xqb[8] ? xqb[8] + b : NULL, xqb[9] ? xqb[9] + b : NULL,
-                                      xqb[10] ? xqb[10] + b : NULL, xqb[11] ? xqb[11] + b : NULL,
-                                      xqb[12] ? xqb[12] + b : NULL, xqb[13] ? xqb[13] + b : NULL,
-                                      xqb[14] ? xqb[14] + b : NULL, xqb[15] ? xqb[15] + b : NULL,
-                                      np, acc);
-        }
-        for (uint32_t p = 0; p < np; p++) {
-            acc[p] = quarter_warp_sum_f32(acc[p], lane);
-            if (lane == 0) {
-                if (atomic_out) {
-                    uint32_t tok = pair[p] / n_expert;
-                    atomicAdd(down_out + (uint64_t)tok * out_dim + row, acc[p]);
-                } else {
-                    down_out[(uint64_t)pair[p] * out_dim + row] = acc[p];
-                }
-            }
-        }
-    }
-}
-
 __global__ static void moe_down_sorted_p2_qwarp32_kernel(
         float *down_out,
         const char *down_base,
@@ -9356,8 +9817,6 @@ static int routed_moe_launch(
               getenv("DS4_CUDA_MOE_NO_GATE_ROW128") == NULL));
         const uint32_t use_down_tile16 = use_atomic_down && expert_tile_m == 8u &&
             n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_DOWN_TILE16") == NULL;
-        const uint32_t use_down_block16 = use_down_tile16 && midq_blocks <= 8u &&
-            getenv("DS4_CUDA_MOE_NO_DOWN_BLOCK16") == NULL;
         const uint32_t use_decode_lut_gate =
             n_tokens == 1u && xq_blocks <= 16u &&
             getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") == NULL;
@@ -9669,49 +10128,25 @@ static int routed_moe_launch(
                 if (use_down_row2048) {
                     if (down_row_span == 512u) {
                         dim3 tgrid((out_dim + 511u) / 512u, down_tile_capacity, 1);
-                        if (use_down_block16) {
-                            moe_down_expert_tile16_rowspan_block16_kernel<512><<<tgrid, 256>>>(
-                                use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
-                                down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                                down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
-                                midq_blocks, out_dim, n_expert, use_atomic_down);
-                        } else {
-                            moe_down_expert_tile16_rowspan_kernel<512><<<tgrid, 256>>>(
-                                use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
-                                down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                                down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
-                                midq_blocks, out_dim, n_expert, use_atomic_down);
-                        }
+                        moe_down_expert_tile16_rowspan_kernel<512><<<tgrid, 256>>>(
+                            use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
+                            down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                            down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
+                            midq_blocks, out_dim, n_expert, use_atomic_down);
                     } else if (down_row_span == 1024u) {
                         dim3 tgrid((out_dim + 1023u) / 1024u, down_tile_capacity, 1);
-                        if (use_down_block16) {
-                            moe_down_expert_tile16_rowspan_block16_kernel<1024><<<tgrid, 256>>>(
-                                use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
-                                down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                                down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
-                                midq_blocks, out_dim, n_expert, use_atomic_down);
-                        } else {
-                            moe_down_expert_tile16_rowspan_kernel<1024><<<tgrid, 256>>>(
-                                use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
-                                down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                                down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
-                                midq_blocks, out_dim, n_expert, use_atomic_down);
-                        }
+                        moe_down_expert_tile16_rowspan_kernel<1024><<<tgrid, 256>>>(
+                            use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
+                            down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                            down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
+                            midq_blocks, out_dim, n_expert, use_atomic_down);
                     } else {
                         dim3 tgrid((out_dim + 2047u) / 2048u, down_tile_capacity, 1);
-                        if (use_down_block16) {
-                            moe_down_expert_tile16_rowspan_block16_kernel<2048><<<tgrid, 256>>>(
-                                use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
-                                down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                                down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
-                                midq_blocks, out_dim, n_expert, use_atomic_down);
-                        } else {
-                            moe_down_expert_tile16_row2048_kernel<<<tgrid, 256>>>(
-                                use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
-                                down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                                down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
-                                midq_blocks, out_dim, n_expert, use_atomic_down);
-                        }
+                        moe_down_expert_tile16_row2048_kernel<<<tgrid, 256>>>(
+                            use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
+                            down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                            down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
+                            midq_blocks, out_dim, n_expert, use_atomic_down);
                     }
                 } else if (use_down_tile16) {
                     dim3 tgrid((out_dim + 31u) / 32u, down_tile_capacity, 1);
