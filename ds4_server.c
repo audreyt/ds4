@@ -486,6 +486,7 @@ typedef enum {
 
 typedef enum {
     DS4_STEERING_POLICY_ALWAYS,
+    DS4_STEERING_POLICY_DECODING,
     DS4_STEERING_POLICY_FINAL_ANSWER,
     DS4_STEERING_POLICY_OFF,
 } directional_steering_policy;
@@ -1739,6 +1740,7 @@ static bool append_anthropic_block_content(buf *dst, const char *text) {
  * assistant tool_use blocks to tool_calls, and keeps tool_result blocks as
  * escaped text because DS4 sees tool results in its chat template. */
 static bool parse_anthropic_content_block(const char **p, const char *role, chat_msg *msg) {
+    (void)role;
     if (**p != '{') return false;
     (*p)++;
     char *type = NULL;
@@ -1813,7 +1815,12 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     if (**p != '}') goto bad;
     (*p)++;
 
-    if (type && !strcmp(type, "tool_use") && !strcmp(role, "assistant")) {
+    /* JSON object member order is not meaningful.  Some Anthropic-compatible
+     * clients serialize a message as {"content": ..., "role": ...}, so the
+     * caller may not know the enclosing role yet while parsing content blocks.
+     * Classify protocol blocks by their own "type" field; later rendering and
+     * validation use the final message role. */
+    if (type && !strcmp(type, "tool_use")) {
         tool_call tc = {0};
         tc.id = id ? xstrdup(id) : NULL;
         tc.name = name ? xstrdup(name) : xstrdup("");
@@ -9987,6 +9994,7 @@ static thinking_state thinking_state_from_prompt(const request *r) {
 static const char *directional_steering_policy_name(directional_steering_policy policy) {
     switch (policy) {
     case DS4_STEERING_POLICY_ALWAYS: return "always";
+    case DS4_STEERING_POLICY_DECODING: return "decoding";
     case DS4_STEERING_POLICY_FINAL_ANSWER: return "final-answer";
     case DS4_STEERING_POLICY_OFF: return "off";
     }
@@ -10030,6 +10038,7 @@ static bool directional_steering_should_apply(
         bool *starts_final_answer_out) {
     if (starts_final_answer_out) *starts_final_answer_out = false;
     if (policy == DS4_STEERING_POLICY_ALWAYS) return true;
+    if (policy == DS4_STEERING_POLICY_DECODING) return true;
     if (policy == DS4_STEERING_POLICY_OFF) return false;
 
     if (!final_answer_context) return false;
@@ -10058,6 +10067,12 @@ static void server_apply_directional_steering(server *s, bool enable) {
 static void server_apply_prefill_directional_steering(server *s) {
     server_apply_directional_steering(
         s, s && s->steering_policy == DS4_STEERING_POLICY_ALWAYS);
+}
+
+static void server_apply_decode_directional_steering(server *s) {
+    server_apply_directional_steering(
+        s, s && (s->steering_policy == DS4_STEERING_POLICY_ALWAYS ||
+                 s->steering_policy == DS4_STEERING_POLICY_DECODING));
 }
 
 static bool should_remember_thinking_checkpoint(const request *r,
@@ -10739,6 +10754,7 @@ static void generate_job(server *s, job *j) {
                                                   responses_live_continuation,
                                                   anthropic_live_continuation);
     bool saw_final_answer_text = false;
+    server_apply_decode_directional_steering(s);
 
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
@@ -11758,7 +11774,7 @@ static void usage(FILE *fp) {
         "  --dir-steering-attn F\n"
         "      Apply steering after attention outputs. Default: 0\n"
         "  --dir-steering-policy MODE\n"
-        "      Server steering policy: always, final-answer, or off. Default: always\n"
+        "      Server steering policy: final-answer, decoding, always, or off. Default: final-answer\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
@@ -11843,6 +11859,9 @@ static directional_steering_policy parse_directional_steering_policy_arg(
         const char *s,
         const char *arg) {
     if (!strcmp(s, "always")) return DS4_STEERING_POLICY_ALWAYS;
+    if (!strcmp(s, "decoding") || !strcmp(s, "decode")) {
+        return DS4_STEERING_POLICY_DECODING;
+    }
     if (!strcmp(s, "final-answer") ||
         !strcmp(s, "final") ||
         !strcmp(s, "tool-safe"))
@@ -11854,7 +11873,7 @@ static directional_steering_policy parse_directional_steering_policy_arg(
     }
     server_log(DS4_LOG_DEFAULT, "ds4-server: invalid %s value: %s", arg, s);
     server_log(DS4_LOG_DEFAULT,
-               "ds4-server: valid directional steering policies are: always, final-answer, off");
+               "ds4-server: valid directional steering policies are: final-answer, decoding, always, off");
     exit(2);
 }
 
@@ -11870,7 +11889,7 @@ static server_config parse_options(int argc, char **argv) {
         .port = 8000,
         .ctx_size = 32768,
         .default_tokens = 393216,
-        .steering_policy = DS4_STEERING_POLICY_ALWAYS,
+        .steering_policy = DS4_STEERING_POLICY_FINAL_ANSWER,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
     };
     c.kv_cache = kv_cache_default_options();
@@ -13750,6 +13769,52 @@ static void test_anthropic_full_replay_allows_unknown_live_id(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+static void test_anthropic_tool_use_parses_before_role(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+
+    /* GitHub #127 regression: Crush can replay full Anthropic history with
+     * message objects serialized as {"content": ..., "role": ...}.  The parser
+     * must still remember prior assistant tool_use ids, otherwise old
+     * tool_result blocks are mistaken for live-only continuations and rejected
+     * once the live frontier has moved on to newer tool calls. */
+    pthread_mutex_lock(&s.tool_mu);
+    s.anthropic_live.valid = true;
+    s.anthropic_live.live_tokens = 100;
+    id_list_push_unique(&s.anthropic_live.call_ids, "toolu_current");
+    pthread_mutex_unlock(&s.tool_mu);
+
+    const char *json =
+        "["
+        "{\"content\":["
+        "{\"type\":\"tool_use\",\"id\":\"toolu_old\",\"name\":\"Bash\","
+        "\"input\":{\"command\":\"ls\"}}"
+        "],\"role\":\"assistant\"},"
+        "{\"role\":\"user\",\"content\":["
+        "{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_old\",\"content\":\"ok\"}"
+        "]},"
+        "{\"role\":\"user\",\"content\":\"continue\"}"
+        "]";
+    const char *p = json;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 3);
+    TEST_ASSERT(msgs.v[0].calls.len == 1);
+    TEST_ASSERT(msgs.v[0].calls.v[0].id &&
+                !strcmp(msgs.v[0].calls.v[0].id, "toolu_old"));
+
+    bool needs_live_tool_state = false;
+    char err[160] = {0};
+    TEST_ASSERT(anthropic_validate_tool_results(&s, &msgs,
+                                                &needs_live_tool_state,
+                                                err, sizeof(err)));
+    TEST_ASSERT(!needs_live_tool_state);
+
+    chat_msgs_free(&msgs);
+    live_tool_state_free(&s.anthropic_live);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
 static void test_tool_checkpoint_canonicalization_gate_exact_replay(void) {
     server s;
     memset(&s, 0, sizeof(s));
@@ -14060,6 +14125,16 @@ static void test_dsml_decode_state_separates_structure_and_payload(void) {
 }
 
 static void test_directional_steering_final_answer_policy_is_tool_safe(void) {
+    char *argv0[] = {"ds4-server"};
+    server_config cfg = parse_options(1, argv0);
+    TEST_ASSERT(cfg.steering_policy == DS4_STEERING_POLICY_FINAL_ANSWER);
+    TEST_ASSERT(parse_directional_steering_policy_arg("decoding", "--dir-steering-policy") ==
+                DS4_STEERING_POLICY_DECODING);
+    TEST_ASSERT(parse_directional_steering_policy_arg("decode", "--dir-steering-policy") ==
+                DS4_STEERING_POLICY_DECODING);
+    TEST_ASSERT(!strcmp(directional_steering_policy_name(DS4_STEERING_POLICY_DECODING),
+                        "decoding"));
+
     bool starts = true;
     TEST_ASSERT(directional_steering_should_apply(
         DS4_STEERING_POLICY_ALWAYS,
@@ -14074,6 +14149,19 @@ static void test_directional_steering_final_answer_policy_is_tool_safe(void) {
         0,
         &starts));
     TEST_ASSERT(starts == false);
+
+    TEST_ASSERT(directional_steering_should_apply(
+        DS4_STEERING_POLICY_DECODING,
+        false,
+        false,
+        true,
+        true,
+        DSML_DECODE_STRUCTURAL,
+        DSML_DECODE_STRING_BODY,
+        true,
+        DS4_TOOL_CALLS_START,
+        strlen(DS4_TOOL_CALLS_START),
+        NULL));
 
     starts = true;
     TEST_ASSERT(!directional_steering_should_apply(
@@ -15187,6 +15275,7 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_live_tail_renders_tool_results_only();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();
+    test_anthropic_tool_use_parses_before_role();
     test_tool_checkpoint_canonicalization_gate_exact_replay();
     test_responses_live_tail_renders_tool_outputs_only();
     test_responses_tool_output_id_validation();

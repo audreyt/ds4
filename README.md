@@ -987,6 +987,13 @@ and so forth, much faster than fine-tuning.
 This is also useful for cybersecurity researchers who want to reduce a model's
 willingness to provide dual-use or offensive security guidance.
 
+For `ds4-server`, directional steering defaults to the tool-safe
+`final-answer` policy: prompt prefill, thinking tokens, and DSML tool-call
+syntax stay unsteered, while final visible answer prose uses the configured
+direction. Use `--dir-steering-policy decoding` to leave only prefill
+unsteered, `always` for the original always-on behavior, or `off` to disable
+server-side steering.
+
 For the CyberNeurova abliterated IQ2XXS-w2Q2K imatrix GGUF, the tree includes
 `dir-steering/out/uncertainty_ablit_imatrix.f32`. For the aligned-imatrix
 build, start with `--dir-steering-ffn -0.75 --dir-steering-attn 0` for the
