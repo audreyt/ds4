@@ -8702,7 +8702,8 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
 static int kv_cache_try_load_text(server *s, const char *prompt_text,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
-                                  uint8_t *loaded_ext_flags_out) {
+                                  uint8_t *loaded_ext_flags_out,
+                                  bool responses_protocol) {
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
     if (effective_prompt) effective_prompt->len = 0;
@@ -8771,12 +8772,18 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
         } else {
             ds4_session_invalidate(s->session);
             unlink(path);
-            server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache discarded corrupt text-prefix payload %s", path);
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: kv cache discarded corrupt text-prefix payload%s%s %s",
+                       responses_protocol ? " " : "",
+                       responses_protocol ? "RESPPROTO" : "",
+                       path);
         }
     } else {
         if (header_ok) ds4_session_invalidate(s->session);
         server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: kv cache load failed %s: %s load=%.1f ms",
+                   "ds4-server: kv cache load failed%s%s %s: %s load=%.1f ms",
+                   responses_protocol ? " " : "",
+                   responses_protocol ? "RESPPROTO" : "",
                    path,
                    header_ok ? err : fail_reason,
                    (now_sec() - load_t0) * 1000.0);
@@ -8792,12 +8799,16 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
         if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
             unlink(path);
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: kv cache hit text tokens=%d text=%u quant=%u key=%s load=%.1f ms consumed file=%s",
+                       "ds4-server: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms consumed file=%s",
+                       responses_protocol ? " " : "",
+                       responses_protocol ? "RESPPROTO" : "",
                        loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
         } else {
             kv_cache_touch_file(path, hdr.hits + 1);
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: kv cache hit text tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
+                       "ds4-server: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
+                       responses_protocol ? " " : "",
+                       responses_protocol ? "RESPPROTO" : "",
                        loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
         }
     }
@@ -8811,8 +8822,10 @@ static int kv_cache_try_load(server *s, const request *req,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
     return kv_cache_try_load_text(s, req ? req->prompt_text : NULL,
-                                  effective_prompt, loaded_path_out,
-                                  loaded_ext_flags_out);
+                                  effective_prompt,
+                                  loaded_path_out,
+                                  loaded_ext_flags_out,
+                                  req && req->api == API_RESPONSES);
 }
 
 static int live_text_prefix_prompt(server *s, const request *req,
@@ -9289,6 +9302,7 @@ typedef struct {
     char ctx[48];
     const char *phase;
     bool has_tools;
+    bool responses_protocol;
     double t0;
     double last_t;
     int last_current;
@@ -9301,7 +9315,8 @@ static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
     snprintf(buf, len, "%d..%d:%d", cached, prompt, suffix);
 }
 
-static void log_flags(char *buf, size_t len, bool tools, bool thinking,
+static void log_flags(char *buf, size_t len, bool responses_protocol,
+                      bool tools, bool thinking,
                       bool dsml_start, bool dsml_end) {
     size_t used = 0;
     buf[0] = '\0';
@@ -9309,6 +9324,7 @@ static void log_flags(char *buf, size_t len, bool tools, bool thinking,
     int n = snprintf(buf + used, used < len ? len - used : 0, "%s%s", used ? " " : "", name); \
     if (n > 0) used += (size_t)n; \
 } while (0)
+    if (responses_protocol) ADD_FLAG("RESPPROTO");
     if (tools) ADD_FLAG("TOOLS");
     if (thinking) ADD_FLAG("THINKING");
     if (dsml_start) ADD_FLAG("DSML_START");
@@ -9317,6 +9333,7 @@ static void log_flags(char *buf, size_t len, bool tools, bool thinking,
 }
 
 static void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
+                                bool responses_protocol,
                                 bool tools, bool thinking,
                                 bool dsml_start, bool dsml_end,
                                 double decode_t0,
@@ -9332,7 +9349,8 @@ static void log_decode_progress(req_kind kind, int prompt_tokens, int completion
                      prompt_tokens + *last_completion,
                      prompt_tokens + completion);
     char flags[80];
-    log_flags(flags, sizeof(flags), tools, thinking, dsml_start, dsml_end);
+    log_flags(flags, sizeof(flags), responses_protocol,
+              tools, thinking, dsml_start, dsml_end);
     server_log(DS4_LOG_GENERATION,
                "ds4-server: %s ctx=%s gen=%d%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs",
                kind == REQ_CHAT ? "chat" : "completion",
@@ -9392,7 +9410,8 @@ static bool should_remember_thinking_checkpoint(const request *r,
     return true;
 }
 
-static void log_tool_calls_summary(const char *ctx, const tool_calls *calls) {
+static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
+                                   bool responses_protocol) {
     if (!calls || calls->len == 0) return;
     buf names = {0};
     buf ids = {0};
@@ -9402,9 +9421,13 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls) {
         buf_puts(&names, calls->v[i].name ? calls->v[i].name : "?");
         buf_puts(&ids, calls->v[i].id ? calls->v[i].id : "?");
     }
+    char flags[32];
+    log_flags(flags, sizeof(flags), responses_protocol, false, false, false, false);
     server_log(DS4_LOG_TOOL,
-               "ds4-server: tool calls ctx=%s n=%d raw_dsml=%d ids=[%s] names=[%s]",
+               "ds4-server: tool calls ctx=%s%s%s n=%d raw_dsml=%d ids=[%s] names=[%s]",
                ctx,
+               flags[0] ? " " : "",
+               flags,
                calls->len,
                calls->raw_dsml && calls->raw_dsml[0] ? 1 : 0,
                ids.ptr ? ids.ptr : "",
@@ -9445,7 +9468,8 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     p->last_t = now;
     p->seen = true;
     char flags[64];
-    log_flags(flags, sizeof(flags), p->has_tools, false, false, false);
+    log_flags(flags, sizeof(flags), p->responses_protocol,
+              p->has_tools, false, false, false);
     const char *phase = p->phase ? p->phase : "prefill";
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s %s chunk %d/%d (%.1f%%) chunk=%.2f t/s avg=%.2f t/s %.3fs",
@@ -9613,7 +9637,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
         char *path = NULL;
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
-                                            &effective, &path, NULL);
+                                            &effective, &path, NULL, false);
         if (loaded == 0) ds4_session_invalidate(s->session);
 
         char sync_err[160] = {0};
@@ -9726,6 +9750,7 @@ static void generate_job(server *s, job *j) {
                         &j->req.prompt, old_pos, common);
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
+    const bool responses_protocol = j->req.api == API_RESPONSES;
     bool responses_live_continuation = false;
     bool anthropic_live_continuation = false;
     bool thinking_live_continuation = false;
@@ -9769,7 +9794,7 @@ static void generate_job(server *s, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
-    if (cached == 0 && j->req.api == API_RESPONSES &&
+    if (cached == 0 && responses_protocol &&
         j->req.responses_requires_live_tool_state)
     {
         /* The parser saw a valid live call_id, but by worker execution time the
@@ -9815,7 +9840,8 @@ static void generate_job(server *s, job *j) {
     }
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
-                   "ds4-server: live kv cache miss live=%d prompt=%d common=%d reason=%s",
+                   "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s",
+                   responses_protocol ? " RESPPROTO" : "",
                    old_pos, j->req.prompt.len, common,
                    trace_cache_miss_reason(&cache_diag));
     }
@@ -9836,7 +9862,7 @@ static void generate_job(server *s, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
-    if (j->req.api == API_RESPONSES &&
+    if (responses_protocol &&
         j->req.responses_requires_live_reasoning &&
         !(cached > 0 &&
           ((!strcmp(cache_source, "responses-visible") ||
@@ -9870,14 +9896,16 @@ static void generate_job(server *s, job *j) {
         .prompt_tokens = prompt_tokens,
         .cached_tokens = cached,
         .has_tools = j->req.has_tools,
+        .responses_protocol = responses_protocol,
         .t0 = t0,
     };
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
     char req_flags[64];
-    log_flags(req_flags, sizeof(req_flags), j->req.has_tools, false, false, false);
+    log_flags(req_flags, sizeof(req_flags), responses_protocol,
+              j->req.has_tools, false, false, false);
     if (responses_live_continuation) {
         server_log(DS4_LOG_PREFILL,
-                   "ds4-server: responses live continuation match=%s ids=%d cached=%d prompt=%d",
+                   "ds4-server: responses live continuation RESPPROTO match=%s ids=%d cached=%d prompt=%d",
                    responses_live_match ? responses_live_match : "unknown",
                    responses_live_match_ids,
                    cached,
@@ -9972,7 +10000,12 @@ static void generate_job(server *s, job *j) {
     long responses_created_at = (long)time(NULL);
     if (j->req.stream) {
         if (!sse_headers(j->fd)) {
-            server_log(DS4_LOG_GENERATION, "ds4-server: %s ctx=%s sse headers failed", j->req.kind == REQ_CHAT ? "chat" : "completion", ctx_span);
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: %s ctx=%s%s%s sse headers failed",
+                       j->req.kind == REQ_CHAT ? "chat" : "completion",
+                       ctx_span,
+                       req_flags[0] ? " " : "",
+                       req_flags);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -9994,7 +10027,11 @@ static void generate_job(server *s, job *j) {
             responses_stream_init(&j->req, &responses_live);
             responses_live.active = true;
             if (!responses_sse_created(j->fd, &j->req, &responses_live, responses_created_at)) {
-                server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s responses created event failed", ctx_span);
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: chat ctx=%s%s%s responses created event failed",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags);
                 responses_stream_free(&responses_live);
                 ds4_tokens_free(&effective_prompt);
                 return;
@@ -10169,8 +10206,10 @@ static void generate_job(server *s, job *j) {
                 if (orphan_end && !saw_orphan_tool_end) {
                     saw_orphan_tool_end = true;
                     server_log(DS4_LOG_WARNING,
-                               "ds4-server: chat ctx=%s ignored orphan tool-call end marker after %d generated tokens",
+                               "ds4-server: chat ctx=%s%s%s ignored orphan tool-call end marker after %d generated tokens",
                                ctx_span,
+                               req_flags[0] ? " " : "",
+                               req_flags,
                                completion);
                     trace_event(s, trace_id,
                                 "ignored orphan tool-call end marker after %d generated tokens",
@@ -10194,6 +10233,7 @@ static void generate_job(server *s, job *j) {
 
             if (completion >= next_decode_log) {
                 log_decode_progress(j->req.kind, prompt_tokens, completion,
+                                    responses_protocol,
                                     j->req.has_tools,
                                     thinking.inside,
                                     saw_tool_start,
@@ -10240,6 +10280,7 @@ static void generate_job(server *s, job *j) {
 
     if (completion > last_decode_log_completion) {
         log_decode_progress(j->req.kind, prompt_tokens, completion,
+                            responses_protocol,
                             j->req.has_tools,
                             thinking.inside,
                             saw_tool_start,
@@ -10274,8 +10315,10 @@ static void generate_job(server *s, job *j) {
             &recovered_tool_parse_failure);
         if (!parsed_ok && recovered_tool_parse_failure) {
             server_log(DS4_LOG_WARNING,
-                       "ds4-server: chat ctx=%s invalid tool call returned as assistant text finish=%s",
+                       "ds4-server: chat ctx=%s%s%s invalid tool call returned as assistant text finish=%s",
                        ctx_span,
+                       req_flags[0] ? " " : "",
+                       req_flags,
                        final_finish);
             trace_event(s, trace_id,
                         "invalid tool call returned as assistant text finish=%s",
@@ -10290,7 +10333,8 @@ static void generate_job(server *s, job *j) {
             responses_live_clear(s);
         }
     }
-    log_tool_calls_summary(ctx_span, &parsed_calls);
+    log_tool_calls_summary(ctx_span, &parsed_calls,
+                           responses_protocol);
 
     trace_finish(s, trace_id, &j->req, final_finish, completion,
                  saw_tool_start, saw_tool_end,
@@ -10389,9 +10433,11 @@ static void generate_job(server *s, job *j) {
         }
         if (!response_ok) {
             server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: %s ctx=%s final stream failed",
+                       "ds4-server: %s ctx=%s%s%s final stream failed",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
-                       ctx_span);
+                       ctx_span,
+                       req_flags[0] ? " " : "",
+                       req_flags);
         }
     } else if (j->req.api == API_ANTHROPIC) {
         anthropic_final_response(j->fd, &j->req, id,
@@ -10415,6 +10461,7 @@ static void generate_job(server *s, job *j) {
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
         log_flags(flags, sizeof(flags),
+                  responses_protocol,
                   true,
                   thinking.inside,
                   saw_tool_start,
@@ -10442,6 +10489,7 @@ static void generate_job(server *s, job *j) {
     } else {
         char flags[80];
         log_flags(flags, sizeof(flags),
+                  responses_protocol,
                   j->req.has_tools,
                   thinking.inside,
                   false,
