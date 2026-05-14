@@ -551,6 +551,9 @@ typedef struct {
     char *content;
     char *reasoning;
     char *tool_call_id;
+    char **tool_call_ids;
+    int tool_call_ids_len;
+    int tool_call_ids_cap;
     tool_calls calls;
 } chat_msg;
 
@@ -575,7 +578,9 @@ typedef struct {
 static void stop_list_clear(stop_list *stops);
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
+static void id_list_free(stop_list *ids);
 static bool responses_live_has_call_id(server *s, const char *id);
+static bool anthropic_live_has_call_id(server *s, const char *id);
 
 typedef struct {
     req_kind kind;
@@ -620,6 +625,9 @@ typedef struct {
     bool responses_requires_live_reasoning;
     stop_list responses_live_call_ids;
     char *responses_live_suffix_text;
+    bool anthropic_requires_live_tool_state;
+    stop_list anthropic_live_call_ids;
+    char *anthropic_live_suffix_text;
     tool_replay_stats tool_replay;
 } request;
 
@@ -703,11 +711,27 @@ static void tool_calls_push(tool_calls *calls, tool_call tc) {
     calls->v[calls->len++] = tc;
 }
 
+static void chat_msg_add_tool_call_id(chat_msg *m, const char *id) {
+    if (!m || !id || !id[0]) return;
+    if (!m->tool_call_id) m->tool_call_id = xstrdup(id);
+    for (int i = 0; i < m->tool_call_ids_len; i++) {
+        if (m->tool_call_ids[i] && !strcmp(m->tool_call_ids[i], id)) return;
+    }
+    if (m->tool_call_ids_len == m->tool_call_ids_cap) {
+        m->tool_call_ids_cap = m->tool_call_ids_cap ? m->tool_call_ids_cap * 2 : 2;
+        m->tool_call_ids = xrealloc(m->tool_call_ids,
+            (size_t)m->tool_call_ids_cap * sizeof(m->tool_call_ids[0]));
+    }
+    m->tool_call_ids[m->tool_call_ids_len++] = xstrdup(id);
+}
+
 static void chat_msg_free(chat_msg *m) {
     free(m->role);
     free(m->content);
     free(m->reasoning);
     free(m->tool_call_id);
+    for (int i = 0; i < m->tool_call_ids_len; i++) free(m->tool_call_ids[i]);
+    free(m->tool_call_ids);
     tool_calls_free(&m->calls);
     memset(m, 0, sizeof(*m));
 }
@@ -799,6 +823,9 @@ static void request_free(request *r) {
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
+    stop_list_clear(&r->anthropic_live_call_ids);
+    free(r->anthropic_live_call_ids.v);
+    free(r->anthropic_live_suffix_text);
     tool_schema_orders_free(&r->tool_orders);
     memset(r, 0, sizeof(*r));
 }
@@ -1652,11 +1679,13 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
                     goto fail;
                 }
             } else if (!strcmp(key, "tool_call_id")) {
-                free(msg.tool_call_id);
-                if (!json_string(p, &msg.tool_call_id)) {
+                char *id = NULL;
+                if (!json_string(p, &id)) {
                     free(key);
                     goto fail;
                 }
+                chat_msg_add_tool_call_id(&msg, id);
+                free(id);
             } else if (!strcmp(key, "tool_calls")) {
                 tool_calls_free(&msg.calls);
                 if (!parse_tool_calls_value(p, &msg.calls)) {
@@ -1785,6 +1814,7 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
         tc.arguments = input ? xstrdup(input) : xstrdup("{}");
         tool_calls_push(&msg->calls, tc);
     } else if (type && !strcmp(type, "tool_result")) {
+        chat_msg_add_tool_call_id(msg, id);
         buf b = {0};
         buf_puts(&b, msg->content ? msg->content : "");
         buf_puts(&b, "<tool_result>");
@@ -2350,14 +2380,14 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
 }
 
 /* Render only the semantic tail that must be appended to the live KV for a
- * Responses continuation.
+ * tool-result continuation.
  *
- * In the common Codex/pi tool path, the previous assistant tool-call turn is
- * already in the model session, including hidden thinking.  The next request
- * only provides function_call_output/custom_tool_call_output items, sometimes
- * inside a full visible replay and sometimes as a short tail.  Re-rendering the
- * assistant call here would duplicate it and destroy cache alignment, so this
- * function starts at the first new item and emits only:
+ * In the common agent tool path, the previous assistant tool-call turn is
+ * already in the model session, including hidden thinking and exact sampled
+ * DSML.  The next request provides only the tool results, either as OpenAI
+ * Responses tool-output items or Anthropic user content blocks.  Re-rendering
+ * the assistant call here would duplicate it and destroy cache alignment, so
+ * this function starts at the first new item and emits only:
  *
  *   previous EOS, tool results, and the next assistant prefix.
  *
@@ -2365,8 +2395,8 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
  * suffix tokenization happens later after the cache decision, using the live
  * token prefix as the boundary.  That avoids BPE merges across the visible
  * replay/live-KV boundary. */
-static char *render_responses_live_tail(const chat_msgs *msgs, int start,
-                                        ds4_think_mode think_mode) {
+static char *render_live_tool_tail(const chat_msgs *msgs, int start,
+                                   ds4_think_mode think_mode) {
     const bool think = ds4_think_mode_enabled(think_mode);
     buf out = {0};
     buf_puts(&out, "<｜end▁of▁sentence｜>");
@@ -2423,6 +2453,14 @@ static bool chat_msg_has_call_id(const chat_msg *m, const char *id) {
     return false;
 }
 
+static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
+    if (!m || !ids) return;
+    id_list_push_unique(ids, m->tool_call_id);
+    for (int i = 0; i < m->tool_call_ids_len; i++) {
+        id_list_push_unique(ids, m->tool_call_ids[i]);
+    }
+}
+
 static const chat_msg *responses_find_prior_call_msg(const chat_msgs *msgs,
                                                      int before,
                                                      const char *id) {
@@ -2442,11 +2480,13 @@ static const chat_msg *responses_find_prior_call_msg(const chat_msgs *msgs,
  *
  * Case 1 is the fast, protocol-native continuation path: keep the live KV and
  * append only the tool result.  Case 2 is stateless replay after restart or
- * branching.  In thinking mode, case 2 is only complete if the replay also
- * carries reasoning state for the assistant call.  Official Responses clients
- * can do this with reasoning items / encrypted reasoning content; a visible
- * transcript alone is not enough because it omits hidden tokens that affected
- * the next-token distribution. */
+ * branching.  In thinking mode, case 2 is less faithful if the replay omits
+ * reasoning state for the assistant call.  Official Responses clients can
+ * carry that state with reasoning items / encrypted reasoning content; when
+ * they do not, the request is still renderable as visible history.  Mark that
+ * condition so generate_job() can prefer live / visible checkpoints and emit a
+ * warning if it must fall back to visible replay instead of aborting the
+ * session. */
 static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
                                             ds4_think_mode think_mode,
                                             bool *requires_live_tool_state,
@@ -2459,25 +2499,31 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (strcmp(m->role, "tool") && strcmp(m->role, "function")) continue;
-        if (!m->tool_call_id || !m->tool_call_id[0]) continue;
 
-        const bool live_known = responses_live_has_call_id(s, m->tool_call_id);
-        const chat_msg *prior = responses_find_prior_call_msg(msgs, i, m->tool_call_id);
-        if (!live_known && !prior) {
-            snprintf(err, errlen,
-                     "unknown tool output call_id %s; replay full Responses history",
-                     m->tool_call_id);
-            return false;
+        stop_list ids = {0};
+        chat_msg_collect_tool_call_ids(m, &ids);
+        for (int j = 0; j < ids.len; j++) {
+            const char *id = ids.v[j];
+            const bool live_known = responses_live_has_call_id(s, id);
+            const chat_msg *prior = responses_find_prior_call_msg(msgs, i, id);
+            if (!live_known && !prior) {
+                snprintf(err, errlen,
+                         "Responses continuation state is not available for call_id %s; retry by replaying the full input history",
+                         id);
+                id_list_free(&ids);
+                return false;
+            }
+            if (!prior) {
+                if (requires_live_tool_state) *requires_live_tool_state = true;
+                continue;
+            }
+            if (needs_reasoning &&
+                (!prior->reasoning || !prior->reasoning[0]))
+            {
+                if (requires_live_reasoning) *requires_live_reasoning = true;
+            }
         }
-        if (!prior) {
-            if (requires_live_tool_state) *requires_live_tool_state = true;
-            continue;
-        }
-        if (needs_reasoning &&
-            (!prior->reasoning || !prior->reasoning[0]))
-        {
-            if (requires_live_reasoning) *requires_live_reasoning = true;
-        }
+        id_list_free(&ids);
     }
     return true;
 }
@@ -2510,14 +2556,92 @@ static void responses_prepare_live_continuation(request *r,
         }
     } else {
         for (int i = tail_start; i < msgs->len; i++) {
-            id_list_push_unique(&r->responses_live_call_ids, msgs->v[i].tool_call_id);
+            chat_msg_collect_tool_call_ids(&msgs->v[i], &r->responses_live_call_ids);
         }
     }
     if (r->responses_live_call_ids.len == 0) return;
 
     free(r->responses_live_suffix_text);
     r->responses_live_suffix_text =
-        render_responses_live_tail(msgs, tail_start, r->think_mode);
+        render_live_tool_tail(msgs, tail_start, r->think_mode);
+}
+
+static bool anthropic_msg_is_tool_result_tail(const chat_msg *m) {
+    return m && !strcmp(m->role, "user") &&
+           ((m->tool_call_id && m->tool_call_id[0]) ||
+            m->tool_call_ids_len > 0);
+}
+
+/* Validate Anthropic tool results before rendering.
+ *
+ * A tool_result.tool_use_id is valid if it is either still bound to the live
+ * Anthropic assistant tool-call frontier or the same request replays the prior
+ * assistant tool_use block.  The first case is the fast path: keep the sampled
+ * KV and append only the tool-result suffix.  The second case is a normal
+ * stateless replay, where exact DSML tool memory can restore the sampled tool
+ * bytes before prefix matching.  A tool-result-only request with an unknown
+ * live id has no safe prefix to reconstruct, so report a clear client error. */
+static bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
+                                            bool *requires_live_tool_state,
+                                            char *err, size_t errlen) {
+    if (requires_live_tool_state) *requires_live_tool_state = false;
+    if (!msgs) return true;
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!anthropic_msg_is_tool_result_tail(m)) continue;
+
+        stop_list ids = {0};
+        chat_msg_collect_tool_call_ids(m, &ids);
+        for (int j = 0; j < ids.len; j++) {
+            const char *id = ids.v[j];
+            const bool live_known = anthropic_live_has_call_id(s, id);
+            const chat_msg *prior = responses_find_prior_call_msg(msgs, i, id);
+            if (!live_known && !prior) {
+                snprintf(err, errlen,
+                         "Anthropic continuation state is not available for tool_use_id %s; retry by replaying the full messages history",
+                         id);
+                id_list_free(&ids);
+                return false;
+            }
+            if (!prior && requires_live_tool_state) {
+                *requires_live_tool_state = true;
+            }
+        }
+        id_list_free(&ids);
+    }
+    return true;
+}
+
+/* Prepare the Anthropic live-tool fast path.
+ *
+ * Anthropic's visible replay normally includes the assistant tool_use JSON and
+ * the user tool_result.  That replay is still only a description of what the
+ * model sampled.  If the incoming tool_result IDs match the live sampled
+ * frontier, generate_job() can skip replay matching entirely and append just
+ * EOS + tool_result + next assistant prefix to the real KV. */
+static void anthropic_prepare_live_continuation(request *r,
+                                                const chat_msgs *msgs) {
+    if (!r || r->api != API_ANTHROPIC || !msgs || msgs->len == 0) return;
+
+    int tail_end = msgs->len;
+    while (tail_end > 0 && role_is_system(msgs->v[tail_end - 1].role)) tail_end--;
+    int tail_start = tail_end;
+    while (tail_start > 0 &&
+           anthropic_msg_is_tool_result_tail(&msgs->v[tail_start - 1]))
+    {
+        tail_start--;
+    }
+    if (tail_start == tail_end) return;
+
+    stop_list_clear(&r->anthropic_live_call_ids);
+    for (int i = tail_start; i < msgs->len; i++) {
+        chat_msg_collect_tool_call_ids(&msgs->v[i], &r->anthropic_live_call_ids);
+    }
+    if (r->anthropic_live_call_ids.len == 0) return;
+
+    free(r->anthropic_live_suffix_text);
+    r->anthropic_live_suffix_text =
+        render_live_tool_tail(msgs, tail_start, r->think_mode);
 }
 
 /* The API parsers are intentionally selective JSON parsers: they keep only
@@ -2873,8 +2997,19 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    if (!anthropic_validate_tool_results(s, &msgs,
+                                         &r->anthropic_requires_live_tool_state,
+                                         err, errlen))
+    {
+        chat_msgs_free(&msgs);
+        free(system);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    anthropic_prepare_live_continuation(r, &msgs);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
@@ -3023,8 +3158,9 @@ fail:
  *   - For reasoning models, the replay must also include reasoning state.  DS4
  *     can render plain reasoning summaries/content, but it cannot decrypt
  *     reasoning.encrypted_content.  If live state is unavailable and the replay
- *     only contains visible messages/tool calls, later validation marks it
- *     incomplete and the request is rejected.
+ *     only contains visible messages/tool calls, later validation marks it as a
+ *     lower-fidelity replay; generate_job() logs that and continues from the
+ *     visible transcript rather than killing a recoverable agent session.
  *
  * Reasoning items are merged into the next assistant message so
  * render_chat_prompt_text can wrap them in <think>. */
@@ -3340,9 +3476,7 @@ item_fail:
             msg.content = output ? output : xstrdup("");
             output = NULL;
             if (call_id || item_id) {
-                msg.tool_call_id = call_id ? call_id : item_id;
-                if (call_id) call_id = NULL;
-                else item_id = NULL;
+                chat_msg_add_tool_call_id(&msg, call_id ? call_id : item_id);
             }
             chat_msgs_push(msgs, msg);
         } else if (!strcmp(t, "reasoning")) {
@@ -3435,9 +3569,7 @@ item_fail:
                                tools_json ? tools_json : "";
             msg.content = xstrdup(body);
             if (call_id || item_id) {
-                msg.tool_call_id = call_id ? call_id : item_id;
-                if (call_id) call_id = NULL;
-                else item_id = NULL;
+                chat_msg_add_tool_call_id(&msg, call_id ? call_id : item_id);
             }
             chat_msgs_push(msgs, msg);
         } else if (!is_bookkeeping) {
@@ -4569,6 +4701,7 @@ static bool http_response(int fd, int code, const char *type, const char *body) 
     const char *reason = code == 200 ? "OK" :
                          code == 400 ? "Bad Request" :
                          code == 404 ? "Not Found" :
+                         code == 409 ? "Conflict" :
                          code == 500 ? "Internal Server Error" : "Error";
     buf h = {0};
     buf_printf(&h,
@@ -4713,15 +4846,18 @@ typedef enum {
 } openai_stream_mode;
 
 typedef enum {
-    OPENAI_TOOL_BETWEEN_INVOKES,
-    OPENAI_TOOL_BETWEEN_PARAMS,
-    OPENAI_TOOL_PARAM_VALUE,
-    OPENAI_TOOL_DONE,
-    OPENAI_TOOL_ERROR,
-} openai_tool_stream_state;
+    DSML_TOOL_BETWEEN_INVOKES,
+    DSML_TOOL_BETWEEN_PARAMS,
+    DSML_TOOL_PARAM_VALUE,
+    DSML_TOOL_DONE,
+    DSML_TOOL_ERROR,
+} dsml_tool_stream_state;
 
+/* Shared states for protocol-specific DSML stream projections.  The model
+ * still samples DSML; these states only translate already-sampled bytes into
+ * OpenAI / Anthropic wire events while final parsing remains authoritative. */
 typedef struct {
-    openai_tool_stream_state state;
+    dsml_tool_stream_state state;
     const char *tool_calls_end;
     const char *invoke_start;
     const char *invoke_end;
@@ -5354,7 +5490,7 @@ static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
     openai_tool_stream_free(ts);
     memset(ts, 0, sizeof(*ts));
     ts->active = true;
-    ts->state = OPENAI_TOOL_BETWEEN_INVOKES;
+    ts->state = DSML_TOOL_BETWEEN_INVOKES;
     ts->parse_pos = pos;
     if (raw_full_lit(raw, raw_len, pos, DS4_TOOL_CALLS_START)) {
         ts->parse_pos += strlen(DS4_TOOL_CALLS_START);
@@ -5379,7 +5515,7 @@ static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
         ts->param_end = "</parameter>";
     } else {
         ts->active = false;
-        ts->state = OPENAI_TOOL_ERROR;
+        ts->state = DSML_TOOL_ERROR;
         return false;
     }
     return true;
@@ -5387,7 +5523,7 @@ static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
 
 static bool openai_tool_stream_fail(openai_tool_stream *ts) {
     ts->active = false;
-    ts->state = OPENAI_TOOL_ERROR;
+    ts->state = DSML_TOOL_ERROR;
     return true;
 }
 
@@ -5411,7 +5547,7 @@ static bool openai_tool_start_invoke(int fd, server *s, const request *r, const 
     ts->args_open = true;
     ts->first_param = true;
     ts->parse_pos = (size_t)(tag_end - raw) + 1;
-    ts->state = OPENAI_TOOL_BETWEEN_PARAMS;
+    ts->state = DSML_TOOL_BETWEEN_PARAMS;
     return true;
 }
 
@@ -5437,7 +5573,7 @@ static bool openai_tool_start_param(int fd, const request *r, const char *id,
 
     ts->param_is_string = string_value;
     ts->parse_pos = (size_t)(tag_end - raw) + 1;
-    ts->state = OPENAI_TOOL_PARAM_VALUE;
+    ts->state = DSML_TOOL_PARAM_VALUE;
     return true;
 }
 
@@ -5455,7 +5591,7 @@ static bool openai_tool_finish_param(int fd, const request *r, const char *id,
     if (ts->param_is_string &&
         !openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1)) return false;
     ts->parse_pos = value_end + strlen(ts->param_end);
-    ts->state = OPENAI_TOOL_BETWEEN_PARAMS;
+    ts->state = DSML_TOOL_BETWEEN_PARAMS;
     return true;
 }
 
@@ -5463,19 +5599,19 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
                                       openai_tool_stream *ts,
                                       const char *raw, size_t raw_len) {
     while (ts->active && ts->parse_pos < raw_len) {
-        if (ts->state == OPENAI_TOOL_BETWEEN_INVOKES) {
+        if (ts->state == DSML_TOOL_BETWEEN_INVOKES) {
             while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
             if (ts->parse_pos >= raw_len) return true;
             if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->tool_calls_end)) {
                 ts->parse_pos += strlen(ts->tool_calls_end);
                 ts->active = false;
-                ts->state = OPENAI_TOOL_DONE;
+                ts->state = DSML_TOOL_DONE;
                 return true;
             }
             if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->tool_calls_end, ts->invoke_start)) return true;
             if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_start)) {
                 size_t before_pos = ts->parse_pos;
-                openai_tool_stream_state before_state = ts->state;
+                dsml_tool_stream_state before_state = ts->state;
                 if (!openai_tool_start_invoke(fd, s, r, id, ts, raw, raw_len)) return false;
                 if (ts->parse_pos == before_pos && ts->state == before_state) return true;
                 continue;
@@ -5483,7 +5619,7 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
             return openai_tool_stream_fail(ts);
         }
 
-        if (ts->state == OPENAI_TOOL_BETWEEN_PARAMS) {
+        if (ts->state == DSML_TOOL_BETWEEN_PARAMS) {
             while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
             if (ts->parse_pos >= raw_len) return true;
             if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_end)) {
@@ -5492,13 +5628,13 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
                 ts->args_open = false;
                 ts->parse_pos += strlen(ts->invoke_end);
                 ts->index++;
-                ts->state = OPENAI_TOOL_BETWEEN_INVOKES;
+                ts->state = DSML_TOOL_BETWEEN_INVOKES;
                 continue;
             }
             if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->invoke_end, ts->param_start)) return true;
             if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->param_start)) {
                 size_t before_pos = ts->parse_pos;
-                openai_tool_stream_state before_state = ts->state;
+                dsml_tool_stream_state before_state = ts->state;
                 if (!openai_tool_start_param(fd, r, id, ts, raw, raw_len)) return false;
                 if (ts->parse_pos == before_pos && ts->state == before_state) return true;
                 continue;
@@ -5506,7 +5642,7 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
             return openai_tool_stream_fail(ts);
         }
 
-        if (ts->state == OPENAI_TOOL_PARAM_VALUE) {
+        if (ts->state == DSML_TOOL_PARAM_VALUE) {
             const char *end = find_lit_bounded(raw + ts->parse_pos,
                                                raw_len - ts->parse_pos,
                                                ts->param_end);
@@ -6588,6 +6724,7 @@ static bool sse_event(int fd, const char *event, const char *data) {
 typedef enum {
     ANTH_STREAM_THINKING,
     ANTH_STREAM_TEXT,
+    ANTH_STREAM_TOOL,
     ANTH_STREAM_SUPPRESS,
 } anthropic_stream_mode;
 
@@ -6595,8 +6732,27 @@ typedef enum {
     ANTH_BLOCK_NONE,
     ANTH_BLOCK_THINKING,
     ANTH_BLOCK_TEXT,
+    ANTH_BLOCK_TOOL,
 } anthropic_block_type;
 
+typedef struct {
+    dsml_tool_stream_state state;
+    const dsml_syntax *syn;
+    size_t parse_pos;
+    int index;
+    bool active;
+    bool emitted_any;
+    bool args_open;
+    bool first_param;
+    bool param_is_string;
+    char **ids;
+    int ids_cap;
+} anthropic_tool_stream;
+
+/* Anthropic streaming uses the same sampled DSML bytes that will later be
+ * parsed and remembered for exact continuation.  This state is only a wire
+ * projection: it turns an in-progress DSML block into content_block/tool_use
+ * SSE events, and never rewrites the model-visible transcript or cache key. */
 typedef struct {
     anthropic_stream_mode mode;
     anthropic_block_type open_block;
@@ -6606,6 +6762,7 @@ typedef struct {
     bool checked_think_prefix;
     bool sent_thinking;
     bool sent_text;
+    anthropic_tool_stream tool;
 } anthropic_stream;
 
 static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
@@ -6629,6 +6786,55 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
     return ok;
 }
 
+static void anthropic_tool_stream_free(anthropic_tool_stream *ts) {
+    if (!ts) return;
+    for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
+    free(ts->ids);
+    ts->ids = NULL;
+    ts->ids_cap = 0;
+}
+
+static void anthropic_stream_free(anthropic_stream *st) {
+    if (!st) return;
+    anthropic_tool_stream_free(&st->tool);
+}
+
+static bool anthropic_tool_stream_has_id(const anthropic_tool_stream *ts,
+                                         const char *id, int upto) {
+    if (!ts || !id || !id[0]) return false;
+    if (upto > ts->ids_cap) upto = ts->ids_cap;
+    for (int i = 0; i < upto; i++) {
+        if (ts->ids[i] && !strcmp(ts->ids[i], id)) return true;
+    }
+    return false;
+}
+
+static const char *anthropic_tool_stream_id(server *s, anthropic_tool_stream *ts,
+                                            int index) {
+    if (!ts || index < 0) return "";
+    if (index >= ts->ids_cap) {
+        int old = ts->ids_cap;
+        int cap = old ? old : 4;
+        while (cap <= index) cap *= 2;
+        ts->ids = xrealloc(ts->ids, (size_t)cap * sizeof(ts->ids[0]));
+        memset(ts->ids + old, 0, (size_t)(cap - old) * sizeof(ts->ids[0]));
+        ts->ids_cap = cap;
+    }
+    if (!ts->ids[index]) {
+        char id[64];
+        for (;;) {
+            random_tool_id(id, sizeof(id), API_ANTHROPIC);
+            if (!anthropic_tool_stream_has_id(ts, id, index) &&
+                !tool_memory_has_id(s, id)) break;
+        }
+        ts->ids[index] = xstrdup(id);
+    }
+    return ts->ids[index];
+}
+
+/* Text and thinking blocks have fixed JSON shapes.  Tool blocks are opened by
+ * name later, after the DSML invoke tag is complete, so they use a dedicated
+ * opener instead of this helper. */
 static bool anthropic_sse_open_block(int fd, anthropic_stream *st,
                                      anthropic_block_type type) {
     if (st->open_block == type) return true;
@@ -6653,6 +6859,27 @@ static bool anthropic_sse_open_block(int fd, anthropic_stream *st,
     return ok;
 }
 
+static bool anthropic_sse_open_tool_block(int fd, anthropic_stream *st,
+                                          const char *tool_id,
+                                          const char *name) {
+    if (st->open_block == ANTH_BLOCK_TOOL) return true;
+    if (st->open_block != ANTH_BLOCK_NONE) return false;
+
+    buf b = {0};
+    buf_printf(&b,
+               "{\"type\":\"content_block_start\",\"index\":%d,"
+               "\"content_block\":{\"type\":\"tool_use\",\"id\":",
+               st->next_index);
+    json_escape(&b, tool_id ? tool_id : "");
+    buf_puts(&b, ",\"name\":");
+    json_escape(&b, name ? name : "");
+    buf_puts(&b, ",\"input\":{}}}");
+    bool ok = sse_event(fd, "content_block_start", b.ptr);
+    buf_free(&b);
+    if (ok) st->open_block = ANTH_BLOCK_TOOL;
+    return ok;
+}
+
 static bool anthropic_sse_delta_live(int fd, const anthropic_stream *st,
                                      anthropic_block_type type,
                                      const char *text, size_t len) {
@@ -6673,6 +6900,25 @@ static bool anthropic_sse_delta_live(int fd, const anthropic_stream *st,
         json_escape_n(&b, text, len);
         buf_puts(&b, "}}");
     }
+    bool ok = sse_event(fd, "content_block_delta", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+/* Anthropic's input_json_delta carries a fragment of a JSON object, encoded as
+ * a JSON string.  We stream exactly the same object that the final DSML parser
+ * will build: an opening "{", quoted keys, raw JSON values or escaped string
+ * contents, and the closing "}". */
+static bool anthropic_sse_tool_delta_live(int fd, const anthropic_stream *st,
+                                          const char *text, size_t len) {
+    if (len == 0) return true;
+    buf b = {0};
+    buf_printf(&b,
+               "{\"type\":\"content_block_delta\",\"index\":%d,"
+               "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":",
+               st->next_index);
+    json_escape_n(&b, text, len);
+    buf_puts(&b, "}}");
     bool ok = sse_event(fd, "content_block_delta", b.ptr);
     buf_free(&b);
     return ok;
@@ -6705,6 +6951,228 @@ static bool anthropic_sse_close_block_live(int fd, const char *id,
         st->next_index++;
     }
     return ok;
+}
+
+static bool anthropic_tool_emit_args_fragment(int fd, anthropic_stream *st,
+                                              const char *text, size_t len) {
+    return anthropic_sse_tool_delta_live(fd, st, text, len);
+}
+
+static bool anthropic_tool_emit_string_value(int fd, anthropic_stream *st,
+                                             const char *text, size_t len) {
+    if (len == 0) return true;
+    char *raw = xstrndup(text, len);
+    char *unescaped = dsml_unescape_text(raw);
+    buf frag = {0};
+    json_escape_fragment_n(&frag, unescaped, strlen(unescaped));
+    bool ok = anthropic_tool_emit_args_fragment(fd, st,
+                                                frag.ptr ? frag.ptr : "",
+                                                frag.len);
+    buf_free(&frag);
+    free(unescaped);
+    free(raw);
+    return ok;
+}
+
+static bool anthropic_tool_emit_param_prefix(int fd, anthropic_stream *st,
+                                             const char *name, bool is_string) {
+    anthropic_tool_stream *ts = &st->tool;
+    buf frag = {0};
+    if (ts->first_param) ts->first_param = false;
+    else buf_putc(&frag, ',');
+    json_escape(&frag, name ? name : "");
+    buf_putc(&frag, ':');
+    if (is_string) buf_putc(&frag, '"');
+    bool ok = anthropic_tool_emit_args_fragment(fd, st,
+                                                frag.ptr ? frag.ptr : "",
+                                                frag.len);
+    buf_free(&frag);
+    return ok;
+}
+
+/* The parser below mirrors the OpenAI tool-delta parser but keeps Anthropic's
+ * content-block lifecycle local.  A callback abstraction would save lines, but
+ * it would hide the different block/stop semantics that make this code easy to
+ * audit when a client reports a streaming regression. */
+static bool anthropic_tool_stream_init(anthropic_tool_stream *ts,
+                                       const char *raw, size_t raw_len,
+                                       size_t pos) {
+    anthropic_tool_stream_free(ts);
+    memset(ts, 0, sizeof(*ts));
+    ts->active = true;
+    ts->state = DSML_TOOL_BETWEEN_INVOKES;
+    for (size_t i = 0; i < sizeof(dsml_syntaxes) / sizeof(dsml_syntaxes[0]); i++) {
+        const dsml_syntax *syn = &dsml_syntaxes[i];
+        if (raw_full_lit(raw, raw_len, pos, syn->tool_calls_start)) {
+            ts->syn = syn;
+            ts->parse_pos = pos + strlen(syn->tool_calls_start);
+            return true;
+        }
+    }
+    ts->active = false;
+    ts->state = DSML_TOOL_ERROR;
+    return false;
+}
+
+static bool anthropic_tool_stream_fail(anthropic_tool_stream *ts) {
+    ts->active = false;
+    ts->state = DSML_TOOL_ERROR;
+    return true;
+}
+
+static bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
+                                        const char *raw, size_t raw_len) {
+    anthropic_tool_stream *ts = &st->tool;
+    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    if (!tag_end) return true;
+    char *tag = xstrndup(raw + ts->parse_pos,
+                         (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    char *name = dsml_attr(tag, "name");
+    free(tag);
+    if (!name) return anthropic_tool_stream_fail(ts);
+
+    /* This id is already visible to the client.  After final parsing,
+     * apply_anthropic_stream_tool_ids() copies it into the parsed tool_call
+     * before tool_memory_remember(), so the next tool_result can continue from
+     * the live KV state instead of re-rendering canonical JSON. */
+    const char *tool_id = anthropic_tool_stream_id(s, ts, ts->index);
+    bool ok = anthropic_sse_open_tool_block(fd, st, tool_id, name) &&
+              anthropic_tool_emit_args_fragment(fd, st, "{", 1);
+    free(name);
+    if (!ok) return false;
+
+    ts->emitted_any = true;
+    ts->args_open = true;
+    ts->first_param = true;
+    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->state = DSML_TOOL_BETWEEN_PARAMS;
+    return true;
+}
+
+static bool anthropic_tool_start_param(int fd, anthropic_stream *st,
+                                       const char *raw, size_t raw_len) {
+    anthropic_tool_stream *ts = &st->tool;
+    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    if (!tag_end) return true;
+    char *tag = xstrndup(raw + ts->parse_pos,
+                         (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    char *name = dsml_attr(tag, "name");
+    char *is_string = dsml_attr(tag, "string");
+    free(tag);
+    if (!name || !is_string) {
+        free(name);
+        free(is_string);
+        return anthropic_tool_stream_fail(ts);
+    }
+    bool string_value = !strcmp(is_string, "true");
+    bool ok = anthropic_tool_emit_param_prefix(fd, st, name, string_value);
+    free(name);
+    free(is_string);
+    if (!ok) return false;
+
+    ts->param_is_string = string_value;
+    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->state = DSML_TOOL_PARAM_VALUE;
+    return true;
+}
+
+static bool anthropic_tool_finish_param(int fd, anthropic_stream *st,
+                                        const char *raw, size_t value_end) {
+    anthropic_tool_stream *ts = &st->tool;
+    if (value_end > ts->parse_pos) {
+        bool ok = ts->param_is_string ?
+            anthropic_tool_emit_string_value(fd, st, raw + ts->parse_pos,
+                                             value_end - ts->parse_pos) :
+            anthropic_tool_emit_args_fragment(fd, st, raw + ts->parse_pos,
+                                              value_end - ts->parse_pos);
+        if (!ok) return false;
+    }
+    if (ts->param_is_string &&
+        !anthropic_tool_emit_args_fragment(fd, st, "\"", 1)) return false;
+    ts->parse_pos = value_end + strlen(ts->syn->param_end);
+    ts->state = DSML_TOOL_BETWEEN_PARAMS;
+    return true;
+}
+
+static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
+                                         anthropic_stream *st,
+                                         const char *raw, size_t raw_len) {
+    anthropic_tool_stream *ts = &st->tool;
+    while (ts->active && ts->parse_pos < raw_len) {
+        if (ts->state == DSML_TOOL_BETWEEN_INVOKES) {
+            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            if (ts->parse_pos >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->tool_calls_end)) {
+                ts->parse_pos += strlen(ts->syn->tool_calls_end);
+                ts->active = false;
+                ts->state = DSML_TOOL_DONE;
+                return true;
+            }
+            if (raw_partial_any(raw, raw_len, ts->parse_pos,
+                                ts->syn->tool_calls_end, ts->syn->invoke_start)) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->invoke_start)) {
+                size_t before_pos = ts->parse_pos;
+                dsml_tool_stream_state before_state = ts->state;
+                if (!anthropic_tool_start_invoke(fd, s, st, raw, raw_len)) return false;
+                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                continue;
+            }
+            return anthropic_tool_stream_fail(ts);
+        }
+
+        if (ts->state == DSML_TOOL_BETWEEN_PARAMS) {
+            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            if (ts->parse_pos >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->invoke_end)) {
+                if (ts->args_open &&
+                    !anthropic_tool_emit_args_fragment(fd, st, "}", 1)) return false;
+                ts->args_open = false;
+                if (!anthropic_sse_close_block_live(fd, id, st)) return false;
+                ts->parse_pos += strlen(ts->syn->invoke_end);
+                ts->index++;
+                ts->state = DSML_TOOL_BETWEEN_INVOKES;
+                continue;
+            }
+            if (raw_partial_any(raw, raw_len, ts->parse_pos,
+                                ts->syn->invoke_end, ts->syn->param_start)) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->param_start)) {
+                size_t before_pos = ts->parse_pos;
+                dsml_tool_stream_state before_state = ts->state;
+                if (!anthropic_tool_start_param(fd, st, raw, raw_len)) return false;
+                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                continue;
+            }
+            return anthropic_tool_stream_fail(ts);
+        }
+
+        if (ts->state == DSML_TOOL_PARAM_VALUE) {
+            const char *end = find_lit_bounded(raw + ts->parse_pos,
+                                               raw_len - ts->parse_pos,
+                                               ts->syn->param_end);
+            if (end) {
+                if (!anthropic_tool_finish_param(fd, st, raw,
+                                                 (size_t)(end - raw))) return false;
+                continue;
+            }
+            size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
+                                                            raw_len,
+                                                            ts->syn->param_end,
+                                                            ts->param_is_string);
+            if (limit > ts->parse_pos) {
+                bool ok = ts->param_is_string ?
+                    anthropic_tool_emit_string_value(fd, st, raw + ts->parse_pos,
+                                                     limit - ts->parse_pos) :
+                    anthropic_tool_emit_args_fragment(fd, st, raw + ts->parse_pos,
+                                                      limit - ts->parse_pos);
+                if (!ok) return false;
+                ts->parse_pos = limit;
+            }
+            return true;
+        }
+
+        return true;
+    }
+    return true;
 }
 
 static size_t text_stream_safe_limit(const char *raw, size_t start,
@@ -6748,7 +7216,7 @@ static size_t text_stream_safe_limit(const char *raw, size_t start,
     return utf8_stream_safe_len(raw, start, limit, final);
 }
 
-static bool anthropic_sse_stream_update(int fd, const request *r, const char *id,
+static bool anthropic_sse_stream_update(int fd, server *s, const request *r, const char *id,
                                         anthropic_stream *st,
                                         const char *raw, size_t raw_len,
                                         bool final) {
@@ -6819,11 +7287,25 @@ static bool anthropic_sse_stream_update(int fd, const request *r, const char *id
         if (tool) {
             if (!anthropic_sse_close_block_live(fd, id, st)) return false;
             st->emit_pos = (size_t)(tool - raw);
-            st->mode = ANTH_STREAM_SUPPRESS;
+            /* On normal token-by-token updates, switch from hidden text to a
+             * live tool_use projection as soon as the DSML block starts.  On
+             * final catch-up from plain text, leave the block for the existing
+             * final emitter so old non-incremental behavior stays unchanged. */
+            if (!final &&
+                anthropic_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
+                st->mode = ANTH_STREAM_TOOL;
+            } else {
+                st->mode = ANTH_STREAM_SUPPRESS;
+            }
         } else if (final) {
             if (!anthropic_sse_close_block_live(fd, id, st)) return false;
             st->mode = ANTH_STREAM_SUPPRESS;
         }
+    }
+
+    if (st->mode == ANTH_STREAM_TOOL) {
+        if (!anthropic_tool_stream_update(fd, s, id, st, raw, raw_len)) return false;
+        if (!st->tool.active) st->mode = ANTH_STREAM_SUPPRESS;
     }
     return true;
 }
@@ -6835,7 +7317,13 @@ static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char 
     if (!calls) return true;
 
     buf b = {0};
-    for (int i = 0; i < calls->len; i++, st->next_index++) {
+    /* Tool calls completed by anthropic_tool_stream_update() have already
+     * produced start/delta/stop events.  Only emit the tail calls that were not
+     * seen by the live projection, for example if the first DSML bytes only
+     * become available during final flush. */
+    int already_streamed = st->tool.emitted_any ? st->tool.index : 0;
+    if (already_streamed > calls->len) already_streamed = calls->len;
+    for (int i = already_streamed; i < calls->len; i++, st->next_index++) {
         const tool_call *tc = &calls->v[i];
         char idbuf[128];
         snprintf(idbuf, sizeof(idbuf), "toolu_%s_%d", id, i);
@@ -6883,11 +7371,11 @@ static bool anthropic_sse_stop_live(int fd, const char *finish,
     return ok;
 }
 
-static bool anthropic_sse_finish_live(int fd, const request *r, const char *id,
+static bool anthropic_sse_finish_live(int fd, server *s, const request *r, const char *id,
                                       anthropic_stream *st, const char *raw,
                                       size_t raw_len, const tool_calls *calls,
                                       const char *finish, int completion_tokens) {
-    if (!anthropic_sse_stream_update(fd, r, id, st, raw, raw_len, true)) return false;
+    if (!anthropic_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
 
     if (st->sent_thinking && !st->sent_text && (!calls || calls->len == 0)) {
         if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
@@ -7015,23 +7503,20 @@ typedef struct {
 
 typedef struct {
     bool valid;
-    /* Token frontier of the live model session after the last successful
-     * Responses assistant turn.  Continuing from this point preserves hidden
-     * thinking and sampled DSML bytes that are not necessarily present in the
-     * client-visible replay. */
+    /* Token frontier of a live assistant tool-call turn. Continuing from this
+     * point preserves hidden thinking and sampled DSML bytes that are not
+     * necessarily present in the client-visible replay. */
     int live_tokens;
-    /* Rendered conversation text that the client is expected to replay.  This
-     * is deliberately the visible protocol transcript, not a dump of live KV:
-     * when reasoning summaries are not requested, hidden thinking is omitted.
-     * If a later request starts with this text, DS4 can continue from
-     * live_tokens and tokenize only the new suffix. */
+    /* Optional rendered conversation text that the client is expected to replay.
+     * Responses uses this because visible replay can omit hidden reasoning.
+     * Anthropic currently uses only the call-id side of the state. */
     char *visible_text;
     size_t visible_len;
-    /* Tool-call ids generated at the same live frontier.  A following
-     * function_call_output/custom_tool_call_output for these ids is a direct
-     * protocol continuation and should not trigger prompt-prefix matching. */
+    /* Tool-call ids generated at the same live frontier. A following tool
+     * result for these ids is a direct protocol continuation and should not
+     * trigger prompt-prefix matching or checkpoint canonicalization. */
     stop_list call_ids;
-} responses_live_state;
+} live_tool_state;
 
 typedef struct {
     bool valid;
@@ -7053,7 +7538,8 @@ struct server {
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
-    responses_live_state responses_live;
+    live_tool_state responses_live;
+    live_tool_state anthropic_live;
     visible_live_state thinking_live;
     bool disable_exact_dsml_tool_replay;
     pthread_mutex_t tool_mu;
@@ -7270,15 +7756,14 @@ static void tool_memory_free(tool_memory *m) {
     memset(m, 0, sizeof(*m));
 }
 
-/* Single live Responses state.
+/* Single live protocol-tool state.
  *
- * This is not an implementation of persistent previous_response_id or the
- * Conversations API.  DS4 currently rejects those durable-state parameters.
- * The state below is only an in-memory optimization for the current local
- * session, where the next request is expected to arrive immediately from the
- * same agent loop.  If it does not match, DS4 falls back to the same prefix and
- * disk-cache machinery used by chat/completions. */
-static void responses_live_clear_locked(responses_live_state *st) {
+ * This is not an implementation of durable remote conversation storage.  It is
+ * only an in-memory binding from protocol tool-call IDs to the current sampled
+ * KV frontier.  If it does not match, DS4 falls back to the same prefix and
+ * disk-cache machinery used by chat/completions, or returns a clear error for
+ * tool-result-only requests that have no replayable prefix. */
+static void live_tool_state_clear_locked(live_tool_state *st) {
     if (!st) return;
     stop_list_clear(&st->call_ids);
     free(st->visible_text);
@@ -7288,9 +7773,9 @@ static void responses_live_clear_locked(responses_live_state *st) {
     st->live_tokens = 0;
 }
 
-static void responses_live_free(responses_live_state *st) {
+static void live_tool_state_free(live_tool_state *st) {
     if (!st) return;
-    responses_live_clear_locked(st);
+    live_tool_state_clear_locked(st);
     free(st->call_ids.v);
     memset(st, 0, sizeof(*st));
 }
@@ -7332,7 +7817,7 @@ static void responses_live_remember(server *s, const char *visible_text,
                                     const tool_calls *calls) {
     if (!s || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
-    responses_live_clear_locked(&s->responses_live);
+    live_tool_state_clear_locked(&s->responses_live);
     s->responses_live.visible_text = xstrdup(visible_text);
     s->responses_live.visible_len = strlen(visible_text);
     if (calls) {
@@ -7345,10 +7830,29 @@ static void responses_live_remember(server *s, const char *visible_text,
     pthread_mutex_unlock(&s->tool_mu);
 }
 
+static void anthropic_live_remember(server *s, const tool_calls *calls) {
+    if (!s || !calls || calls->len == 0) return;
+    pthread_mutex_lock(&s->tool_mu);
+    live_tool_state_clear_locked(&s->anthropic_live);
+    for (int i = 0; i < calls->len; i++) {
+        id_list_push_unique(&s->anthropic_live.call_ids, calls->v[i].id);
+    }
+    s->anthropic_live.live_tokens = ds4_session_pos(s->session);
+    s->anthropic_live.valid = s->anthropic_live.call_ids.len > 0;
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
 static void responses_live_clear(server *s) {
     if (!s) return;
     pthread_mutex_lock(&s->tool_mu);
-    responses_live_clear_locked(&s->responses_live);
+    live_tool_state_clear_locked(&s->responses_live);
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+static void anthropic_live_clear(server *s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->tool_mu);
+    live_tool_state_clear_locked(&s->anthropic_live);
     pthread_mutex_unlock(&s->tool_mu);
 }
 
@@ -7357,6 +7861,15 @@ static bool responses_live_has_call_id(server *s, const char *id) {
     pthread_mutex_lock(&s->tool_mu);
     bool found = s->responses_live.valid &&
                  id_list_contains(&s->responses_live.call_ids, id);
+    pthread_mutex_unlock(&s->tool_mu);
+    return found;
+}
+
+static bool anthropic_live_has_call_id(server *s, const char *id) {
+    if (!s || !id || !id[0]) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    bool found = s->anthropic_live.valid &&
+                 id_list_contains(&s->anthropic_live.call_ids, id);
     pthread_mutex_unlock(&s->tool_mu);
     return found;
 }
@@ -7370,6 +7883,20 @@ static bool responses_live_matches_request(server *s, const stop_list *ids,
               s->responses_live.call_ids.len == ids->len;
     for (int i = 0; ok && i < ids->len; i++) {
         ok = id_list_contains(&s->responses_live.call_ids, ids->v[i]);
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return ok;
+}
+
+static bool anthropic_live_matches_request(server *s, const stop_list *ids,
+                                           int live_tokens) {
+    if (!s || !ids || ids->len == 0) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    bool ok = s->anthropic_live.valid &&
+              s->anthropic_live.live_tokens == live_tokens &&
+              s->anthropic_live.call_ids.len == ids->len;
+    for (int i = 0; ok && i < ids->len; i++) {
+        ok = id_list_contains(&s->anthropic_live.call_ids, ids->v[i]);
     }
     pthread_mutex_unlock(&s->tool_mu);
     return ok;
@@ -7515,8 +8042,22 @@ static void apply_openai_stream_tool_ids(tool_calls *calls,
     }
 }
 
+static void apply_anthropic_stream_tool_ids(tool_calls *calls,
+                                            const anthropic_stream *st) {
+    if (!calls || !st) return;
+    /* The SSE stream may have exposed tool ids before final DSML parsing.  The
+     * parsed calls must inherit those ids before assign_tool_call_ids() and
+     * tool_memory_remember(), otherwise the client returns a tool_result for an
+     * id that the continuation fast path does not know. */
+    int n = calls->len < st->tool.ids_cap ? calls->len : st->tool.ids_cap;
+    for (int i = 0; i < n; i++) {
+        if (calls->v[i].id && calls->v[i].id[0]) continue;
+        if (st->tool.ids[i] && st->tool.ids[i][0]) calls->v[i].id = xstrdup(st->tool.ids[i]);
+    }
+}
+
 /* =========================================================================
- * Disk KV Cache.
+ * KV Cache.
  * =========================================================================
  *
  * The server has one live Metal session.  We persist reusable DS4 session
@@ -7769,6 +8310,10 @@ static void id_list_free(stop_list *ids) {
 static void collect_tool_call_ids(const chat_msgs *msgs, stop_list *ids) {
     if (!msgs || !ids) return;
     for (int i = 0; i < msgs->len; i++) {
+        id_list_push_unique(ids, msgs->v[i].tool_call_id);
+        for (int j = 0; j < msgs->v[i].tool_call_ids_len; j++) {
+            id_list_push_unique(ids, msgs->v[i].tool_call_ids[j]);
+        }
         const tool_calls *calls = &msgs->v[i].calls;
         for (int j = 0; j < calls->len; j++) {
             id_list_push_unique(ids, calls->v[j].id);
@@ -8161,8 +8706,11 @@ static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live) {
         kv_entry e = kc->entry[victim];
         if (unlink(e.path) == 0) {
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: kv cache evicted tokens=%u hits=%u size=%.2f MiB",
-                       e.tokens, e.hits, (double)e.file_size / (1024.0 * 1024.0));
+                       "ds4-server: kv cache evicted reason=disk-cache-full tokens=%u hits=%u size=%.2f MiB file=%s",
+                       e.tokens,
+                       e.hits,
+                       (double)e.file_size / (1024.0 * 1024.0),
+                       e.path ? e.path : "?");
             if (total >= e.file_size) total -= e.file_size;
             else total = 0;
         } else {
@@ -8225,6 +8773,12 @@ static bool byte_prefix_match(const char *text, size_t text_len,
                               const char *prefix, size_t prefix_len) {
     return prefix_len <= text_len &&
            (prefix_len == 0 || memcmp(text, prefix, prefix_len) == 0);
+}
+
+static const char *kv_cache_key_kind(uint8_t ext_flags) {
+    if (ext_flags & KV_EXT_RESPONSES_VISIBLE) return "responses-visible";
+    if (ext_flags & KV_EXT_THINKING_VISIBLE) return "thinking-visible";
+    return "token-text";
 }
 
 static void tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n) {
@@ -8601,7 +9155,8 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
 static int kv_cache_try_load_text(server *s, const char *prompt_text,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
-                                  uint8_t *loaded_ext_flags_out) {
+                                  uint8_t *loaded_ext_flags_out,
+                                  bool responses_protocol) {
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
     if (effective_prompt) effective_prompt->len = 0;
@@ -8670,12 +9225,18 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
         } else {
             ds4_session_invalidate(s->session);
             unlink(path);
-            server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache discarded corrupt text-prefix payload %s", path);
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: kv cache discarded corrupt text-prefix payload%s%s %s",
+                       responses_protocol ? " " : "",
+                       responses_protocol ? "RESPPROTO" : "",
+                       path);
         }
     } else {
         if (header_ok) ds4_session_invalidate(s->session);
         server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: kv cache load failed %s: %s load=%.1f ms",
+                   "ds4-server: kv cache load failed%s%s %s: %s load=%.1f ms",
+                   responses_protocol ? " " : "",
+                   responses_protocol ? "RESPPROTO" : "",
                    path,
                    header_ok ? err : fail_reason,
                    (now_sec() - load_t0) * 1000.0);
@@ -8687,18 +9248,20 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
         if (loaded_path_out) *loaded_path_out = xstrdup(path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = hdr.ext_flags;
         kc->continued_last_store_tokens = loaded;
-        const char *key_kind = "token-text";
-        if (hdr.ext_flags & KV_EXT_RESPONSES_VISIBLE) key_kind = "responses-visible";
-        else if (hdr.ext_flags & KV_EXT_THINKING_VISIBLE) key_kind = "thinking-visible";
+        const char *key_kind = kv_cache_key_kind(hdr.ext_flags);
         if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
             unlink(path);
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: kv cache hit text tokens=%d text=%u quant=%u key=%s load=%.1f ms consumed file=%s",
+                       "ds4-server: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms consumed file=%s",
+                       responses_protocol ? " " : "",
+                       responses_protocol ? "RESPPROTO" : "",
                        loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
         } else {
             kv_cache_touch_file(path, hdr.hits + 1);
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: kv cache hit text tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
+                       "ds4-server: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
+                       responses_protocol ? " " : "",
+                       responses_protocol ? "RESPPROTO" : "",
                        loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
         }
     }
@@ -8712,8 +9275,10 @@ static int kv_cache_try_load(server *s, const request *req,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
     return kv_cache_try_load_text(s, req ? req->prompt_text : NULL,
-                                  effective_prompt, loaded_path_out,
-                                  loaded_ext_flags_out);
+                                  effective_prompt,
+                                  loaded_path_out,
+                                  loaded_ext_flags_out,
+                                  req && req->api == API_RESPONSES);
 }
 
 static int live_text_prefix_prompt(server *s, const request *req,
@@ -8766,6 +9331,32 @@ static int responses_live_continuation_prompt(server *s, const request *req,
         s->engine, live_tokens, req->responses_live_suffix_text,
         effective_prompt);
     if (matched_ids) *matched_ids = req->responses_live_call_ids.len;
+    return live_tokens->len;
+}
+
+/* Tool-result Anthropic continuation.
+ *
+ * /v1/messages has no server-side response object like the OpenAI Responses
+ * API, but its tool_use_id is still a precise continuation handle inside a live
+ * local agent loop.  When the IDs and live token frontier match, continue from
+ * the sampled DSML state and append only the user tool_result suffix. */
+static int anthropic_live_continuation_prompt(server *s, const request *req,
+                                              int live_pos,
+                                              ds4_tokens *effective_prompt,
+                                              int *matched_ids) {
+    if (!s || !req || !effective_prompt) return 0;
+    if (req->api != API_ANTHROPIC || !req->anthropic_live_suffix_text) return 0;
+    if (req->anthropic_live_call_ids.len == 0) return 0;
+    if (!anthropic_live_matches_request(s, &req->anthropic_live_call_ids,
+                                        live_pos)) return 0;
+
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    if (!live_tokens || live_tokens->len != live_pos) return 0;
+
+    build_prompt_from_exact_prefix_and_text_suffix(
+        s->engine, live_tokens, req->anthropic_live_suffix_text,
+        effective_prompt);
+    if (matched_ids) *matched_ids = req->anthropic_live_call_ids.len;
     return live_tokens->len;
 }
 
@@ -9162,7 +9753,9 @@ typedef struct {
     int prompt_tokens;
     int cached_tokens;
     char ctx[48];
+    const char *phase;
     bool has_tools;
+    bool responses_protocol;
     double t0;
     double last_t;
     int last_current;
@@ -9175,7 +9768,8 @@ static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
     snprintf(buf, len, "%d..%d:%d", cached, prompt, suffix);
 }
 
-static void log_flags(char *buf, size_t len, bool tools, bool thinking,
+static void log_flags(char *buf, size_t len, bool responses_protocol,
+                      bool tools, bool thinking,
                       bool dsml_start, bool dsml_end) {
     size_t used = 0;
     buf[0] = '\0';
@@ -9183,6 +9777,7 @@ static void log_flags(char *buf, size_t len, bool tools, bool thinking,
     int n = snprintf(buf + used, used < len ? len - used : 0, "%s%s", used ? " " : "", name); \
     if (n > 0) used += (size_t)n; \
 } while (0)
+    if (responses_protocol) ADD_FLAG("RESPPROTO");
     if (tools) ADD_FLAG("TOOLS");
     if (thinking) ADD_FLAG("THINKING");
     if (dsml_start) ADD_FLAG("DSML_START");
@@ -9190,7 +9785,8 @@ static void log_flags(char *buf, size_t len, bool tools, bool thinking,
 #undef ADD_FLAG
 }
 
-static void log_decode_progress(req_kind kind, const char *ctx, int completion,
+static void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
+                                bool responses_protocol,
                                 bool tools, bool thinking,
                                 bool dsml_start, bool dsml_end,
                                 double decode_t0,
@@ -9201,8 +9797,13 @@ static void log_decode_progress(req_kind kind, const char *ctx, int completion,
     const int interval_tokens = completion - *last_completion;
     const double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
     const double avg_tps = elapsed > 0.0 ? (double)completion / elapsed : 0.0;
+    char ctx[48];
+    request_ctx_span(ctx, sizeof(ctx),
+                     prompt_tokens + *last_completion,
+                     prompt_tokens + completion);
     char flags[80];
-    log_flags(flags, sizeof(flags), tools, thinking, dsml_start, dsml_end);
+    log_flags(flags, sizeof(flags), responses_protocol,
+              tools, thinking, dsml_start, dsml_end);
     server_log(DS4_LOG_GENERATION,
                "ds4-server: %s ctx=%s gen=%d%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs",
                kind == REQ_CHAT ? "chat" : "completion",
@@ -9374,18 +9975,29 @@ static bool should_remember_thinking_checkpoint(const request *r,
     return true;
 }
 
-static void log_tool_calls_summary(const char *ctx, const tool_calls *calls) {
+static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
+                                   bool responses_protocol) {
     if (!calls || calls->len == 0) return;
     buf names = {0};
+    buf ids = {0};
     for (int i = 0; i < calls->len; i++) {
         if (i) buf_putc(&names, ',');
+        if (i) buf_putc(&ids, ',');
         buf_puts(&names, calls->v[i].name ? calls->v[i].name : "?");
+        buf_puts(&ids, calls->v[i].id ? calls->v[i].id : "?");
     }
+    char flags[32];
+    log_flags(flags, sizeof(flags), responses_protocol, false, false, false, false);
     server_log(DS4_LOG_TOOL,
-               "ds4-server: tool calls ctx=%s n=%d names=[%s]",
+               "ds4-server: tool calls ctx=%s%s%s n=%d raw_dsml=%d ids=[%s] names=[%s]",
                ctx,
+               flags[0] ? " " : "",
+               flags,
                calls->len,
+               calls->raw_dsml && calls->raw_dsml[0] ? 1 : 0,
+               ids.ptr ? ids.ptr : "",
                names.ptr ? names.ptr : "");
+    buf_free(&ids);
     buf_free(&names);
 }
 
@@ -9396,7 +10008,9 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double now = now_sec();
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
-        if (p->srv && current > p->cached_tokens) kv_cache_maybe_store_continued(p->srv);
+        if (p->srv && current > p->cached_tokens) {
+            kv_cache_maybe_store_continued(p->srv);
+        }
         return;
     }
     int display_start = p->cached_tokens;
@@ -9419,20 +10033,25 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     p->last_t = now;
     p->seen = true;
     char flags[64];
-    log_flags(flags, sizeof(flags), p->has_tools, false, false, false);
+    log_flags(flags, sizeof(flags), p->responses_protocol,
+              p->has_tools, false, false, false);
+    const char *phase = p->phase ? p->phase : "prefill";
     server_log(DS4_LOG_PREFILL,
-               "ds4-server: %s ctx=%s%s%s prefill chunk %d/%d (%.1f%%) chunk=%.2f t/s avg=%.2f t/s %.3fs",
+               "ds4-server: %s ctx=%s%s%s %s chunk %d/%d (%.1f%%) chunk=%.2f t/s avg=%.2f t/s %.3fs",
                p->kind == REQ_CHAT ? "chat" : "completion",
                p->ctx,
                flags[0] ? " " : "",
                flags,
+               phase,
                display_current,
                display_total,
                pct,
                chunk_tps,
                avg_tps,
                elapsed);
-    if (p->srv && current > p->cached_tokens) kv_cache_maybe_store_continued(p->srv);
+    if (p->srv && current > p->cached_tokens) {
+        kv_cache_maybe_store_continued(p->srv);
+    }
 }
 
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
@@ -9580,37 +10199,73 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
          * but the generated tail is too large to overwrite safely inside the
          * live raw-window ring.  Prefer an older disk checkpoint over replaying
          * a very long conversation from token zero. */
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: tool checkpoint canonicalization needs rebuild ctx=%s common=%d live=%d canonical=%d reason=\"%s\"",
-                   ctx, common, live_len, canonical.len, err);
         char *path = NULL;
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
-                                            &effective, &path, NULL);
+                                            &effective, &path, NULL, false);
         if (loaded == 0) ds4_session_invalidate(s->session);
 
         char sync_err[160] = {0};
         const ds4_tokens *sync_prompt = loaded > 0 ? &effective : &canonical;
+        char rebuild_ctx[48];
+        request_ctx_span(rebuild_ctx, sizeof(rebuild_ctx), loaded, sync_prompt->len);
+        int replay_tokens = sync_prompt->len - loaded;
+        if (replay_tokens < 0) replay_tokens = sync_prompt->len;
+        int canonical_tail_tokens = canonical.len - common;
+        if (canonical_tail_tokens < 0) canonical_tail_tokens = canonical.len;
+        int discarded_live_tokens = live_len - common;
+        if (discarded_live_tokens < 0) discarded_live_tokens = 0;
+        const char *source = loaded > 0 ? "disk" : "full";
+        const double rebuild_t0 = now_sec();
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: tool checkpoint canonicalization needs %d tokens rebuild ctx=%s request_ctx=%s reason=canonical-tail-rewrite tail=%d discard=%d common=%d live=%d target=%d cached=%d source=%s%s%s",
+                   replay_tokens,
+                   rebuild_ctx,
+                   ctx,
+                   canonical_tail_tokens,
+                   discarded_live_tokens,
+                   common,
+                   live_len,
+                   canonical.len,
+                   loaded,
+                   source,
+                   path ? " file=" : "",
+                   path ? path : "");
+        server_prefill_progress rebuild_progress = {
+            .srv = s,
+            .kind = j->req.kind,
+            .prompt_tokens = sync_prompt->len,
+            .cached_tokens = loaded,
+            .phase = "tool checkpoint rebuild",
+            .has_tools = j->req.has_tools,
+            .t0 = rebuild_t0,
+        };
+        snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
+        ds4_session_set_progress(s->session, server_progress_cb, &rebuild_progress);
         if (ds4_session_sync(s->session, sync_prompt, sync_err, sizeof(sync_err)) == 0) {
+            ds4_session_set_progress(s->session, NULL, NULL);
+            const double rebuild_sec = now_sec() - rebuild_t0;
             if (loaded > 0) {
                 server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d via=disk cached=%d",
-                           ctx, common, live_len, canonical.len, loaded);
+                           "ds4-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=disk cached=%d replay=%d target=%d %.3fs",
+                           rebuild_ctx, ctx, loaded, replay_tokens, canonical.len, rebuild_sec);
                 trace_event(s, trace_id,
                             "tool checkpoint canonicalized via disk: common=%d live=%d canonical=%d cached=%d file=%s",
                             common, live_len, canonical.len, loaded, path ? path : "");
             } else {
                 server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d via=rebuild",
-                           ctx, common, live_len, canonical.len);
+                           "ds4-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=full cached=0 replay=%d target=%d %.3fs",
+                           rebuild_ctx, ctx, replay_tokens, canonical.len, rebuild_sec);
                 trace_event(s, trace_id,
                             "tool checkpoint canonicalized via rebuild: common=%d live=%d canonical=%d reason=%s",
                             common, live_len, canonical.len, err);
             }
         } else {
+            ds4_session_set_progress(s->session, NULL, NULL);
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: tool checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
-                       ctx, common, live_len, canonical.len, sync_err);
+                       "ds4-server: tool checkpoint rebuild failed ctx=%s request_ctx=%s source=%s cached=%d replay=%d target=%d error=\"%s\"",
+                       rebuild_ctx, ctx, source, loaded, replay_tokens,
+                       canonical.len, sync_err);
             trace_event(s, trace_id, "tool checkpoint canonicalization failed after rebuild request: %s", sync_err);
         }
         ds4_tokens_free(&effective);
@@ -9642,13 +10297,14 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
  * token-prefix hit, then a rendered-text prefix hit for the live checkpoint,
- * then the disk text-prefix index, then a cold prefill.  On text-prefix hits we
- * build a fresh effective prompt from the checkpoint's exact token history plus
- * a newly tokenized string suffix; the canonical full-prompt tokens are not
- * sliced because BPE may merge across the byte boundary.  Cold prompt caching is
- * handled before generation: if the stable checkpoint is shorter than the full
- * prompt, we prefill to that boundary, store it, and immediately continue to the
- * real prompt.  The live graph therefore always moves forward. */
+ * then disk text-prefix restart snapshots, then a cold prefill.  On text-prefix
+ * hits we build a fresh effective prompt from the checkpoint's exact token
+ * history plus a newly tokenized string suffix; the canonical full-prompt
+ * tokens are not sliced because BPE may merge across the byte boundary.  Cold
+ * prompt caching is handled before generation: if the stable checkpoint is
+ * shorter than the full prompt, we prefill to that boundary, store it, and
+ * immediately continue to the real prompt.  The live graph therefore always
+ * moves forward. */
 static void generate_job(server *s, job *j) {
     char err[160];
     err[0] = '\0';
@@ -9659,10 +10315,13 @@ static void generate_job(server *s, job *j) {
                         &j->req.prompt, old_pos, common);
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
+    const bool responses_protocol = j->req.api == API_RESPONSES;
     bool responses_live_continuation = false;
+    bool anthropic_live_continuation = false;
     bool thinking_live_continuation = false;
     const char *responses_live_match = NULL;
     int responses_live_match_ids = 0;
+    int anthropic_live_match_ids = 0;
     /* Responses gets the first chance to continue from live state.  This is
      * the whole point of the API shape: a request that is bound to prior live
      * output by visible transcript or tool call ids does not need to prove an
@@ -9690,18 +10349,35 @@ static void generate_job(server *s, job *j) {
     if (cached > 0) {
         responses_live_continuation = true;
         prompt_for_sync = &effective_prompt;
-    } else if (j->req.api == API_RESPONSES &&
-               j->req.responses_requires_live_tool_state)
+    } else {
+        cached = anthropic_live_continuation_prompt(s, &j->req, old_pos,
+                                                    &effective_prompt,
+                                                    &anthropic_live_match_ids);
+        if (cached > 0) {
+            anthropic_live_continuation = true;
+            cache_source = "anthropic-tool-output";
+            prompt_for_sync = &effective_prompt;
+        }
+    }
+    if (cached == 0 && responses_protocol &&
+        j->req.responses_requires_live_tool_state)
     {
         /* The parser saw a valid live call_id, but by worker execution time the
          * live frontier no longer matches.  Since the request did not replay
          * the prior assistant call, there is no stateless prefix to match and
          * no disk key to search by. */
         ds4_tokens_free(&effective_prompt);
-        http_error(j->fd, 400,
-                   "Responses tool output requires live call state; replay full input instead");
+        http_error(j->fd, 409,
+                   "Responses continuation state is not available; retry by replaying the full input history");
         return;
-    } else {
+    } else if (cached == 0 && j->req.api == API_ANTHROPIC &&
+               j->req.anthropic_requires_live_tool_state)
+    {
+        ds4_tokens_free(&effective_prompt);
+        http_error(j->fd, 409,
+                   "Anthropic continuation state is not available; retry by replaying the full messages history");
+        return;
+    } else if (cached == 0) {
         cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
         cache_source = cached > 0 ? "memory-token" : "none";
     }
@@ -9729,7 +10405,8 @@ static void generate_job(server *s, job *j) {
     }
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
-                   "ds4-server: live kv cache miss live=%d prompt=%d common=%d reason=%s",
+                   "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s",
+                   responses_protocol ? " RESPPROTO" : "",
                    old_pos, j->req.prompt.len, common,
                    trace_cache_miss_reason(&cache_diag));
     }
@@ -9750,27 +10427,16 @@ static void generate_job(server *s, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
-    if (j->req.api == API_RESPONSES &&
+    const bool responses_reasoning_state_preserved =
+        cached > 0 &&
+        ((!strcmp(cache_source, "responses-visible") ||
+          !strcmp(cache_source, "responses-tool-output")) ||
+         (!strcmp(cache_source, "disk-text") &&
+          (disk_cache_ext_flags & KV_EXT_RESPONSES_VISIBLE)));
+    const bool responses_visible_replay_without_reasoning =
+        responses_protocol &&
         j->req.responses_requires_live_reasoning &&
-        !(cached > 0 &&
-          ((!strcmp(cache_source, "responses-visible") ||
-            !strcmp(cache_source, "responses-tool-output")) ||
-           (!strcmp(cache_source, "disk-text") &&
-            (disk_cache_ext_flags & KV_EXT_RESPONSES_VISIBLE)))))
-    {
-        /* A stateless replay that includes a prior tool call but omits the
-         * reasoning state is not equivalent to the live session.  Give disk
-         * recovery one chance first: a Responses-visible disk checkpoint is
-         * keyed by the visible transcript but carries the hidden KV payload and
-         * is therefore a valid substitute for live memory after client/session
-         * switching.  Ordinary token-text checkpoints before the missing
-         * reasoning are not enough. */
-        ds4_tokens_free(&effective_prompt);
-        free(disk_cache_path);
-        http_error(j->fd, 400,
-                   "Responses replay is missing reasoning state; retry with live state or full reasoning items");
-        return;
-    }
+        !responses_reasoning_state_preserved;
     const int prompt_tokens = prompt_for_sync->len;
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
@@ -9784,16 +10450,24 @@ static void generate_job(server *s, job *j) {
         .prompt_tokens = prompt_tokens,
         .cached_tokens = cached,
         .has_tools = j->req.has_tools,
+        .responses_protocol = responses_protocol,
         .t0 = t0,
     };
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
     char req_flags[64];
-    log_flags(req_flags, sizeof(req_flags), j->req.has_tools, false, false, false);
+    log_flags(req_flags, sizeof(req_flags), responses_protocol,
+              j->req.has_tools, false, false, false);
     if (responses_live_continuation) {
         server_log(DS4_LOG_PREFILL,
-                   "ds4-server: responses live continuation match=%s ids=%d cached=%d prompt=%d",
+                   "ds4-server: responses live continuation RESPPROTO match=%s ids=%d cached=%d prompt=%d",
                    responses_live_match ? responses_live_match : "unknown",
                    responses_live_match_ids,
+                   cached,
+                   prompt_tokens);
+    } else if (anthropic_live_continuation) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: anthropic live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
+                   anthropic_live_match_ids,
                    cached,
                    prompt_tokens);
     } else if (thinking_live_continuation) {
@@ -9801,6 +10475,23 @@ static void generate_job(server *s, job *j) {
                    "ds4-server: thinking live continuation match=visible-prefix cached=%d prompt=%d",
                    cached,
                    prompt_tokens);
+    }
+    if (responses_visible_replay_without_reasoning) {
+        /* The request replays a prior tool-call turn but omits the hidden
+         * reasoning that originally led to it.  A live Responses checkpoint, or
+         * a responses-visible disk checkpoint, would preserve that hidden KV.
+         * If neither is available, continue from the visible transcript instead
+         * of surfacing a hard error to the user.  This is lower fidelity, but it
+         * lets old / restarted agent sessions recover and is exactly what the
+         * client asked us to prefill. */
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: responses replay RESPPROTO missing reasoning state; continuing from visible history source=%s cached=%d prompt=%d",
+                   cache_source,
+                   cached,
+                   prompt_tokens);
+        trace_event(s, trace_id,
+                    "responses replay missing reasoning state; continuing from visible history source=%s cached=%d",
+                    cache_source, cached);
     }
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt start",
@@ -9847,11 +10538,13 @@ static void generate_job(server *s, job *j) {
         http_error(j->fd, 500, err);
         return;
     }
-    /* Once a non-live request wins, the old Responses live binding is stale.
-     * Keep it only when the current request explicitly continued from it. */
+    /* Once a non-live request wins, old protocol live bindings are stale. Keep
+     * a binding only when this request explicitly continued from it. */
     if (!responses_live_continuation) responses_live_clear(s);
+    if (!anthropic_live_continuation) anthropic_live_clear(s);
     if (!thinking_live_continuation) thinking_live_clear(s);
     ds4_session_set_progress(s->session, NULL, NULL);
+    kv_cache_maybe_store_continued(s);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -9878,7 +10571,12 @@ static void generate_job(server *s, job *j) {
     long responses_created_at = (long)time(NULL);
     if (j->req.stream) {
         if (!sse_headers(j->fd)) {
-            server_log(DS4_LOG_GENERATION, "ds4-server: %s ctx=%s sse headers failed", j->req.kind == REQ_CHAT ? "chat" : "completion", ctx_span);
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: %s ctx=%s%s%s sse headers failed",
+                       j->req.kind == REQ_CHAT ? "chat" : "completion",
+                       ctx_span,
+                       req_flags[0] ? " " : "",
+                       req_flags);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -9900,7 +10598,11 @@ static void generate_job(server *s, job *j) {
             responses_stream_init(&j->req, &responses_live);
             responses_live.active = true;
             if (!responses_sse_created(j->fd, &j->req, &responses_live, responses_created_at)) {
-                server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s responses created event failed", ctx_span);
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: chat ctx=%s%s%s responses created event failed",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags);
                 responses_stream_free(&responses_live);
                 ds4_tokens_free(&effective_prompt);
                 return;
@@ -10072,7 +10774,7 @@ static void generate_job(server *s, job *j) {
                 plain_stream_pos = stream_len;
             }
             if (j->req.stream && j->req.api == API_ANTHROPIC &&
-                !anthropic_sse_stream_update(j->fd, &j->req, id,
+                !anthropic_sse_stream_update(j->fd, s, &j->req, id,
                                              &anthropic_live, text.ptr, stream_len,
                                              false)) {
                 finish = "error";
@@ -10112,8 +10814,10 @@ static void generate_job(server *s, job *j) {
                 if (orphan_end && !saw_orphan_tool_end) {
                     saw_orphan_tool_end = true;
                     server_log(DS4_LOG_WARNING,
-                               "ds4-server: chat ctx=%s ignored orphan tool-call end marker after %d generated tokens",
+                               "ds4-server: chat ctx=%s%s%s ignored orphan tool-call end marker after %d generated tokens",
                                ctx_span,
+                               req_flags[0] ? " " : "",
+                               req_flags,
                                completion);
                     trace_event(s, trace_id,
                                 "ignored orphan tool-call end marker after %d generated tokens",
@@ -10136,7 +10840,8 @@ static void generate_job(server *s, job *j) {
             }
 
             if (completion >= next_decode_log) {
-                log_decode_progress(j->req.kind, ctx_span, completion,
+                log_decode_progress(j->req.kind, prompt_tokens, completion,
+                                    responses_protocol,
                                     j->req.has_tools,
                                     thinking.inside,
                                     saw_tool_start,
@@ -10182,7 +10887,8 @@ static void generate_job(server *s, job *j) {
     }
 
     if (completion > last_decode_log_completion) {
-        log_decode_progress(j->req.kind, ctx_span, completion,
+        log_decode_progress(j->req.kind, prompt_tokens, completion,
+                            responses_protocol,
                             j->req.has_tools,
                             thinking.inside,
                             saw_tool_start,
@@ -10217,8 +10923,10 @@ static void generate_job(server *s, job *j) {
             &recovered_tool_parse_failure);
         if (!parsed_ok && recovered_tool_parse_failure) {
             server_log(DS4_LOG_WARNING,
-                       "ds4-server: chat ctx=%s invalid tool call returned as assistant text finish=%s",
+                       "ds4-server: chat ctx=%s%s%s invalid tool call returned as assistant text finish=%s",
                        ctx_span,
+                       req_flags[0] ? " " : "",
+                       req_flags,
                        final_finish);
             trace_event(s, trace_id,
                         "invalid tool call returned as assistant text finish=%s",
@@ -10226,6 +10934,8 @@ static void generate_job(server *s, job *j) {
         }
         if (parsed_calls.len) {
             if (openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &openai_live);
+            if (j->req.api == API_ANTHROPIC && j->req.stream)
+                apply_anthropic_stream_tool_ids(&parsed_calls, &anthropic_live);
             assign_tool_call_ids(s, &j->req, &parsed_calls, j->req.api);
             tool_memory_remember(s, &parsed_calls);
             final_finish = "tool_calls";
@@ -10233,7 +10943,8 @@ static void generate_job(server *s, job *j) {
             responses_live_clear(s);
         }
     }
-    log_tool_calls_summary(ctx_span, &parsed_calls);
+    log_tool_calls_summary(ctx_span, &parsed_calls,
+                           responses_protocol);
 
     trace_finish(s, trace_id, &j->req, final_finish, completion,
                  saw_tool_start, saw_tool_end,
@@ -10260,6 +10971,15 @@ static void generate_job(server *s, job *j) {
             free(visible_suffix);
         } else {
             responses_live_clear(s);
+        }
+    }
+    if (j->req.api == API_ANTHROPIC) {
+        if (parsed_calls.len && strcmp(final_finish, "error") &&
+            strcmp(final_finish, "length"))
+        {
+            anthropic_live_remember(s, &parsed_calls);
+        } else {
+            anthropic_live_clear(s);
         }
     }
 
@@ -10290,7 +11010,7 @@ static void generate_job(server *s, job *j) {
     if (j->req.stream) {
         bool response_ok = true;
         if (j->req.api == API_ANTHROPIC) {
-            response_ok = anthropic_sse_finish_live(j->fd, &j->req, id, &anthropic_live,
+            response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
                                                     text.ptr ? text.ptr : "", text.len,
                                                     &parsed_calls, final_finish, completion);
         } else if (openai_live_chat) {
@@ -10323,9 +11043,11 @@ static void generate_job(server *s, job *j) {
         }
         if (!response_ok) {
             server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: %s ctx=%s final stream failed",
+                       "ds4-server: %s ctx=%s%s%s final stream failed",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
-                       ctx_span);
+                       ctx_span,
+                       req_flags[0] ? " " : "",
+                       req_flags);
         }
     } else if (j->req.api == API_ANTHROPIC) {
         anthropic_final_response(j->fd, &j->req, id,
@@ -10349,6 +11071,7 @@ static void generate_job(server *s, job *j) {
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
         log_flags(flags, sizeof(flags),
+                  responses_protocol,
                   true,
                   thinking.inside,
                   saw_tool_start,
@@ -10376,6 +11099,7 @@ static void generate_job(server *s, job *j) {
     } else {
         char flags[80];
         log_flags(flags, sizeof(flags),
+                  responses_protocol,
                   j->req.has_tools,
                   thinking.inside,
                   false,
@@ -10406,6 +11130,7 @@ static void generate_job(server *s, job *j) {
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
+    anthropic_stream_free(&anthropic_live);
     openai_stream_free(&openai_live);
     responses_stream_free(&responses_live);
     buf_free(&text);
@@ -10832,7 +11557,8 @@ static void server_close_resources(server *s) {
     }
     kv_cache_close(&s->kv);
     tool_memory_free(&s->tool_mem);
-    responses_live_free(&s->responses_live);
+    live_tool_state_free(&s->responses_live);
+    live_tool_state_free(&s->anthropic_live);
     visible_live_free(&s->thinking_live);
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
@@ -11511,17 +12237,17 @@ static void test_anthropic_live_stream_sends_incremental_blocks(void) {
     anthropic_stream st;
     TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_test", 10, &st));
     const char *raw1 = "need a tool</think>Hello.\n\n";
-    TEST_ASSERT(anthropic_sse_stream_update(sv[0], &r, "msg_test", &st,
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_test", &st,
                                             raw1, strlen(raw1), false));
 
     const char *raw =
         "need a tool</think>Hello.\n\n"
         DS4_TOOL_CALLS_START "\n";
-    TEST_ASSERT(anthropic_sse_stream_update(sv[0], &r, "msg_test", &st,
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_test", &st,
                                             raw, strlen(raw), false));
 
     tool_calls calls = make_swapped_bash_call();
-    TEST_ASSERT(anthropic_sse_finish_live(sv[0], &r, "msg_test", &st,
+    TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_test", &st,
                                           raw, strlen(raw), &calls,
                                           "tool_calls", 8));
     shutdown(sv[0], SHUT_WR);
@@ -11548,6 +12274,92 @@ static void test_anthropic_live_stream_sends_incremental_blocks(void) {
 
     free(out);
     tool_calls_free(&calls);
+    anthropic_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_anthropic_tool_stream_sends_live_tool_use(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.tool_orders = make_bash_order();
+
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_tool", 7, &st));
+
+    const char *raw =
+        "Before.\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo partial";
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_tool", &st,
+                                            raw, strlen(raw), false));
+
+    const char *raw_complete =
+        "Before.\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo partial done" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_tool", &st,
+                                            raw_complete, strlen(raw_complete), false));
+
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message(raw_complete, &parsed_content,
+                                        &parsed_reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    apply_anthropic_stream_tool_ids(&calls, &st);
+    TEST_ASSERT(calls.v[0].id != NULL);
+    TEST_ASSERT(!strncmp(calls.v[0].id, "toolu_", 6));
+    TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_tool", &st,
+                                          raw_complete, strlen(raw_complete),
+                                          &calls, "tool_calls", 5));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *text = strstr(out, "\"text\":\"Before.\"");
+    const char *tool = strstr(out, "\"type\":\"tool_use\"");
+    const char *key = strstr(out, "\\\"command\\\":\\\"");
+    const char *partial = strstr(out, "\"partial_json\":\"echo partial\"");
+    const char *rest = strstr(out, "\"partial_json\":\" done\"");
+    const char *stop = strstr(out, "event: message_stop");
+    int tool_use_count = 0;
+    for (const char *p = out; (p = strstr(p, "\"type\":\"tool_use\"")) != NULL; p++) {
+        tool_use_count++;
+    }
+    TEST_ASSERT(text != NULL);
+    TEST_ASSERT(tool != NULL);
+    TEST_ASSERT(key != NULL);
+    TEST_ASSERT(partial != NULL);
+    TEST_ASSERT(rest != NULL);
+    TEST_ASSERT(stop != NULL);
+    TEST_ASSERT(strstr(out, calls.v[0].id) != NULL);
+    TEST_ASSERT(text < tool);
+    TEST_ASSERT(tool < key);
+    TEST_ASSERT(key < partial);
+    TEST_ASSERT(partial < rest);
+    TEST_ASSERT(rest < stop);
+    TEST_ASSERT(tool_use_count == 1);
+    TEST_ASSERT(strstr(out, DS4_TOOL_CALLS_START) == NULL);
+    TEST_ASSERT(strstr(out, DS4_PARAM_START) == NULL);
+
+    free(out);
+    free(parsed_content);
+    free(parsed_reasoning);
+    tool_calls_free(&calls);
+    anthropic_stream_free(&st);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -11763,7 +12575,7 @@ static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
     TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_incomplete_tool", &st,
                                          raw_invoke, strlen(raw_invoke), false));
     TEST_ASSERT(st.mode == OPENAI_STREAM_TOOL);
-    TEST_ASSERT(st.tool.state == OPENAI_TOOL_BETWEEN_INVOKES);
+    TEST_ASSERT(st.tool.state == DSML_TOOL_BETWEEN_INVOKES);
 
     const char *raw_param =
         DS4_TOOL_CALLS_START "\n"
@@ -11772,7 +12584,7 @@ static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
     TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_incomplete_tool", &st,
                                          raw_param, strlen(raw_param), false));
     TEST_ASSERT(st.mode == OPENAI_STREAM_TOOL);
-    TEST_ASSERT(st.tool.state == OPENAI_TOOL_BETWEEN_PARAMS);
+    TEST_ASSERT(st.tool.state == DSML_TOOL_BETWEEN_PARAMS);
 
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
@@ -12587,6 +13399,169 @@ static void test_seeded_tool_ids_are_deterministic(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+static void test_anthropic_tool_memory_replays_sampled_dsml(void) {
+    const char *sampled_dsml =
+        "\n\n" DS4_TOOL_CALLS_START "\n"
+        "<｜DSML｜invoke name=\"Bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"description\" string=\"true\">list files</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        DS4_TOOL_CALLS_END;
+
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.tool_mu, NULL);
+    tool_memory_put(&s, "toolu_exact", sampled_dsml);
+
+    const char *json =
+        "["
+        "{\"role\":\"assistant\",\"content\":["
+        "{\"type\":\"tool_use\",\"id\":\"toolu_exact\",\"name\":\"Bash\","
+        "\"input\":{\"description\":\"list files\",\"command\":\"ls -la\"}}"
+        "]},"
+        "{\"role\":\"user\",\"content\":["
+        "{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_exact\",\"content\":\"ok\"}"
+        "]}"
+        "]";
+    const char *p = json;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 2);
+    TEST_ASSERT(msgs.v[1].tool_call_id && !strcmp(msgs.v[1].tool_call_id, "toolu_exact"));
+
+    stop_list ids = {0};
+    collect_tool_call_ids(&msgs, &ids);
+    TEST_ASSERT(id_list_contains(&ids, "toolu_exact"));
+    id_list_free(&ids);
+
+    tool_replay_stats stats = {0};
+    tool_memory_attach_to_messages(&s, &msgs, &stats);
+    TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
+    TEST_ASSERT(stats.mem == 1);
+    TEST_ASSERT(stats.canonical == 0);
+
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    const char *command = strstr(prompt, "name=\"command\"");
+    const char *description = strstr(prompt, "name=\"description\"");
+    TEST_ASSERT(command != NULL);
+    TEST_ASSERT(description != NULL);
+    TEST_ASSERT(command < description);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+    tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+static void test_anthropic_live_tail_renders_tool_results_only(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.think_mode = DS4_THINK_HIGH;
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup("toolu_live");
+    tc.name = xstrdup("Bash");
+    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("<tool_result>/tmp</tool_result>");
+    chat_msg_add_tool_call_id(&user, "toolu_live");
+    chat_msgs_push(&msgs, user);
+
+    /* Anthropic system text is parsed separately and appended to chat_msgs for
+     * rendering.  The live-tail finder must ignore it when locating the final
+     * tool_result run. */
+    chat_msg system = {0};
+    system.role = xstrdup("system");
+    system.content = xstrdup("You are terse.");
+    chat_msgs_push(&msgs, system);
+
+    anthropic_prepare_live_continuation(&r, &msgs);
+    TEST_ASSERT(r.anthropic_live_call_ids.len == 1);
+    TEST_ASSERT(!strcmp(r.anthropic_live_call_ids.v[0], "toolu_live"));
+    TEST_ASSERT(r.anthropic_live_suffix_text != NULL);
+    TEST_ASSERT(!strncmp(r.anthropic_live_suffix_text,
+                         "<｜end▁of▁sentence｜><｜User｜><tool_result>",
+                         strlen("<｜end▁of▁sentence｜><｜User｜><tool_result>")));
+    TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "/tmp</tool_result>") != NULL);
+    TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "<｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "Bash") == NULL);
+
+    chat_msgs_free(&msgs);
+    request_free(&r);
+}
+
+static void test_anthropic_tool_result_id_validation(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("<tool_result>out</tool_result>");
+    chat_msg_add_tool_call_id(&user, "toolu_missing");
+    chat_msgs_push(&msgs, user);
+
+    char err[160] = {0};
+    TEST_ASSERT(!anthropic_validate_tool_results(&s, &msgs, NULL,
+                                                 err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "Anthropic continuation state is not available") != NULL);
+
+    pthread_mutex_lock(&s.tool_mu);
+    s.anthropic_live.valid = true;
+    s.anthropic_live.live_tokens = 10;
+    id_list_push_unique(&s.anthropic_live.call_ids, "toolu_missing");
+    pthread_mutex_unlock(&s.tool_mu);
+    bool needs_live_tool_state = false;
+    err[0] = '\0';
+    TEST_ASSERT(anthropic_validate_tool_results(&s, &msgs,
+                                                &needs_live_tool_state,
+                                                err, sizeof(err)));
+    TEST_ASSERT(needs_live_tool_state);
+
+    chat_msgs_free(&msgs);
+    live_tool_state_free(&s.anthropic_live);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+static void test_anthropic_full_replay_allows_unknown_live_id(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup("toolu_replay");
+    tc.name = xstrdup("Bash");
+    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("<tool_result>/tmp</tool_result>");
+    chat_msg_add_tool_call_id(&user, "toolu_replay");
+    chat_msgs_push(&msgs, user);
+
+    bool needs_live_tool_state = false;
+    char err[160] = {0};
+    TEST_ASSERT(anthropic_validate_tool_results(&s, &msgs,
+                                                &needs_live_tool_state,
+                                                err, sizeof(err)));
+    TEST_ASSERT(!needs_live_tool_state);
+
+    chat_msgs_free(&msgs);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
 static void test_tool_checkpoint_canonicalization_gate_exact_replay(void) {
     server s;
     memset(&s, 0, sizeof(s));
@@ -12667,7 +13642,7 @@ static void test_responses_tool_output_id_validation(void) {
     char err[160] = {0};
     TEST_ASSERT(!responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH, NULL, NULL,
                                                  err, sizeof(err)));
-    TEST_ASSERT(strstr(err, "unknown tool output call_id") != NULL);
+    TEST_ASSERT(strstr(err, "Responses continuation state is not available") != NULL);
 
     pthread_mutex_lock(&s.tool_mu);
     s.responses_live.valid = true;
@@ -12682,7 +13657,7 @@ static void test_responses_tool_output_id_validation(void) {
     TEST_ASSERT(needs_live_tool_state);
 
     chat_msgs_free(&msgs);
-    responses_live_free(&s.responses_live);
+    live_tool_state_free(&s.responses_live);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -12756,7 +13731,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     TEST_ASSERT(!needs_live_reasoning);
 
     chat_msgs_free(&msgs);
-    responses_live_free(&s.responses_live);
+    live_tool_state_free(&s.responses_live);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -13867,6 +14842,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
     test_anthropic_live_stream_sends_incremental_blocks();
+    test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
@@ -13883,6 +14859,10 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
     test_seeded_tool_ids_are_deterministic();
+    test_anthropic_tool_memory_replays_sampled_dsml();
+    test_anthropic_live_tail_renders_tool_results_only();
+    test_anthropic_tool_result_id_validation();
+    test_anthropic_full_replay_allows_unknown_live_id();
     test_tool_checkpoint_canonicalization_gate_exact_replay();
     test_responses_live_tail_renders_tool_outputs_only();
     test_responses_tool_output_id_validation();
