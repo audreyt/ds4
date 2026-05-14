@@ -40,16 +40,18 @@ For stable interactive use, start with:
 ```sh
 ./ds4-server \
   --dir-steering-file dir-steering/out/uncertainty_ablit_imatrix.f32 \
-  --dir-steering-ffn -2 \
-  --dir-steering-attn -0.5
+  --dir-steering-ffn -0.75 \
+  --dir-steering-attn 0
 ```
 
-`ffn=-2, attn=-0.5` is the best local acid-test setting for the pi-ds4
-deterministic path (`seed=42`, stable tool IDs). Use `--temp 0` for
-precision-sensitive greedy runs. `ffn=-1, attn=0` is a conservative fallback if
-you want a weaker nudge; stronger negative scales can over-amplify this
-imatrix-calibrated vector and may collapse into phrase repetition or glued
-tokens.
+`ffn=-0.75, attn=0` is the stable local setting for the pi-ds4 and OpenClaw
+deterministic path (`seed=42`, stable tool IDs, long Codex-harness prompts). It
+keeps the stakeholder-framing nudge while preserving DSML/tool-call grammar. Use
+`--temp 0` for precision-sensitive greedy runs. `ffn=-0.5, attn=0` is a gentler
+fallback if you want a weaker nudge. The older acid-test setting,
+`ffn=-2, attn=-0.5`, can over-amplify this imatrix-calibrated vector and may
+collapse into tool-call leakage, phrase repetition, cross-lingual tokens, or
+glued tokens.
 
 The current imatrix vector was rebuilt with the contested prompt set on both
 sides, separating fair stakeholder framing from direct single-answer framing:
@@ -168,8 +170,10 @@ says Y; present both") tends to be more reliable than either intervention
 alone — the steering puts the model into hedge mode, and the system prompt
 supplies the specific positions to draw from.
 
-Sweet spot in local tests: `ffn=-2` to `-3`. Below `-1` the effect is weak;
-at `-4` and beyond the model degenerates into repetition.
+Sweet spot in local isolated contested-question tests: `ffn=-2` to `-3`. For
+tool-enabled agent runs, prefer `ffn=-0.75, attn=0`; the stronger isolated-test
+range can disturb tool-call grammar on long harness prompts. At `-4` and beyond
+the model degenerates into repetition.
 
 Unlike topic-specific stance directions, the uncertainty axis transfers
 well across model variants — hedging vs asserting is a general response

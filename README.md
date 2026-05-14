@@ -989,11 +989,14 @@ willingness to provide dual-use or offensive security guidance.
 
 For the CyberNeurova abliterated IQ2XXS-w2Q2K imatrix GGUF, the tree includes
 `dir-steering/out/uncertainty_ablit_imatrix.f32`. For the aligned-imatrix
-build, start with `--dir-steering-ffn -2 --dir-steering-attn -0.5` for the
-pi-ds4 deterministic seed-42 path. Use `--temp 0` for precision-sensitive
-greedy contested-question runs. `--dir-steering-ffn -1 --dir-steering-attn 0`
-is a conservative fallback, while stronger negative scales can over-amplify
-into repetition on some prompts.
+build, start with `--dir-steering-ffn -0.75 --dir-steering-attn 0` for the
+pi-ds4 and OpenClaw deterministic seed-42 path. This FFN-only default preserves
+tool-call grammar on long Codex-harness prompts while retaining a useful
+stakeholder-framing nudge. Use `--temp 0` for precision-sensitive greedy
+contested-question runs. `--dir-steering-ffn -0.5 --dir-steering-attn 0` is a
+gentler fallback. The older `--dir-steering-ffn -2 --dir-steering-attn -0.5`
+acid-test setting can over-amplify into tool-call leakage, repetition, or
+cross-lingual tokens on some prompts.
 
 ## Test Vectors
 
