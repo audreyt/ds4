@@ -475,6 +475,7 @@ typedef enum {
 typedef enum {
     API_OPENAI,
     API_ANTHROPIC,
+    API_RESPONSES,
 } api_style;
 
 static void random_tool_id(char *dst, size_t dstlen, api_style api) {
@@ -523,6 +524,11 @@ typedef struct {
 
 typedef struct {
     char *name;
+    char *wire_name;
+    char *namespace;
+    /* Distinguish the Responses hosted tool from a normal function that
+     * happens to be named "tool_search". */
+    bool responses_tool_search;
     char **prop;
     int len;
     int cap;
@@ -560,6 +566,11 @@ typedef struct {
     size_t max_len;
 } stop_list;
 
+static void stop_list_clear(stop_list *stops);
+static bool id_list_contains(const stop_list *ids, const char *id);
+static void id_list_push_unique(stop_list *ids, const char *id);
+static bool responses_live_has_call_id(server *s, const char *id);
+
 typedef struct {
     req_kind kind;
     api_style api;
@@ -580,6 +591,29 @@ typedef struct {
     ds4_think_mode think_mode;
     bool has_tools;
     bool prompt_preserves_reasoning;
+    /* For /v1/responses: emit reasoning_summary_* events / fields only when the
+     * client opted in via reasoning.summary. Other APIs leave this false; the
+     * field is ignored on those code paths. */
+    bool reasoning_summary_emit;
+    /* Responses continuation contract:
+     *
+     * A live Responses tool loop is not a normal "new prompt with a long
+     * prefix" request.  The protocol gives tool outputs a call_id that binds
+     * them to a prior assistant tool call.  If that call_id is still known in
+     * memory, the live KV is the authoritative prefix, including any hidden
+     * thinking that the client did not replay.  These fields carry the parsed
+     * evidence needed by generate_job() to append only the new suffix.
+     *
+     * A tool-output-only request has no stateless prefix to match.  If the live
+     * call_id binding is gone by the time the worker executes it, DS4 must ask
+     * for a full replay rather than cold-prefilling a prompt that starts with a
+     * naked tool result.  Similarly, if live state is gone, a reasoning-mode
+     * tool replay must contain the prior reasoning item (or an equivalent
+     * opaque reasoning state from a future implementation). */
+    bool responses_requires_live_tool_state;
+    bool responses_requires_live_reasoning;
+    stop_list responses_live_call_ids;
+    char *responses_live_suffix_text;
     tool_replay_stats tool_replay;
 } request;
 
@@ -630,6 +664,8 @@ static void chat_msgs_push(chat_msgs *msgs, chat_msg msg) {
 
 static void tool_schema_order_free(tool_schema_order *o) {
     free(o->name);
+    free(o->wire_name);
+    free(o->namespace);
     for (int i = 0; i < o->len; i++) free(o->prop[i]);
     free(o->prop);
     memset(o, 0, sizeof(*o));
@@ -671,12 +707,10 @@ static void tool_schema_orders_push(tool_schema_orders *orders, tool_schema_orde
     orders->v[orders->len++] = order;
 }
 
-#ifdef DS4_SERVER_TEST
 static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *orders, const char *name) {
     int idx = tool_schema_orders_find_index(orders, name);
     return idx >= 0 ? &orders->v[idx] : NULL;
 }
-#endif
 
 static void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
@@ -698,12 +732,15 @@ static void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    stop_list_clear(&r->responses_live_call_ids);
+    free(r->responses_live_call_ids.v);
+    free(r->responses_live_suffix_text);
     tool_schema_orders_free(&r->tool_orders);
     memset(r, 0, sizeof(*r));
 }
 
 static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort) {
-    if (!enabled) return DS4_THINK_NONE;
+    if (!enabled || effort == DS4_THINK_NONE) return DS4_THINK_NONE;
     return effort == DS4_THINK_MAX ? DS4_THINK_MAX : DS4_THINK_HIGH;
 }
 
@@ -714,9 +751,17 @@ static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
         return true;
     }
     if (!strcmp(s, "xhigh") || !strcmp(s, "high") ||
-        !strcmp(s, "medium") || !strcmp(s, "low"))
+        !strcmp(s, "medium") || !strcmp(s, "low") ||
+        !strcmp(s, "minimal"))
     {
+        /* DS4 only exposes HIGH and MAX above zero, so "minimal" collapses to
+         * the smallest non-zero level (HIGH). Callers that need *no* reasoning
+         * must use "none" instead. */
         *out = DS4_THINK_HIGH;
+        return true;
+    }
+    if (!strcmp(s, "none")) {
+        *out = DS4_THINK_NONE;
         return true;
     }
     return false;
@@ -1077,6 +1122,8 @@ static void append_raw_json_line(buf *b, const char *json) {
     buf_puts(b, json);
 }
 
+static void json_escape(buf *b, const char *s);
+
 static char *openai_function_schema_from_tool(const char *raw) {
     const char *p = raw;
     json_ws(&p);
@@ -1105,6 +1152,158 @@ static char *openai_function_schema_from_tool(const char *raw) {
         json_ws(&p);
     }
     return NULL;
+}
+
+static char *responses_special_schema_from_tool(const char *raw) {
+    const char *p = raw;
+    json_ws(&p);
+    if (*p != '{') return NULL;
+    p++;
+
+    char *type = NULL;
+    char *description = NULL;
+    char *parameters = NULL;
+    char *out = NULL;
+
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto done;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto done;
+        }
+        p++;
+        if (!strcmp(key, "type")) {
+            free(type);
+            if (!json_string(&p, &type)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "description")) {
+            free(description);
+            if (!json_string(&p, &description)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "parameters")) {
+            free(parameters);
+            if (!json_raw_value(&p, &parameters)) {
+                free(key);
+                goto done;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto done;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+
+    if (type && !strcmp(type, "tool_search")) {
+        buf b = {0};
+        buf_puts(&b, "{\"name\":\"tool_search\",\"description\":");
+        json_escape(&b, description ? description : "Search available tools.");
+        buf_puts(&b, ",\"parameters\":");
+        buf_puts(&b, parameters ? parameters :
+                 "{\"type\":\"object\",\"properties\":{}}");
+        buf_putc(&b, '}');
+        out = buf_take(&b);
+    }
+
+done:
+    free(type);
+    free(description);
+    free(parameters);
+    return out;
+}
+
+static char *responses_namespace_function_schema_from_tool(const char *raw,
+                                                           const char *namespace,
+                                                           char **wire_name) {
+    const char *p = raw;
+    json_ws(&p);
+    if (*p != '{') return NULL;
+    p++;
+
+    char *type = NULL;
+    char *name = NULL;
+    char *description = NULL;
+    char *parameters = NULL;
+    char *out = NULL;
+
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto done;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto done;
+        }
+        p++;
+        if (!strcmp(key, "type")) {
+            free(type);
+            if (!json_string(&p, &type)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "name")) {
+            free(name);
+            if (!json_string(&p, &name)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "description")) {
+            free(description);
+            if (!json_string(&p, &description)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "parameters") || !strcmp(key, "input_schema")) {
+            free(parameters);
+            if (!json_raw_value(&p, &parameters)) {
+                free(key);
+                goto done;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto done;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+
+    if ((!type || !strcmp(type, "function")) && namespace && name && name[0]) {
+        buf prompt_name = {0};
+        buf_puts(&prompt_name, namespace);
+        buf_puts(&prompt_name, name);
+
+        buf b = {0};
+        buf_puts(&b, "{\"name\":");
+        json_escape(&b, prompt_name.ptr ? prompt_name.ptr : name);
+        buf_puts(&b, ",\"description\":");
+        json_escape(&b, description ? description : "");
+        buf_puts(&b, ",\"parameters\":");
+        buf_puts(&b, parameters ? parameters :
+                 "{\"type\":\"object\",\"properties\":{}}");
+        buf_putc(&b, '}');
+        out = buf_take(&b);
+        if (wire_name) *wire_name = xstrdup(name);
+        buf_free(&prompt_name);
+    }
+
+done:
+    free(type);
+    free(name);
+    free(description);
+    free(parameters);
+    return out;
 }
 
 static bool parse_schema_properties(const char *json, tool_schema_order *order) {
@@ -1156,7 +1355,11 @@ static bool parse_schema_properties(const char *json, tool_schema_order *order) 
     return *p == '}';
 }
 
-static void tool_schema_orders_add_json(tool_schema_orders *orders, const char *json) {
+static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
+                                             const char *json,
+                                             const char *namespace,
+                                             const char *wire_name,
+                                             bool responses_tool_search) {
     if (!orders || !json) return;
     const char *p = json;
     json_ws(&p);
@@ -1196,7 +1399,10 @@ static void tool_schema_orders_add_json(tool_schema_orders *orders, const char *
         if (*p == ',') p++;
         json_ws(&p);
     }
-    if (order.name && order.len > 0) {
+    if (order.name) {
+        if (namespace && namespace[0]) order.namespace = xstrdup(namespace);
+        if (wire_name && wire_name[0]) order.wire_name = xstrdup(wire_name);
+        order.responses_tool_search = responses_tool_search;
         tool_schema_orders_push(orders, order);
         memset(&order, 0, sizeof(order));
     }
@@ -1204,10 +1410,100 @@ done:
     tool_schema_order_free(&order);
 }
 
+static void tool_schema_orders_add_json(tool_schema_orders *orders, const char *json) {
+    tool_schema_orders_add_json_wire(orders, json, NULL, NULL, false);
+}
+
+static bool append_responses_namespace_tool_schemas(buf *schemas,
+                                                    tool_schema_orders *orders,
+                                                    const char *raw) {
+    const char *p = raw;
+    json_ws(&p);
+    if (*p != '{') return false;
+    p++;
+
+    char *type = NULL;
+    char *name = NULL;
+    char *tools = NULL;
+    bool appended = false;
+
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto done;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto done;
+        }
+        p++;
+        if (!strcmp(key, "type")) {
+            free(type);
+            if (!json_string(&p, &type)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "name")) {
+            free(name);
+            if (!json_string(&p, &name)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "tools")) {
+            free(tools);
+            if (!json_raw_value(&p, &tools)) {
+                free(key);
+                goto done;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto done;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+
+    if (!type || strcmp(type, "namespace") || !name || !tools) goto done;
+
+    const char *tp = tools;
+    json_ws(&tp);
+    if (*tp != '[') goto done;
+    tp++;
+    json_ws(&tp);
+    while (*tp && *tp != ']') {
+        char *tool_raw = NULL;
+        if (!json_raw_value(&tp, &tool_raw)) goto done;
+        char *wire_name = NULL;
+        char *schema =
+            responses_namespace_function_schema_from_tool(tool_raw, name, &wire_name);
+        if (schema) {
+            append_raw_json_line(schemas, schema);
+            tool_schema_orders_add_json_wire(orders, schema, name, wire_name, false);
+            appended = true;
+        }
+        free(schema);
+        free(wire_name);
+        free(tool_raw);
+        json_ws(&tp);
+        if (*tp == ',') tp++;
+        json_ws(&tp);
+    }
+
+done:
+    free(type);
+    free(name);
+    free(tools);
+    return appended;
+}
+
 /* OpenAI wraps tools as {"type":"function","function":{...}}. Anthropic sends
  * the function schema directly as {"name":...,"input_schema":...}. The DS4
  * prompt wants one raw function schema per line, so unwrap OpenAI tools and keep
- * already-direct schemas unchanged. */
+ * already-direct schemas unchanged. Responses can additionally group tools in a
+ * namespace item; those are flattened for DSML prompt rendering while preserving
+ * their client-facing name and namespace for response output. */
 static bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders) {
     json_ws(p);
     if (json_lit(p, "null")) {
@@ -1223,9 +1519,21 @@ static bool parse_tools_value(const char **p, char **out, tool_schema_orders *or
         char *raw = NULL;
         if (!json_raw_value(p, &raw)) goto bad;
         char *function = openai_function_schema_from_tool(raw);
-        const char *schema = function ? function : raw;
-        append_raw_json_line(&schemas, schema);
-        tool_schema_orders_add_json(orders, schema);
+        if (function) {
+            append_raw_json_line(&schemas, function);
+            tool_schema_orders_add_json(orders, function);
+        } else if (!append_responses_namespace_tool_schemas(&schemas, orders, raw)) {
+            char *special = responses_special_schema_from_tool(raw);
+            if (special) {
+                append_raw_json_line(&schemas, special);
+                tool_schema_orders_add_json_wire(orders, special,
+                                                 NULL, NULL, true);
+            } else {
+                append_raw_json_line(&schemas, raw);
+                tool_schema_orders_add_json(orders, raw);
+            }
+            free(special);
+        }
         free(function);
         free(raw);
         json_ws(p);
@@ -1977,6 +2285,177 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     return buf_take(&out);
 }
 
+/* Render only the semantic tail that must be appended to the live KV for a
+ * Responses continuation.
+ *
+ * In the common Codex/pi tool path, the previous assistant tool-call turn is
+ * already in the model session, including hidden thinking.  The next request
+ * only provides function_call_output/custom_tool_call_output items, sometimes
+ * inside a full visible replay and sometimes as a short tail.  Re-rendering the
+ * assistant call here would duplicate it and destroy cache alignment, so this
+ * function starts at the first new item and emits only:
+ *
+ *   previous EOS, tool results, and the next assistant prefix.
+ *
+ * This is intentionally independent from req.prompt's already-tokenized suffix:
+ * suffix tokenization happens later after the cache decision, using the live
+ * token prefix as the boundary.  That avoids BPE merges across the visible
+ * replay/live-KV boundary. */
+static char *render_responses_live_tail(const chat_msgs *msgs, int start,
+                                        ds4_think_mode think_mode) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    buf out = {0};
+    buf_puts(&out, "<｜end▁of▁sentence｜>");
+
+    bool pending_assistant = false;
+    bool pending_tool_result = false;
+    for (int i = start; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) {
+            continue;
+        } else if (!strcmp(m->role, "user")) {
+            buf_puts(&out, "<｜User｜>");
+            buf_puts(&out, m->content ? m->content : "");
+            pending_assistant = true;
+            pending_tool_result = false;
+        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+            if (!pending_tool_result) buf_puts(&out, "<｜User｜>");
+            buf_puts(&out, "<tool_result>");
+            append_dsml_text_escaped(&out, m->content);
+            buf_puts(&out, "</tool_result>");
+            pending_assistant = true;
+            pending_tool_result = true;
+        } else if (!strcmp(m->role, "assistant")) {
+            if (pending_assistant) {
+                buf_puts(&out, "<｜Assistant｜>");
+                if (think) {
+                    buf_puts(&out, "<think>");
+                    buf_puts(&out, m->reasoning ? m->reasoning : "");
+                    buf_puts(&out, "</think>");
+                } else {
+                    buf_puts(&out, "</think>");
+                }
+            }
+            buf_puts(&out, m->content ? m->content : "");
+            append_dsml_tool_calls_text(&out, &m->calls);
+            buf_puts(&out, "<｜end▁of▁sentence｜>");
+            pending_assistant = false;
+            pending_tool_result = false;
+        }
+    }
+
+    if (pending_assistant) {
+        buf_puts(&out, "<｜Assistant｜>");
+        buf_puts(&out, think ? "<think>" : "</think>");
+    }
+    return buf_take(&out);
+}
+
+static bool chat_msg_has_call_id(const chat_msg *m, const char *id) {
+    if (!m || !id || !id[0] || strcmp(m->role, "assistant")) return false;
+    for (int i = 0; i < m->calls.len; i++) {
+        if (m->calls.v[i].id && !strcmp(m->calls.v[i].id, id)) return true;
+    }
+    return false;
+}
+
+static const chat_msg *responses_find_prior_call_msg(const chat_msgs *msgs,
+                                                     int before,
+                                                     const char *id) {
+    if (!msgs || !id || !id[0]) return NULL;
+    if (before > msgs->len) before = msgs->len;
+    for (int i = before - 1; i >= 0; i--) {
+        if (chat_msg_has_call_id(&msgs->v[i], id)) return &msgs->v[i];
+    }
+    return NULL;
+}
+
+/* Validate Responses tool outputs before rendering.
+ *
+ * A tool output with a call_id is meaningful only if either:
+ *   1. DS4 still has the matching live assistant call in memory, or
+ *   2. the same request replays the prior assistant call item.
+ *
+ * Case 1 is the fast, protocol-native continuation path: keep the live KV and
+ * append only the tool result.  Case 2 is stateless replay after restart or
+ * branching.  In thinking mode, case 2 is only complete if the replay also
+ * carries reasoning state for the assistant call.  Official Responses clients
+ * can do this with reasoning items / encrypted reasoning content; a visible
+ * transcript alone is not enough because it omits hidden tokens that affected
+ * the next-token distribution. */
+static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
+                                            ds4_think_mode think_mode,
+                                            bool *requires_live_tool_state,
+                                            bool *requires_live_reasoning,
+                                            char *err, size_t errlen) {
+    if (!msgs) return true;
+    if (requires_live_tool_state) *requires_live_tool_state = false;
+    if (requires_live_reasoning) *requires_live_reasoning = false;
+    const bool needs_reasoning = ds4_think_mode_enabled(think_mode);
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (strcmp(m->role, "tool") && strcmp(m->role, "function")) continue;
+        if (!m->tool_call_id || !m->tool_call_id[0]) continue;
+
+        const bool live_known = responses_live_has_call_id(s, m->tool_call_id);
+        const chat_msg *prior = responses_find_prior_call_msg(msgs, i, m->tool_call_id);
+        if (!live_known && !prior) {
+            snprintf(err, errlen,
+                     "unknown tool output call_id %s; replay full Responses history",
+                     m->tool_call_id);
+            return false;
+        }
+        if (!prior) {
+            if (requires_live_tool_state) *requires_live_tool_state = true;
+            continue;
+        }
+        if (needs_reasoning &&
+            (!prior->reasoning || !prior->reasoning[0]))
+        {
+            if (requires_live_reasoning) *requires_live_reasoning = true;
+        }
+    }
+    return true;
+}
+
+/* Record the call ids and suffix candidate for a live Responses continuation.
+ *
+ * This only prepares evidence.  generate_job() later checks that the live
+ * server state is still exactly at the remembered token frontier before using
+ * it.  If another request already replaced the session, normal token/text/disk
+ * prefix matching handles the request instead. */
+static void responses_prepare_live_continuation(request *r,
+                                                const chat_msgs *msgs) {
+    if (!r || r->api != API_RESPONSES || !msgs || msgs->len == 0) return;
+
+    int tail_start = msgs->len;
+    while (tail_start > 0) {
+        const chat_msg *m = &msgs->v[tail_start - 1];
+        if (strcmp(m->role, "tool") && strcmp(m->role, "function")) break;
+        tail_start--;
+    }
+    if (tail_start == msgs->len) return;
+
+    stop_list_clear(&r->responses_live_call_ids);
+    if (tail_start > 0) {
+        const int anchor = tail_start - 1;
+        const chat_msg *assistant = &msgs->v[anchor];
+        if (strcmp(assistant->role, "assistant") || assistant->calls.len == 0) return;
+        for (int i = 0; i < assistant->calls.len; i++) {
+            id_list_push_unique(&r->responses_live_call_ids, assistant->calls.v[i].id);
+        }
+    } else {
+        for (int i = tail_start; i < msgs->len; i++) {
+            id_list_push_unique(&r->responses_live_call_ids, msgs->v[i].tool_call_id);
+        }
+    }
+    if (r->responses_live_call_ids.len == 0) return;
+
+    free(r->responses_live_suffix_text);
+    r->responses_live_suffix_text =
+        render_responses_live_tail(msgs, tail_start, r->think_mode);
+}
+
 /* The API parsers are intentionally selective JSON parsers: they keep only
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
@@ -2345,6 +2824,951 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
 bad:
     chat_msgs_free(&msgs);
     free(system);
+    free(tool_schemas);
+    snprintf(err, errlen, "invalid JSON request");
+    request_free(r);
+    return false;
+}
+
+/* Responses API: convert a content-array item (input_text/output_text/text) into a
+ * concatenated string. Strict shape check: bare string, null, or an array of
+ * recognized text blocks. Numbers / objects / arrays-of-primitives at the top
+ * level all reject so the client sees a 400 instead of an answer built on
+ * silently dropped context. */
+static bool parse_responses_content_array(const char **p, char **out) {
+    json_ws(p);
+    if (**p == '"') return json_string(p, out);
+    if (json_lit(p, "null")) {
+        *out = xstrdup("");
+        return true;
+    }
+    if (**p != '[') {
+        return false;
+    }
+    (*p)++;
+    buf b = {0};
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p == '"') {
+            char *s = NULL;
+            if (!json_string(p, &s)) goto fail;
+            buf_puts(&b, s);
+            free(s);
+        } else if (**p == '{') {
+            (*p)++;
+            char *type = NULL;
+            char *text = NULL;
+            json_ws(p);
+            while (**p && **p != '}') {
+                char *key = NULL;
+                if (!json_string(p, &key)) {
+                    free(type);
+                    free(text);
+                    goto fail;
+                }
+                json_ws(p);
+                if (**p != ':') {
+                    free(key);
+                    free(type);
+                    free(text);
+                    goto fail;
+                }
+                (*p)++;
+                if (!strcmp(key, "type")) {
+                    free(type);
+                    if (!json_string(p, &type)) {
+                        free(key);
+                        free(text);
+                        goto fail;
+                    }
+                } else if (!strcmp(key, "text")) {
+                    free(text);
+                    /* The text field of a typed content block is a plain JSON
+                     * string. Accept null as the empty string for parity with
+                     * upstream serializers that emit null for empty blocks. */
+                    json_ws(p);
+                    if (json_lit(p, "null")) {
+                        text = xstrdup("");
+                    } else if (!json_string(p, &text)) {
+                        free(key);
+                        free(type);
+                        goto fail;
+                    }
+                } else if (!json_skip_value(p)) {
+                    free(key);
+                    free(type);
+                    free(text);
+                    goto fail;
+                }
+                free(key);
+                json_ws(p);
+                if (**p == ',') (*p)++;
+                json_ws(p);
+            }
+            if (**p != '}') {
+                free(type);
+                free(text);
+                goto fail;
+            }
+            (*p)++;
+            /* Fail closed: a content object must carry a known text-like type
+             * AND a text field. Anything else — missing type, missing text,
+             * image/file/audio types, future schema-drift — is rejected so the
+             * client gets a 400 instead of an answer built on context the
+             * server discarded silently. */
+            bool is_text_block = type && (
+                !strcmp(type, "input_text") ||
+                !strcmp(type, "output_text") ||
+                !strcmp(type, "text") ||
+                !strcmp(type, "summary_text") ||
+                !strcmp(type, "reasoning_text"));
+            if (!is_text_block || !text) {
+                free(type);
+                free(text);
+                goto fail;
+            }
+            buf_puts(&b, text);
+            free(type);
+            free(text);
+        } else {
+            /* Reject primitives, arrays-of-arrays, nulls: a content array
+             * element must be either a string or a typed text object. */
+            goto fail;
+        }
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') goto fail;
+    (*p)++;
+    *out = buf_take(&b);
+    return true;
+fail:
+    buf_free(&b);
+    return false;
+}
+
+/* Codex /v1/responses input items have a `type` discriminator (message,
+ * function_call, function_call_output, reasoning, custom_tool_call,
+ * custom_tool_call_output, ...). We collapse them into chat_msgs the same way
+ * the chat completion / Anthropic parsers do, so the rest of the engine sees a
+ * single conversation history shape.
+ *
+ * Protocol contract for stateless replay:
+ *   - The client must replay response.output items before tool outputs.
+ *   - For reasoning models, the replay must also include reasoning state.  DS4
+ *     can render plain reasoning summaries/content, but it cannot decrypt
+ *     reasoning.encrypted_content.  If live state is unavailable and the replay
+ *     only contains visible messages/tool calls, later validation marks it
+ *     incomplete and the request is rejected.
+ *
+ * Reasoning items are merged into the next assistant message so
+ * render_chat_prompt_text can wrap them in <think>. */
+static bool parse_responses_input(const char **p, chat_msgs *msgs,
+                                  buf *loaded_tool_schemas,
+                                  tool_schema_orders *orders) {
+    json_ws(p);
+    if (**p != '[') return false;
+    (*p)++;
+
+    buf pending_reasoning = {0};
+
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p != '{') goto fail;
+        (*p)++;
+        char *type = NULL;
+        char *role = NULL;
+        char *content = NULL;
+        char *name = NULL;
+        char *namespace = NULL;
+        char *call_id = NULL;
+        char *item_id = NULL;
+        char *arguments = NULL;
+        char *output = NULL;
+        char *input_str = NULL;
+        char *summary = NULL;
+        char *action = NULL;
+        char *result = NULL;
+        char *tools_json = NULL;
+        char *status_str = NULL;
+        json_ws(p);
+        while (**p && **p != '}') {
+            char *key = NULL;
+            if (!json_string(p, &key)) goto item_fail;
+            json_ws(p);
+            if (**p != ':') {
+                free(key);
+                goto item_fail;
+            }
+            (*p)++;
+            if (!strcmp(key, "type")) {
+                free(type);
+                if (!json_string(p, &type)) {
+                    free(key);
+                    goto item_fail;
+                }
+            } else if (!strcmp(key, "role")) {
+                free(role);
+                if (!json_string(p, &role)) {
+                    free(key);
+                    goto item_fail;
+                }
+            } else if (!strcmp(key, "content")) {
+                free(content);
+                if (!parse_responses_content_array(p, &content)) {
+                    free(key);
+                    goto item_fail;
+                }
+            } else if (!strcmp(key, "name")) {
+                free(name);
+                if (!json_string(p, &name)) {
+                    free(key);
+                    goto item_fail;
+                }
+            } else if (!strcmp(key, "namespace")) {
+                free(namespace);
+                if (!json_string(p, &namespace)) {
+                    free(key);
+                    goto item_fail;
+                }
+            } else if (!strcmp(key, "call_id")) {
+                free(call_id);
+                if (!json_string(p, &call_id)) {
+                    free(key);
+                    goto item_fail;
+                }
+            } else if (!strcmp(key, "id")) {
+                free(item_id);
+                if (!json_string(p, &item_id)) {
+                    free(key);
+                    goto item_fail;
+                }
+            } else if (!strcmp(key, "arguments")) {
+                free(arguments);
+                json_ws(p);
+                if (**p == '"') {
+                    if (!json_string(p, &arguments)) {
+                        free(key);
+                        goto item_fail;
+                    }
+                } else if (!json_raw_value(p, &arguments)) {
+                    free(key);
+                    goto item_fail;
+                }
+            } else if (!strcmp(key, "output")) {
+                free(output);
+                json_ws(p);
+                if (**p == '[') {
+                    if (!parse_responses_content_array(p, &output)) {
+                        free(key);
+                        goto item_fail;
+                    }
+                } else if (**p == '"') {
+                    if (!json_string(p, &output)) {
+                        free(key);
+                        goto item_fail;
+                    }
+                } else if (!json_raw_value(p, &output)) {
+                    free(key);
+                    goto item_fail;
+                }
+            } else if (!strcmp(key, "input")) {
+                free(input_str);
+                json_ws(p);
+                if (**p == '"') {
+                    if (!json_string(p, &input_str)) {
+                        free(key);
+                        goto item_fail;
+                    }
+                } else if (!json_raw_value(p, &input_str)) {
+                    free(key);
+                    goto item_fail;
+                }
+            } else if (!strcmp(key, "summary")) {
+                free(summary);
+                if (!parse_responses_content_array(p, &summary)) {
+                    free(key);
+                    goto item_fail;
+                }
+            } else if (!strcmp(key, "action")) {
+                free(action);
+                if (!json_raw_value(p, &action)) {
+                    free(key);
+                    goto item_fail;
+                }
+            } else if (!strcmp(key, "result")) {
+                free(result);
+                json_ws(p);
+                if (**p == '"') {
+                    if (!json_string(p, &result)) {
+                        free(key);
+                        goto item_fail;
+                    }
+                } else if (!json_raw_value(p, &result)) {
+                    free(key);
+                    goto item_fail;
+                }
+            } else if (!strcmp(key, "status")) {
+                free(status_str);
+                if (!json_string(p, &status_str)) {
+                    free(key);
+                    goto item_fail;
+                }
+            } else if (!strcmp(key, "tools")) {
+                /* tool_search_output items carry their discovered tool list
+                 * here instead of in `output` / `result`. Keep it separate
+                 * from the human-visible result body so malformed tool lists
+                 * never get mistaken for normal tool output. */
+                free(tools_json);
+                if (!json_raw_value(p, &tools_json)) {
+                    free(key);
+                    goto item_fail;
+                }
+            } else if (!json_skip_value(p)) {
+                free(key);
+                goto item_fail;
+            }
+            free(key);
+            json_ws(p);
+            if (**p == ',') (*p)++;
+            json_ws(p);
+            continue;
+item_fail:
+            free(type);
+            free(role);
+            free(content);
+            free(name);
+            free(namespace);
+            free(call_id);
+            free(item_id);
+            free(arguments);
+            free(output);
+            free(input_str);
+            free(summary);
+            free(action);
+            free(result);
+            free(tools_json);
+            free(status_str);
+            buf_free(&pending_reasoning);
+            return false;
+        }
+        if (**p != '}') {
+            free(type);
+            free(role);
+            free(content);
+            free(name);
+            free(namespace);
+            free(call_id);
+            free(item_id);
+            free(arguments);
+            free(output);
+            free(input_str);
+            free(summary);
+            free(action);
+            free(result);
+            free(tools_json);
+            free(status_str);
+            goto fail;
+        }
+        (*p)++;
+
+        const char *t = type ? type : "message";
+        /* Replayed items must be in a terminal "completed" state. in_progress,
+         * incomplete, and failed all represent partial model state the client
+         * never confirmed — feeding them back as history would let DS4 continue
+         * from a tool action that never finished. Reject explicitly. */
+        if (status_str && status_str[0] &&
+            strcmp(status_str, "completed") != 0)
+        {
+            free(type);
+            free(role);
+            free(content);
+            free(name);
+            free(namespace);
+            free(call_id);
+            free(item_id);
+            free(arguments);
+            free(output);
+            free(input_str);
+            free(summary);
+            free(action);
+            free(result);
+            free(tools_json);
+            free(status_str);
+            buf_free(&pending_reasoning);
+            return false;
+        }
+        /* Three classes of items:
+         *   1. consumes_reasoning: assistant message / function_call / hosted-tool
+         *      call. Attaches pending reasoning to its own assistant message.
+         *   2. is_bookkeeping: compaction / context_compaction etc. Semantically
+         *      transparent — passes through without touching pending_reasoning.
+         *   3. everything else (user message, tool output): forces pending
+         *      reasoning to flush in-position as an empty assistant message so it
+         *      stays before this item in the rendered history. */
+        bool consumes_reasoning =
+            (!strcmp(t, "message") && role && !strcmp(role, "assistant")) ||
+            !strcmp(t, "function_call") || !strcmp(t, "custom_tool_call") ||
+            !strcmp(t, "local_shell_call") || !strcmp(t, "web_search_call") ||
+            !strcmp(t, "tool_search_call") || !strcmp(t, "image_generation_call");
+        bool is_bookkeeping =
+            !strcmp(t, "compaction") || !strcmp(t, "context_compaction");
+        if (!consumes_reasoning && !is_bookkeeping && pending_reasoning.len) {
+            chat_msg flush_msg = {0};
+            flush_msg.role = xstrdup("assistant");
+            flush_msg.content = xstrdup("");
+            flush_msg.reasoning = buf_take(&pending_reasoning);
+            chat_msgs_push(msgs, flush_msg);
+        }
+        if (!strcmp(t, "message")) {
+            chat_msg msg = {0};
+            msg.role = xstrdup(role ? role : "user");
+            msg.content = content ? content : xstrdup("");
+            content = NULL;
+            if (!strcmp(msg.role, "assistant") && pending_reasoning.len) {
+                msg.reasoning = buf_take(&pending_reasoning);
+            }
+            chat_msgs_push(msgs, msg);
+        } else if (!strcmp(t, "function_call") || !strcmp(t, "custom_tool_call")) {
+            tool_call tc = {0};
+            tc.id = xstrdup(call_id ? call_id : item_id ? item_id : "");
+            /* function_call uses `arguments` (JSON string); custom_tool_call uses
+             * `input` (free text). Treat both as the same on-wire argument blob —
+             * append_dsml_arguments_from_json will fall back to a single text param
+             * if the value isn't a JSON object. */
+            const char *args_src = arguments ? arguments :
+                                   input_str ? input_str : "{}";
+            tc.arguments = xstrdup(args_src);
+            if (strcmp(t, "custom_tool_call") && namespace && namespace[0] &&
+                name && name[0])
+            {
+                buf qualified = {0};
+                buf_puts(&qualified, namespace);
+                buf_puts(&qualified, name);
+                tc.name = buf_take(&qualified);
+            } else {
+                tc.name = xstrdup(name ? name : "");
+            }
+            /* A Responses turn that has both message text and tool calls splits
+             * them across separate output items; the chat template renders the
+             * second assistant record without an `<|Assistant|>` prefix, leaving
+             * the tool call bare. Merge into the previous assistant message
+             * when nothing user-like / tool-output-like came between them. */
+            chat_msg *last = msgs->len ? &msgs->v[msgs->len - 1] : NULL;
+            if (last && !strcmp(last->role, "assistant")) {
+                if (pending_reasoning.len && (!last->reasoning || !last->reasoning[0])) {
+                    free(last->reasoning);
+                    last->reasoning = buf_take(&pending_reasoning);
+                }
+                tool_calls_push(&last->calls, tc);
+            } else {
+                chat_msg msg = {0};
+                msg.role = xstrdup("assistant");
+                msg.content = xstrdup("");
+                if (pending_reasoning.len) msg.reasoning = buf_take(&pending_reasoning);
+                tool_calls_push(&msg.calls, tc);
+                chat_msgs_push(msgs, msg);
+            }
+        } else if (!strcmp(t, "function_call_output") || !strcmp(t, "custom_tool_call_output")) {
+            chat_msg msg = {0};
+            msg.role = xstrdup("tool");
+            msg.content = output ? output : xstrdup("");
+            output = NULL;
+            if (call_id || item_id) {
+                msg.tool_call_id = call_id ? call_id : item_id;
+                if (call_id) call_id = NULL;
+                else item_id = NULL;
+            }
+            chat_msgs_push(msgs, msg);
+        } else if (!strcmp(t, "reasoning")) {
+            /* Stash so it merges into the next assistant message. summary is the
+             * short-form list, content is the verbose chain. Either can be empty. */
+            if (summary && summary[0]) {
+                if (pending_reasoning.len) buf_putc(&pending_reasoning, '\n');
+                buf_puts(&pending_reasoning, summary);
+            }
+            if (content && content[0]) {
+                if (pending_reasoning.len) buf_putc(&pending_reasoning, '\n');
+                buf_puts(&pending_reasoning, content);
+            }
+        } else if (!strcmp(t, "local_shell_call") || !strcmp(t, "web_search_call") ||
+                   !strcmp(t, "tool_search_call") || !strcmp(t, "image_generation_call"))
+        {
+            /* Hosted-tool history isn't natively supported (DS4 doesn't register
+             * these tools), but a Codex client may still replay them when the
+             * model used them in a prior turn. Surface them as function_call
+             * shaped history so the next prompt retains the action that ran. */
+            tool_call tc = {0};
+            tc.id = xstrdup(call_id ? call_id : item_id ? item_id : "");
+            if (!strcmp(t, "tool_search_call")) {
+                tc.name = xstrdup("tool_search");
+            } else if (!strcmp(t, "local_shell_call")) {
+                tc.name = xstrdup("local_shell");
+            } else {
+                tc.name = xstrdup(t);
+            }
+            const char *args_src = action ? action :
+                                   arguments ? arguments :
+                                   input_str ? input_str : "{}";
+            tc.arguments = xstrdup(args_src);
+            chat_msg *last = msgs->len ? &msgs->v[msgs->len - 1] : NULL;
+            if (last && !strcmp(last->role, "assistant")) {
+                if (pending_reasoning.len && (!last->reasoning || !last->reasoning[0])) {
+                    free(last->reasoning);
+                    last->reasoning = buf_take(&pending_reasoning);
+                }
+                tool_calls_push(&last->calls, tc);
+            } else {
+                chat_msg msg = {0};
+                msg.role = xstrdup("assistant");
+                msg.content = xstrdup("");
+                if (pending_reasoning.len) msg.reasoning = buf_take(&pending_reasoning);
+                tool_calls_push(&msg.calls, tc);
+                chat_msgs_push(msgs, msg);
+            }
+        } else if (!strcmp(t, "local_shell_call_output") ||
+                   !strcmp(t, "web_search_call_output") ||
+                   !strcmp(t, "tool_search_output") ||
+                   !strcmp(t, "tool_search_call_output") ||
+                   !strcmp(t, "image_generation_call_output"))
+        {
+            if (!strcmp(t, "tool_search_output") && tools_json &&
+                loaded_tool_schemas && orders)
+            {
+                const char *tools_p = tools_json;
+                char *schemas = NULL;
+                if (!parse_tools_value(&tools_p, &schemas, orders)) {
+                    free(schemas);
+                    free(type);
+                    free(role);
+                    free(content);
+                    free(name);
+                    free(namespace);
+                    free(call_id);
+                    free(item_id);
+                    free(arguments);
+                    free(output);
+                    free(input_str);
+                    free(summary);
+                    free(action);
+                    free(result);
+                    free(tools_json);
+                    free(status_str);
+                    buf_free(&pending_reasoning);
+                    return false;
+                }
+                if (schemas && schemas[0]) {
+                    if (loaded_tool_schemas->len) buf_putc(loaded_tool_schemas, '\n');
+                    buf_puts(loaded_tool_schemas, schemas);
+                }
+                free(schemas);
+            }
+            chat_msg msg = {0};
+            msg.role = xstrdup("tool");
+            const char *body = output ? output :
+                               result ? result :
+                               tools_json ? tools_json : "";
+            msg.content = xstrdup(body);
+            if (call_id || item_id) {
+                msg.tool_call_id = call_id ? call_id : item_id;
+                if (call_id) call_id = NULL;
+                else item_id = NULL;
+            }
+            chat_msgs_push(msgs, msg);
+        } else if (!is_bookkeeping) {
+            /* Anything we don't have an explicit branch for would silently
+             * drop replay context. Fail the parse instead so the client sees
+             * the limitation rather than ending up with stale generation
+             * built on an incomplete history. Only compaction/context_compaction
+             * (true Codex bookkeeping) are allowed to pass through silently. */
+            free(type);
+            free(role);
+            free(content);
+            free(name);
+            free(namespace);
+            free(call_id);
+            free(item_id);
+            free(arguments);
+            free(output);
+            free(input_str);
+            free(summary);
+            free(action);
+            free(result);
+            free(tools_json);
+            free(status_str);
+            buf_free(&pending_reasoning);
+            return false;
+        }
+
+        free(type);
+        free(role);
+        free(content);
+        free(name);
+        free(namespace);
+        free(call_id);
+        free(item_id);
+        free(arguments);
+        free(output);
+        free(input_str);
+        free(summary);
+        free(action);
+        free(result);
+        free(tools_json);
+        free(status_str);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') goto fail;
+    (*p)++;
+    /* Trailing reasoning with no following message/tool item: attach it to an
+     * empty assistant message so the next turn still renders a <think>...</think>
+     * block. Dropping it loses model state when a previous response ended with
+     * a reasoning-only incomplete turn and the client replays the history. */
+    if (pending_reasoning.len) {
+        chat_msg msg = {0};
+        msg.role = xstrdup("assistant");
+        msg.content = xstrdup("");
+        msg.reasoning = buf_take(&pending_reasoning);
+        chat_msgs_push(msgs, msg);
+    }
+    buf_free(&pending_reasoning);
+    return true;
+fail:
+    buf_free(&pending_reasoning);
+    return false;
+}
+
+/* Responses API has `reasoning: {"effort": "...", "summary": "..."}`. effort
+ * controls thinking depth; summary mode (auto/concise/detailed) controls
+ * whether the wire emits summary deltas at all — per the spec, no reasoning
+ * summary is surfaced unless the client opts in. */
+static bool parse_responses_reasoning(const char **p, ds4_think_mode *effort,
+                                      bool *summary_opted_in,
+                                      bool *effort_seen) {
+    json_ws(p);
+    if (json_lit(p, "null")) return true;
+    if (**p != '{') return json_skip_value(p);
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "effort")) {
+            json_ws(p);
+            /* A `null` effort doesn't change thinking_enabled — it's the same
+             * as omitting the field. Only treat the field as a control if it
+             * carried an actual value. */
+            if (json_lit(p, "null")) {
+                /* nothing */
+            } else {
+                if (!parse_reasoning_effort_value(p, effort)) {
+                    free(key);
+                    return false;
+                }
+                if (effort_seen) *effort_seen = true;
+            }
+        } else if (!strcmp(key, "summary")) {
+            json_ws(p);
+            if (json_lit(p, "null")) {
+                /* explicit null disables summary */
+            } else if (**p == '"') {
+                char *mode = NULL;
+                if (!json_string(p, &mode)) {
+                    free(key);
+                    return false;
+                }
+                if (summary_opted_in &&
+                    (!strcmp(mode, "auto") ||
+                     !strcmp(mode, "concise") ||
+                     !strcmp(mode, "detailed")))
+                {
+                    *summary_opted_in = true;
+                }
+                free(mode);
+            } else if (!json_skip_value(p)) {
+                free(key);
+                return false;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
+static bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def_tokens,
+                                    int ctx_size, request *r, char *err, size_t errlen) {
+    request_init(r, REQ_CHAT, def_tokens);
+    r->api = API_RESPONSES;
+    const char *p = body;
+    bool got_input = false;
+    bool tool_choice_none = false;
+    bool got_thinking = false;
+    bool thinking_enabled = true;
+    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    chat_msgs msgs = {0};
+    buf loaded_tool_schemas = {0};
+    char *instructions = NULL;
+    char *tool_schemas = NULL;
+
+    json_ws(&p);
+    if (*p != '{') goto bad;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto bad;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto bad;
+        }
+        p++;
+        if (!strcmp(key, "input")) {
+            chat_msgs_free(&msgs);
+            json_ws(&p);
+            /* Codex CLI always sends `input` as an array; tolerate bare strings
+             * for parity with other Responses-API callers. */
+            if (*p == '"') {
+                char *plain = NULL;
+                if (!json_string(&p, &plain)) {
+                    free(key);
+                    goto bad;
+                }
+                chat_msg msg = {0};
+                msg.role = xstrdup("user");
+                msg.content = plain;
+                chat_msgs_push(&msgs, msg);
+            } else if (!parse_responses_input(&p, &msgs, &loaded_tool_schemas,
+                                              &r->tool_orders)) {
+                free(key);
+                goto bad;
+            }
+            got_input = true;
+        } else if (!strcmp(key, "instructions")) {
+            free(instructions);
+            instructions = NULL;
+            json_ws(&p);
+            if (json_lit(&p, "null")) {
+                instructions = xstrdup("");
+            } else if (!json_string(&p, &instructions)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "tools")) {
+            free(tool_schemas);
+            tool_schemas = NULL;
+            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "tool_choice")) {
+            json_ws(&p);
+            if (*p == '"') {
+                char *choice = NULL;
+                if (!json_string(&p, &choice)) {
+                    free(key);
+                    goto bad;
+                }
+                /* DS4 honours "none" (disable tools) and "auto" (model decides).
+                 * "required" and explicit function targets need constrained
+                 * decoding we don't implement — reject so clients see the
+                 * limitation instead of silently downgrading to auto. */
+                if (!strcmp(choice, "none")) {
+                    tool_choice_none = true;
+                } else if (strcmp(choice, "auto") != 0) {
+                    snprintf(err, errlen, "tool_choice=%s not supported", choice);
+                    free(choice);
+                    free(key);
+                    chat_msgs_free(&msgs);
+                    buf_free(&loaded_tool_schemas);
+                    free(instructions);
+                    free(tool_schemas);
+                    request_free(r);
+                    return false;
+                }
+                free(choice);
+            } else if (*p == '{') {
+                snprintf(err, errlen, "forced tool_choice not supported");
+                free(key);
+                chat_msgs_free(&msgs);
+                buf_free(&loaded_tool_schemas);
+                free(instructions);
+                free(tool_schemas);
+                request_free(r);
+                return false;
+            } else if (!json_skip_value(&p)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "model")) {
+            free(r->model);
+            if (!json_string(&p, &r->model)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "max_output_tokens") || !strcmp(key, "max_tokens")) {
+            if (!json_int(&p, &r->max_tokens)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "temperature")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->temperature = (float)v;
+        } else if (!strcmp(key, "top_p")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->top_p = (float)v;
+        } else if (!strcmp(key, "stream")) {
+            if (!json_bool(&p, &r->stream)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "reasoning")) {
+            bool effort_seen = false;
+            if (!parse_responses_reasoning(&p, &reasoning_effort,
+                                           &r->reasoning_summary_emit,
+                                           &effort_seen)) {
+                free(key);
+                goto bad;
+            }
+            /* Only an explicit effort value counts as the client opting into
+             * thinking control. summary alone, or `reasoning: null`, leaves the
+             * default behaviour (and the model_alias_* fallbacks below) intact. */
+            if (effort_seen) {
+                got_thinking = true;
+                /* Responses-API effort of "minimal" / "none" maps to disabled
+                 * thinking. Other effort values choose between HIGH and MAX. */
+                if (reasoning_effort == DS4_THINK_NONE) thinking_enabled = false;
+            }
+        } else if (!strcmp(key, "previous_response_id") ||
+                   !strcmp(key, "conversation"))
+        {
+            /* Official Responses state can be durable:
+             *   previous_response_id chains to a stored prior response, and
+             *   conversation points at a persistent Conversations object.
+             *
+             * DS4 does not yet implement that durable store.  The supported
+             * modes are either (a) a live in-memory continuation checked by
+             * visible transcript / tool call ids, or (b) stateless replay of
+             * the full input items.  Accepting a non-null durable reference
+             * without loading the referenced items would silently truncate the
+             * prompt, so reject it explicitly. */
+            json_ws(&p);
+            if (!json_lit(&p, "null")) {
+                snprintf(err, errlen,
+                         "%s is not supported; replay full input instead",
+                         key);
+                free(key);
+                chat_msgs_free(&msgs);
+                buf_free(&loaded_tool_schemas);
+                free(instructions);
+                free(tool_schemas);
+                request_free(r);
+                return false;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != '}') goto bad;
+    if (!got_input) {
+        snprintf(err, errlen, "missing input");
+        chat_msgs_free(&msgs);
+        buf_free(&loaded_tool_schemas);
+        free(instructions);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
+    /* instructions in the Responses API replaces any system message — for Codex
+     * it carries the full agent system prompt. Prepend it so render produces a
+     * standard system+chat layout. */
+    if (instructions && instructions[0]) {
+        chat_msg msg = {0};
+        msg.role = xstrdup("system");
+        msg.content = instructions;
+        instructions = NULL;
+        /* Insert at the head so it precedes the conversation. */
+        chat_msgs_push(&msgs, msg);
+        if (msgs.len > 1) {
+            chat_msg tmp = msgs.v[msgs.len - 1];
+            for (int i = msgs.len - 1; i > 0; i--) msgs.v[i] = msgs.v[i - 1];
+            msgs.v[0] = tmp;
+        }
+    }
+    buf combined_tool_schemas = {0};
+    if (tool_schemas && tool_schemas[0]) buf_puts(&combined_tool_schemas, tool_schemas);
+    if (loaded_tool_schemas.len) {
+        if (combined_tool_schemas.len) buf_putc(&combined_tool_schemas, '\n');
+        buf_append(&combined_tool_schemas, loaded_tool_schemas.ptr,
+                   loaded_tool_schemas.len);
+    }
+    const char *active_tool_schemas =
+        (!tool_choice_none && combined_tool_schemas.len) ?
+        combined_tool_schemas.ptr : NULL;
+    r->has_tools = active_tool_schemas && active_tool_schemas[0];
+    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
+    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    r->think_mode = ds4_think_mode_for_context(
+        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
+                                         &r->responses_requires_live_tool_state,
+                                         &r->responses_requires_live_reasoning,
+                                         err, errlen)) {
+        chat_msgs_free(&msgs);
+        buf_free(&combined_tool_schemas);
+        buf_free(&loaded_tool_schemas);
+        free(instructions);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
+    kv_cache_restore_tool_memory_for_messages(s, &msgs);
+    tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    r->prompt_preserves_reasoning =
+        chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    responses_prepare_live_continuation(r, &msgs);
+    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
+                                             &r->tool_orders, r->think_mode);
+    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    chat_msgs_free(&msgs);
+    buf_free(&combined_tool_schemas);
+    buf_free(&loaded_tool_schemas);
+    free(instructions);
+    free(tool_schemas);
+    return true;
+bad:
+    chat_msgs_free(&msgs);
+    buf_free(&loaded_tool_schemas);
+    free(instructions);
     free(tool_schemas);
     snprintf(err, errlen, "invalid JSON request");
     request_free(r);
@@ -4153,9 +5577,812 @@ static bool request_uses_openai_live_stream(const request *r) {
     return r->stream && r->api == API_OPENAI && r->kind == REQ_CHAT;
 }
 
+static bool request_uses_responses_live_stream(const request *r) {
+    return r->stream && r->api == API_RESPONSES && r->kind == REQ_CHAT;
+}
+
 static bool request_uses_structured_stream(const request *r) {
     return r->stream && (r->api == API_ANTHROPIC ||
+                         r->api == API_RESPONSES ||
                          request_uses_openai_live_stream(r));
+}
+
+/* Codex' Responses API uses 24-hex suffixes for response/item ids. Prefix
+ * controls the variant (resp_, rs_, msg_, fc_) so each event references a
+ * stable identifier across output_item.added / .done. */
+static void responses_random_id(char *dst, size_t dstlen, const char *prefix) {
+    unsigned char bytes[12];
+    size_t pos = snprintf(dst, dstlen, "%s", prefix);
+    if (pos >= dstlen) return;
+    static uint64_t fallback_ctr;
+    if (!random_bytes(bytes, sizeof(bytes))) {
+        uint64_t a = ((uint64_t)time(NULL) << 32) ^ (uint64_t)getpid();
+        uint64_t b = ++fallback_ctr ^ (uint64_t)(uintptr_t)dst;
+        memcpy(bytes, &a, sizeof(a));
+        memcpy(bytes + sizeof(a), &b, sizeof(uint32_t));
+    }
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(bytes) && pos + 2 < dstlen; i++) {
+        dst[pos++] = hex[bytes[i] >> 4];
+        dst[pos++] = hex[bytes[i] & 15];
+    }
+    dst[pos] = '\0';
+}
+
+typedef enum {
+    RESP_STREAM_THINKING,
+    RESP_STREAM_TEXT,
+    RESP_STREAM_SUPPRESS,
+} responses_stream_mode;
+
+typedef struct {
+    responses_stream_mode mode;
+    size_t emit_pos;
+    bool active;
+    bool checked_think_prefix;
+    bool reasoning_item_opened;
+    bool reasoning_item_closed;
+    bool reasoning_summary_started;
+    bool reasoning_closed_naturally;
+    bool message_item_opened;
+    bool message_text_part_open;
+    bool message_item_closed;
+    bool reasoning_emitted_any;
+    bool message_emitted_any;
+    buf reasoning_text;
+    buf message_text;
+    char response_id[40];
+    char reasoning_id[40];
+    char message_id[40];
+    int reasoning_index;   /* output_index of the reasoning item (0 if present) */
+    int message_index;     /* output_index of the assistant message item */
+    int next_output_index; /* monotonic counter for upcoming output items */
+    int sequence;          /* monotonic per-event sequence_number Codex consumes */
+} responses_stream;
+
+static void responses_stream_init(const request *r, responses_stream *st) {
+    memset(st, 0, sizeof(*st));
+    st->mode = ds4_think_mode_enabled(r->think_mode) ? RESP_STREAM_THINKING : RESP_STREAM_TEXT;
+    responses_random_id(st->response_id, sizeof(st->response_id), "resp_");
+    responses_random_id(st->reasoning_id, sizeof(st->reasoning_id), "rs_");
+    responses_random_id(st->message_id, sizeof(st->message_id), "msg_");
+    st->reasoning_index = -1;
+    st->message_index = -1;
+}
+
+static void responses_stream_free(responses_stream *st) {
+    if (!st) return;
+    buf_free(&st->reasoning_text);
+    buf_free(&st->message_text);
+}
+
+/* Codex parses an explicit sequence_number on every Responses event for
+ * ordering and reconnect resilience. We inject it after the `{"type":...` head
+ * so emitters can stay readable while still producing the wire shape Codex
+ * expects. */
+static bool responses_sse_emit_event(int fd, responses_stream *st, const char *body) {
+    buf b = {0};
+    buf_puts(&b, "data: ");
+    /* body always starts with `{"type":"..."`. We splice in sequence_number
+     * after the closing quote of that string so every event has it as the
+     * second field. */
+    const char *type_close = NULL;
+    if (body[0] == '{') {
+        const char *p = body + 1;
+        /* Skip the literal `"type":` then the value string. */
+        if (!strncmp(p, "\"type\":\"", 8)) {
+            const char *q = p + 8;
+            while (*q && *q != '"') {
+                if (*q == '\\' && q[1]) q += 2;
+                else q++;
+            }
+            if (*q == '"') type_close = q + 1;
+        }
+    }
+    if (type_close) {
+        size_t head_len = (size_t)(type_close - body);
+        buf_append(&b, body, head_len);
+        buf_printf(&b, ",\"sequence_number\":%d", st->sequence++);
+        buf_puts(&b, type_close);
+    } else {
+        buf_puts(&b, body);
+    }
+    buf_puts(&b, "\n\n");
+    bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_sse_created(int fd, const request *r, responses_stream *st,
+                                  long created_at) {
+    buf b = {0};
+    buf_printf(&b,
+        "{\"type\":\"response.created\",\"response\":{\"id\":\"%s\","
+        "\"object\":\"response\",\"created_at\":%ld,\"status\":\"in_progress\","
+        "\"model\":", st->response_id, created_at);
+    json_escape(&b, r->model);
+    buf_puts(&b, ",\"output\":[]}}");
+    bool ok = responses_sse_emit_event(fd, st, b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_sse_reasoning_added(int fd, responses_stream *st) {
+    buf b = {0};
+    buf_printf(&b,
+        "{\"type\":\"response.output_item.added\",\"output_index\":%d,"
+        "\"item\":{\"id\":\"%s\",\"type\":\"reasoning\",\"status\":\"in_progress\","
+        "\"summary\":[]}}",
+        st->reasoning_index, st->reasoning_id);
+    bool ok = responses_sse_emit_event(fd, st, b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_sse_reasoning_summary_part_added(int fd, responses_stream *st) {
+    buf b = {0};
+    buf_printf(&b,
+        "{\"type\":\"response.reasoning_summary_part.added\","
+        "\"item_id\":\"%s\",\"output_index\":%d,\"summary_index\":0,"
+        "\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}",
+        st->reasoning_id, st->reasoning_index);
+    bool ok = responses_sse_emit_event(fd, st, b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_sse_reasoning_delta(int fd, responses_stream *st,
+                                          const char *text, size_t len) {
+    if (len == 0) return true;
+    buf b = {0};
+    buf_printf(&b,
+        "{\"type\":\"response.reasoning_summary_text.delta\","
+        "\"item_id\":\"%s\",\"output_index\":%d,\"summary_index\":0,\"delta\":",
+        st->reasoning_id, st->reasoning_index);
+    json_escape_n(&b, text, len);
+    buf_putc(&b, '}');
+    bool ok = responses_sse_emit_event(fd, st, b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static const char *responses_item_status_for_finish(const char *finish) {
+    if (finish && (!strcmp(finish, "length") || !strcmp(finish, "error"))) return "incomplete";
+    return "completed";
+}
+
+static bool responses_sse_reasoning_done(int fd, responses_stream *st,
+                                         const char *finish) {
+    /* If the stream terminates before `</think>` was actually observed the
+     * reasoning item is partial — regardless of why generation stopped (EOS,
+     * stop sequence, tool_calls, length, error). Force the item to incomplete
+     * so a client replay rejects it instead of feeding unfinished hidden state
+     * back as completed history. */
+    (void)finish;
+    const char *item_status =
+        st->reasoning_closed_naturally ? "completed" : "incomplete";
+    /* Mirror the message-item close sequence: emit summary_text.done +
+     * summary_part.done before the output_item.done so clients that key off
+     * part lifecycle don't see a dangling open summary part. */
+    buf b = {0};
+    buf_printf(&b,
+        "{\"type\":\"response.reasoning_summary_text.done\","
+        "\"item_id\":\"%s\",\"output_index\":%d,\"summary_index\":0,\"text\":",
+        st->reasoning_id, st->reasoning_index);
+    json_escape_n(&b, st->reasoning_text.ptr ? st->reasoning_text.ptr : "",
+                  st->reasoning_text.len);
+    buf_putc(&b, '}');
+    bool ok = responses_sse_emit_event(fd, st, b.ptr);
+    if (!ok) {
+        buf_free(&b);
+        return false;
+    }
+
+    if (st->reasoning_summary_started) {
+        buf_free(&b);
+        buf_printf(&b,
+            "{\"type\":\"response.reasoning_summary_part.done\","
+            "\"item_id\":\"%s\",\"output_index\":%d,\"summary_index\":0,"
+            "\"part\":{\"type\":\"summary_text\",\"text\":",
+            st->reasoning_id, st->reasoning_index);
+        json_escape_n(&b, st->reasoning_text.ptr ? st->reasoning_text.ptr : "",
+                      st->reasoning_text.len);
+        buf_puts(&b, "}}");
+        ok = responses_sse_emit_event(fd, st, b.ptr);
+        if (!ok) {
+            buf_free(&b);
+            return false;
+        }
+    }
+
+    buf_free(&b);
+    buf_printf(&b,
+        "{\"type\":\"response.output_item.done\",\"output_index\":%d,"
+        "\"item\":{\"id\":\"%s\",\"type\":\"reasoning\",\"status\":\"%s\",\"summary\":[",
+        st->reasoning_index, st->reasoning_id, item_status);
+    if (st->reasoning_text.len) {
+        buf_puts(&b, "{\"type\":\"summary_text\",\"text\":");
+        json_escape_n(&b, st->reasoning_text.ptr, st->reasoning_text.len);
+        buf_putc(&b, '}');
+    }
+    buf_puts(&b, "]}}");
+    ok = responses_sse_emit_event(fd, st, b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_sse_message_added(int fd, responses_stream *st) {
+    buf b = {0};
+    buf_printf(&b,
+        "{\"type\":\"response.output_item.added\",\"output_index\":%d,"
+        "\"item\":{\"id\":\"%s\",\"type\":\"message\",\"status\":\"in_progress\","
+        "\"role\":\"assistant\",\"content\":[]}}",
+        st->message_index, st->message_id);
+    bool ok = responses_sse_emit_event(fd, st, b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_sse_message_text_part_added(int fd, responses_stream *st) {
+    buf b = {0};
+    buf_printf(&b,
+        "{\"type\":\"response.content_part.added\","
+        "\"item_id\":\"%s\",\"output_index\":%d,\"content_index\":0,"
+        "\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}",
+        st->message_id, st->message_index);
+    bool ok = responses_sse_emit_event(fd, st, b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_sse_output_text_delta(int fd, responses_stream *st,
+                                            const char *text, size_t len) {
+    if (len == 0) return true;
+    buf b = {0};
+    buf_printf(&b,
+        "{\"type\":\"response.output_text.delta\","
+        "\"item_id\":\"%s\",\"output_index\":%d,\"content_index\":0,\"delta\":",
+        st->message_id, st->message_index);
+    json_escape_n(&b, text, len);
+    buf_putc(&b, '}');
+    bool ok = responses_sse_emit_event(fd, st, b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_sse_message_done(int fd, responses_stream *st,
+                                       const char *finish) {
+    const char *item_status = responses_item_status_for_finish(finish);
+    buf b = {0};
+    buf_printf(&b,
+        "{\"type\":\"response.output_text.done\","
+        "\"item_id\":\"%s\",\"output_index\":%d,\"content_index\":0,\"text\":",
+        st->message_id, st->message_index);
+    json_escape_n(&b, st->message_text.ptr ? st->message_text.ptr : "",
+                  st->message_text.len);
+    buf_putc(&b, '}');
+    bool ok = responses_sse_emit_event(fd, st, b.ptr);
+    if (!ok) {
+        buf_free(&b);
+        return false;
+    }
+
+    buf_free(&b);
+    buf_printf(&b,
+        "{\"type\":\"response.content_part.done\","
+        "\"item_id\":\"%s\",\"output_index\":%d,\"content_index\":0,"
+        "\"part\":{\"type\":\"output_text\",\"text\":",
+        st->message_id, st->message_index);
+    json_escape_n(&b, st->message_text.ptr ? st->message_text.ptr : "",
+                  st->message_text.len);
+    buf_puts(&b, ",\"annotations\":[]}}");
+    ok = responses_sse_emit_event(fd, st, b.ptr);
+    if (!ok) {
+        buf_free(&b);
+        return false;
+    }
+
+    buf_free(&b);
+    buf_printf(&b,
+        "{\"type\":\"response.output_item.done\",\"output_index\":%d,"
+        "\"item\":{\"id\":\"%s\",\"type\":\"message\",\"status\":\"%s\","
+        "\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":",
+        st->message_index, st->message_id, item_status);
+    json_escape_n(&b, st->message_text.ptr ? st->message_text.ptr : "",
+                  st->message_text.len);
+    buf_puts(&b, ",\"annotations\":[]}]}}");
+    ok = responses_sse_emit_event(fd, st, b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+/* Item identity per tool call must be stable across added/done/completed. */
+typedef struct {
+    char fc_id[40];
+    char call_id[64];
+    bool is_custom;
+    int output_index;
+} responses_tool_item;
+
+static bool responses_tool_call_is_tool_search(const tool_call *tc,
+                                               const tool_schema_order *order) {
+    return tc && tc->name && !strcmp(tc->name, "tool_search") &&
+           (!order || order->responses_tool_search);
+}
+
+/* The internal tool_call doesn't track whether it came from a function_call or
+ * a custom_tool_call (or what tool kind is registered). For round-trip
+ * correctness with the rare custom_tool_call clients, we preserve any provided
+ * call_id verbatim and pre-assign a stable fc_id; the discriminator currently
+ * defaults to function_call because Codex CLI registers all its tools as
+ * function tools. */
+static void responses_tool_items_build(responses_tool_item **out,
+                                       const tool_calls *calls,
+                                       int starting_output_index) {
+    *out = NULL;
+    if (!calls || calls->len == 0) return;
+    responses_tool_item *items = xmalloc((size_t)calls->len * sizeof(*items));
+    for (int i = 0; i < calls->len; i++) {
+        memset(&items[i], 0, sizeof(items[i]));
+        responses_random_id(items[i].fc_id, sizeof(items[i].fc_id), "fc_");
+        if (calls->v[i].id && calls->v[i].id[0]) {
+            snprintf(items[i].call_id, sizeof(items[i].call_id), "%s", calls->v[i].id);
+        } else {
+            responses_random_id(items[i].call_id, sizeof(items[i].call_id), "call_");
+        }
+        items[i].is_custom = false;
+        items[i].output_index = starting_output_index + i;
+    }
+    *out = items;
+}
+
+static void responses_append_function_call_item(buf *b, const tool_call *tc,
+                                                const responses_tool_item *item,
+                                                const char *item_status,
+                                                bool with_args,
+                                                const tool_schema_orders *orders) {
+    const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
+    if (responses_tool_call_is_tool_search(tc, order)) {
+        buf_printf(b,
+            "{\"id\":\"%s\",\"type\":\"tool_search_call\",\"status\":\"%s\","
+            "\"call_id\":\"%s\",\"execution\":\"client\",\"arguments\":",
+            item->fc_id, item_status, item->call_id);
+        if (with_args) append_json_object_or_empty(b, tc->arguments);
+        else buf_puts(b, "{}");
+        buf_putc(b, '}');
+        return;
+    }
+
+    const char *item_type = item->is_custom ? "custom_tool_call" : "function_call";
+    const char *body_field = item->is_custom ? "input" : "arguments";
+    buf_printf(b,
+        "{\"id\":\"%s\",\"type\":\"%s\",\"status\":\"%s\",\"name\":",
+        item->fc_id, item_type, item_status);
+    json_escape(b, order && order->wire_name ? order->wire_name :
+                   (tc->name ? tc->name : ""));
+    if (order && order->namespace) {
+        buf_puts(b, ",\"namespace\":");
+        json_escape(b, order->namespace);
+    }
+    buf_puts(b, ",\"call_id\":");
+    json_escape(b, item->call_id);
+    buf_printf(b, ",\"%s\":", body_field);
+    if (!with_args) {
+        buf_puts(b, "\"\"");
+    } else if (item->is_custom) {
+        json_escape(b, tc->arguments ? tc->arguments : "");
+    } else {
+        append_json_object_string(b, tc->arguments);
+    }
+    buf_putc(b, '}');
+}
+
+static bool responses_sse_function_call_event(int fd, responses_stream *st,
+                                              const tool_call *tc,
+                                              const responses_tool_item *item,
+                                              const tool_schema_orders *orders,
+                                              const char *finish,
+                                              bool done) {
+    /* The added event marks a tool call as in_progress per the Responses
+     * lifecycle; only output_item.done (and the terminal response output)
+     * carry the final completed / incomplete status. The added item ships with
+     * an empty arguments string so clients that accumulate via
+     * function_call_arguments.delta + .done don't end up with doubled JSON. */
+    const char *item_status = done ? responses_item_status_for_finish(finish) : "in_progress";
+    buf b = {0};
+    buf_printf(&b,
+        "{\"type\":\"response.output_item.%s\",\"output_index\":%d,\"item\":",
+        done ? "done" : "added", item->output_index);
+    responses_append_function_call_item(&b, tc, item, item_status, done, orders);
+    buf_putc(&b, '}');
+    bool ok = responses_sse_emit_event(fd, st, b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+/* Stream function-call arguments as a single delta + done, since DS4 generates
+ * the whole DSML invoke as one unit before the worker decides which tool was
+ * called. Clients that follow the OpenAI Responses lifecycle expect both
+ * events between output_item.added (in_progress) and output_item.done. */
+static bool responses_sse_function_call_arguments_done(int fd, responses_stream *st,
+                                                       const tool_call *tc,
+                                                       const responses_tool_item *item,
+                                                       const tool_schema_orders *orders) {
+    const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
+    if (item->is_custom || responses_tool_call_is_tool_search(tc, order)) return true;
+    buf args = {0};
+    append_json_object_string(&args, tc->arguments);
+    buf b = {0};
+    buf_printf(&b,
+        "{\"type\":\"response.function_call_arguments.delta\","
+        "\"item_id\":\"%s\",\"output_index\":%d,\"delta\":",
+        item->fc_id, item->output_index);
+    buf_append(&b, args.ptr ? args.ptr : "\"\"", args.ptr ? args.len : 2);
+    buf_putc(&b, '}');
+    bool ok = responses_sse_emit_event(fd, st, b.ptr);
+    if (!ok) {
+        buf_free(&b);
+        buf_free(&args);
+        return false;
+    }
+
+    buf_free(&b);
+    buf_printf(&b,
+        "{\"type\":\"response.function_call_arguments.done\","
+        "\"item_id\":\"%s\",\"output_index\":%d,\"name\":",
+        item->fc_id, item->output_index);
+    json_escape(&b, order && order->wire_name ? order->wire_name :
+                    (tc->name ? tc->name : ""));
+    if (order && order->namespace) {
+        buf_puts(&b, ",\"namespace\":");
+        json_escape(&b, order->namespace);
+    }
+    buf_puts(&b, ",\"arguments\":");
+    buf_append(&b, args.ptr ? args.ptr : "\"\"", args.ptr ? args.len : 2);
+    buf_putc(&b, '}');
+    ok = responses_sse_emit_event(fd, st, b.ptr);
+    buf_free(&b);
+    buf_free(&args);
+    return ok;
+}
+
+static const char *responses_status_for_finish(const char *finish) {
+    if (finish && !strcmp(finish, "length")) return "incomplete";
+    if (finish && !strcmp(finish, "error")) return "failed";
+    return "completed";
+}
+
+static bool responses_sse_completed(int fd, const request *r,
+                                    responses_stream *st,
+                                    const tool_calls *calls,
+                                    const responses_tool_item *tool_items,
+                                    const char *finish,
+                                    int prompt_tokens, int completion_tokens,
+                                    long created_at) {
+    /* Codex routes terminal behaviour off the event type, not response.status.
+     * Decide here so clients see response.failed / response.incomplete instead
+     * of a "completed" wrapper marked failed in a sub-field. */
+    const char *event_type = "response.completed";
+    if (finish && !strcmp(finish, "error")) event_type = "response.failed";
+    else if (finish && !strcmp(finish, "length")) event_type = "response.incomplete";
+    const char *status = responses_status_for_finish(finish);
+
+    buf b = {0};
+    buf_printf(&b,
+        "{\"type\":\"%s\",\"response\":{\"id\":\"%s\","
+        "\"object\":\"response\",\"created_at\":%ld,\"status\":\"%s\",\"model\":",
+        event_type, st->response_id, created_at, status);
+    json_escape(&b, r->model);
+    if (!strcmp(event_type, "response.failed")) {
+        buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
+                     "\"message\":\"generation failed\"}");
+    } else if (!strcmp(event_type, "response.incomplete")) {
+        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_tokens\"}");
+    }
+    const char *item_status = responses_item_status_for_finish(finish);
+    buf_puts(&b, ",\"output\":[");
+    bool wrote = false;
+    if (st->reasoning_emitted_any) {
+        /* Match responses_sse_reasoning_done: if the stream stopped before
+         * </think>, the reasoning item is partial regardless of the
+         * response-level finish status, so replay must reject it. */
+        const char *reasoning_status =
+            st->reasoning_closed_naturally ? "completed" : "incomplete";
+        buf_printf(&b,
+            "{\"id\":\"%s\",\"type\":\"reasoning\",\"status\":\"%s\",\"summary\":[",
+            st->reasoning_id, reasoning_status);
+        if (st->reasoning_text.len) {
+            buf_puts(&b, "{\"type\":\"summary_text\",\"text\":");
+            json_escape_n(&b, st->reasoning_text.ptr, st->reasoning_text.len);
+            buf_putc(&b, '}');
+        }
+        buf_puts(&b, "]}");
+        wrote = true;
+    }
+    if (st->message_emitted_any) {
+        if (wrote) buf_putc(&b, ',');
+        buf_printf(&b,
+            "{\"id\":\"%s\",\"type\":\"message\",\"status\":\"%s\","
+            "\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":",
+            st->message_id, item_status);
+        json_escape_n(&b, st->message_text.ptr ? st->message_text.ptr : "",
+                      st->message_text.len);
+        buf_puts(&b, ",\"annotations\":[]}]}");
+        wrote = true;
+    }
+    if (calls && tool_items) {
+        for (int i = 0; i < calls->len; i++) {
+            if (wrote) buf_putc(&b, ',');
+            responses_append_function_call_item(&b, &calls->v[i], &tool_items[i],
+                                                item_status, true,
+                                                &r->tool_orders);
+            wrote = true;
+        }
+    }
+    buf_putc(&b, ']');
+    buf_printf(&b,
+        ",\"usage\":{\"input_tokens\":%d,\"input_tokens_details\":{\"cached_tokens\":0},"
+        "\"output_tokens\":%d,\"output_tokens_details\":{\"reasoning_tokens\":0},"
+        "\"total_tokens\":%d}}}",
+        prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
+    bool ok = responses_sse_emit_event(fd, st, b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+/* Responses streaming consumes the same raw token text the OpenAI live stream
+ * consumes: <think>...</think> is reasoning, anything before the tool-call
+ * marker is output text. Tool-call argument deltas are not surfaced because
+ * Codex' SSE parser only ingests function_call items via output_item.done. */
+static bool responses_sse_stream_update(int fd, const request *r,
+                                        responses_stream *st,
+                                        const char *raw, size_t raw_len,
+                                        bool final) {
+    if (!st->active || !raw) return true;
+
+    /* The client only sees reasoning if it explicitly opted in via
+     * reasoning.summary. Otherwise we still need to walk past <think>...</think>
+     * to find the user-visible text, but we suppress the per-chunk emission. */
+    const bool emit_reasoning = r->reasoning_summary_emit;
+
+    if (st->mode == RESP_STREAM_THINKING) {
+        if (!st->checked_think_prefix) {
+            /* The chat template ends the prompt with the literal `<think>` (or
+             * `</think>` when thinking is off), so generation usually starts
+             * mid-reasoning rather than with the open tag. If the model does
+             * happen to repeat `<think>` we skip it; otherwise start from
+             * position 0. The earlier "no-think-prefix => switch to TEXT"
+             * shortcut here was incorrect: it leaked reasoning to clients as
+             * regular output_text because the model was already inside the
+             * think block when it produced its first token. The actual
+             * mode change to TEXT happens only when `</think>` is observed. */
+            const char *open = "<think>";
+            const size_t open_len = strlen(open);
+            if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
+                return true;
+            }
+            if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
+                st->emit_pos = open_len;
+            }
+            st->checked_think_prefix = true;
+        }
+
+        const char *close = strstr(raw + st->emit_pos, "</think>");
+        size_t limit;
+        if (close) {
+            limit = (size_t)(close - raw);
+        } else if (final) {
+            limit = raw_len;
+        } else {
+            const size_t hold = strlen("</think>") - 1;
+            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
+            limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
+        }
+
+        if (limit > st->emit_pos) {
+            if (emit_reasoning) {
+                if (!st->reasoning_item_opened) {
+                    st->reasoning_index = st->next_output_index++;
+                    if (!responses_sse_reasoning_added(fd, st)) return false;
+                    st->reasoning_item_opened = true;
+                }
+                if (!st->reasoning_summary_started) {
+                    if (!responses_sse_reasoning_summary_part_added(fd, st)) return false;
+                    st->reasoning_summary_started = true;
+                }
+                if (!responses_sse_reasoning_delta(fd, st,
+                                                   raw + st->emit_pos,
+                                                   limit - st->emit_pos)) return false;
+                buf_append(&st->reasoning_text, raw + st->emit_pos, limit - st->emit_pos);
+                st->reasoning_emitted_any = true;
+            }
+            st->emit_pos = limit;
+        }
+
+        if (close) {
+            st->emit_pos = (size_t)(close - raw) + strlen("</think>");
+            st->mode = RESP_STREAM_TEXT;
+            st->reasoning_closed_naturally = true;
+        } else if (final) {
+            st->mode = RESP_STREAM_SUPPRESS;
+            return true;
+        } else {
+            return true;
+        }
+    }
+
+    if (st->mode == RESP_STREAM_TEXT) {
+        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
+        size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
+                                              r->has_tools, final);
+
+        if (limit > st->emit_pos) {
+            if (!st->message_item_opened) {
+                st->message_index = st->next_output_index++;
+                if (!responses_sse_message_added(fd, st)) return false;
+                st->message_item_opened = true;
+            }
+            if (!st->message_text_part_open) {
+                if (!responses_sse_message_text_part_added(fd, st)) return false;
+                st->message_text_part_open = true;
+            }
+            if (!responses_sse_output_text_delta(fd, st,
+                                                 raw + st->emit_pos,
+                                                 limit - st->emit_pos)) return false;
+            buf_append(&st->message_text, raw + st->emit_pos, limit - st->emit_pos);
+            st->message_emitted_any = true;
+            st->emit_pos = limit;
+        }
+
+        if (tool) {
+            st->emit_pos = (size_t)(tool - raw);
+            st->mode = RESP_STREAM_SUPPRESS;
+        } else if (final) {
+            st->mode = RESP_STREAM_SUPPRESS;
+        }
+    }
+    return true;
+}
+
+static bool responses_sse_finish_live(int fd, const request *r,
+                                      responses_stream *st,
+                                      const char *raw, size_t raw_len,
+                                      const char *recovered_content,
+                                      const tool_calls *calls,
+                                      const char *finish,
+                                      int prompt_tokens, int completion_tokens,
+                                      long created_at) {
+    if (!responses_sse_stream_update(fd, r, st, raw, raw_len, true)) return false;
+
+    /* Close any half-open reasoning summary so the TUI knows the part ended
+     * before we slot in any tool calls or completion. */
+    if (st->reasoning_item_opened && !st->reasoning_item_closed) {
+        if (!responses_sse_reasoning_done(fd, st, finish)) return false;
+        st->reasoning_item_closed = true;
+    }
+    /* Recovery path: when DSML tool parsing fails the worker promotes the entire
+     * generation to assistant text. Streaming had already entered suppress mode
+     * at the tool marker, so anything in raw[st->emit_pos..raw_len] never made
+     * it to the client. Emit those bytes as additional output_text deltas so
+     * what the client accumulates matches output_item.done and the terminal
+     * response. We use the stream cursor instead of comparing against
+     * recovered_content because the raw text can begin with `<think>...</think>`
+     * which the streaming side consumed as reasoning, not message text. */
+    if (recovered_content && raw && st->emit_pos < raw_len) {
+        const char *tail = raw + st->emit_pos;
+        size_t tail_len = raw_len - st->emit_pos;
+        if (!st->message_item_opened) {
+            st->message_index = st->next_output_index++;
+            if (!responses_sse_message_added(fd, st)) return false;
+            st->message_item_opened = true;
+        }
+        if (!st->message_text_part_open) {
+            if (!responses_sse_message_text_part_added(fd, st)) return false;
+            st->message_text_part_open = true;
+        }
+        if (!responses_sse_output_text_delta(fd, st, tail, tail_len)) return false;
+        buf_append(&st->message_text, tail, tail_len);
+        st->message_emitted_any = true;
+        st->emit_pos = raw_len;
+    }
+    if (st->message_item_opened && !st->message_item_closed) {
+        if (!responses_sse_message_done(fd, st, finish)) return false;
+        st->message_item_closed = true;
+    }
+    responses_tool_item *items = NULL;
+    responses_tool_items_build(&items, calls, st->next_output_index);
+    if (items && calls) st->next_output_index += calls->len;
+    bool ok = true;
+    if (items && calls) {
+        for (int i = 0; i < calls->len && ok; i++) {
+            ok = responses_sse_function_call_event(fd, st, &calls->v[i], &items[i],
+                                                   &r->tool_orders, finish, false);
+            if (ok) ok = responses_sse_function_call_arguments_done(fd, st, &calls->v[i],
+                                                                    &items[i],
+                                                                    &r->tool_orders);
+            if (ok) ok = responses_sse_function_call_event(fd, st, &calls->v[i], &items[i],
+                                                           &r->tool_orders, finish, true);
+        }
+    }
+    if (ok) ok = responses_sse_completed(fd, r, st, calls, items, finish,
+                                         prompt_tokens, completion_tokens, created_at);
+    free(items);
+    return ok;
+}
+
+static bool responses_final_response(int fd, const request *r, const char *id,
+                                     const char *text, const char *reasoning,
+                                     const tool_calls *calls, const char *finish,
+                                     int prompt_tokens, int completion_tokens) {
+    (void)id;
+    char response_id[40], reasoning_id[40], message_id[40];
+    responses_random_id(response_id, sizeof(response_id), "resp_");
+    responses_random_id(reasoning_id, sizeof(reasoning_id), "rs_");
+    responses_random_id(message_id, sizeof(message_id), "msg_");
+
+    responses_tool_item *items = NULL;
+    responses_tool_items_build(&items, calls, 0);
+
+    long now = (long)time(NULL);
+    const char *status = responses_status_for_finish(finish);
+    const char *item_status = responses_item_status_for_finish(finish);
+    buf b = {0};
+    buf_printf(&b,
+        "{\"id\":\"%s\",\"object\":\"response\",\"created_at\":%ld,\"status\":\"%s\","
+        "\"model\":",
+        response_id, now, status);
+    json_escape(&b, r->model);
+    if (finish && !strcmp(finish, "error")) {
+        buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
+                     "\"message\":\"generation failed\"}");
+    } else if (finish && !strcmp(finish, "length")) {
+        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_tokens\"}");
+    }
+    buf_puts(&b, ",\"output\":[");
+    bool wrote = false;
+    if (reasoning && reasoning[0] && r->reasoning_summary_emit) {
+        /* Non-streaming path runs after the worker has post-processed the
+         * generation, so any reasoning here came from a parsed assistant turn
+         * where </think> was observed (otherwise the reasoning text would be
+         * empty). Tag it with the response-level item_status which still flips
+         * to incomplete/failed when finish is length/error. */
+        buf_printf(&b,
+            "{\"id\":\"%s\",\"type\":\"reasoning\",\"status\":\"%s\","
+            "\"summary\":[{\"type\":\"summary_text\",\"text\":",
+            reasoning_id, item_status);
+        json_escape(&b, reasoning);
+        buf_puts(&b, "}]}");
+        wrote = true;
+    }
+    if (text && text[0]) {
+        if (wrote) buf_putc(&b, ',');
+        buf_printf(&b,
+            "{\"id\":\"%s\",\"type\":\"message\",\"status\":\"%s\","
+            "\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":",
+            message_id, item_status);
+        json_escape(&b, text);
+        buf_puts(&b, ",\"annotations\":[]}]}");
+        wrote = true;
+    }
+    if (calls && items) {
+        for (int i = 0; i < calls->len; i++) {
+            if (wrote) buf_putc(&b, ',');
+            responses_append_function_call_item(&b, &calls->v[i], &items[i],
+                                                item_status, true,
+                                                &r->tool_orders);
+            wrote = true;
+        }
+    }
+    buf_putc(&b, ']');
+    buf_printf(&b,
+        ",\"usage\":{\"input_tokens\":%d,\"input_tokens_details\":{\"cached_tokens\":0},"
+        "\"output_tokens\":%d,\"output_tokens_details\":{\"reasoning_tokens\":0},"
+        "\"total_tokens\":%d}}",
+        prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
+    bool ok = http_response(fd, 200, "application/json", b.ptr);
+    buf_free(&b);
+    free(items);
+    return ok;
 }
 
 static bool final_response(int fd, const request *r, const char *id, const char *text,
@@ -4714,12 +6941,36 @@ typedef struct {
     uint64_t scan_clock;
 } tool_memory;
 
+typedef struct {
+    bool valid;
+    /* Token frontier of the live model session after the last successful
+     * Responses assistant turn.  Continuing from this point preserves hidden
+     * thinking and sampled DSML bytes that are not necessarily present in the
+     * client-visible replay. */
+    int live_tokens;
+    /* Rendered conversation text that the client is expected to replay.  This
+     * is deliberately the visible protocol transcript, not a dump of live KV:
+     * when reasoning summaries are not requested, hidden thinking is omitted.
+     * If a later request starts with this text, DS4 can continue from
+     * live_tokens and tokenize only the new suffix. */
+    char *visible_text;
+    size_t visible_len;
+    /* Tool-call ids generated at the same live frontier.  A following
+     * function_call_output/custom_tool_call_output for these ids is a direct
+     * protocol continuation and should not trigger prompt-prefix matching. */
+    stop_list call_ids;
+} responses_live_state;
+
+static bool id_list_contains(const stop_list *ids, const char *id);
+static void id_list_push_unique(stop_list *ids, const char *id);
+
 struct server {
     ds4_engine *engine;
     ds4_session *session;
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
+    responses_live_state responses_live;
     bool disable_exact_dsml_tool_replay;
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
@@ -4935,6 +7186,78 @@ static void tool_memory_free(tool_memory *m) {
     memset(m, 0, sizeof(*m));
 }
 
+/* Single live Responses state.
+ *
+ * This is not an implementation of persistent previous_response_id or the
+ * Conversations API.  DS4 currently rejects those durable-state parameters.
+ * The state below is only an in-memory optimization for the current local
+ * session, where the next request is expected to arrive immediately from the
+ * same agent loop.  If it does not match, DS4 falls back to the same prefix and
+ * disk-cache machinery used by chat/completions. */
+static void responses_live_clear_locked(responses_live_state *st) {
+    if (!st) return;
+    stop_list_clear(&st->call_ids);
+    free(st->visible_text);
+    st->visible_text = NULL;
+    st->visible_len = 0;
+    st->valid = false;
+    st->live_tokens = 0;
+}
+
+static void responses_live_free(responses_live_state *st) {
+    if (!st) return;
+    responses_live_clear_locked(st);
+    free(st->call_ids.v);
+    memset(st, 0, sizeof(*st));
+}
+
+static void responses_live_remember(server *s, const char *visible_text,
+                                    const tool_calls *calls) {
+    if (!s || !visible_text || !visible_text[0]) return;
+    pthread_mutex_lock(&s->tool_mu);
+    responses_live_clear_locked(&s->responses_live);
+    s->responses_live.visible_text = xstrdup(visible_text);
+    s->responses_live.visible_len = strlen(visible_text);
+    if (calls) {
+        for (int i = 0; i < calls->len; i++) {
+            id_list_push_unique(&s->responses_live.call_ids, calls->v[i].id);
+        }
+    }
+    s->responses_live.live_tokens = ds4_session_pos(s->session);
+    s->responses_live.valid = true;
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+static void responses_live_clear(server *s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->tool_mu);
+    responses_live_clear_locked(&s->responses_live);
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+static bool responses_live_has_call_id(server *s, const char *id) {
+    if (!s || !id || !id[0]) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    bool found = s->responses_live.valid &&
+                 id_list_contains(&s->responses_live.call_ids, id);
+    pthread_mutex_unlock(&s->tool_mu);
+    return found;
+}
+
+static bool responses_live_matches_request(server *s, const stop_list *ids,
+                                           int live_tokens) {
+    if (!s || !ids || ids->len == 0) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    bool ok = s->responses_live.valid &&
+              s->responses_live.live_tokens == live_tokens &&
+              s->responses_live.call_ids.len == ids->len;
+    for (int i = 0; ok && i < ids->len; i++) {
+        ok = id_list_contains(&s->responses_live.call_ids, ids->v[i]);
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return ok;
+}
+
 static bool tool_memory_has_id(server *s, const char *id) {
     if (!s || s->disable_exact_dsml_tool_replay || !id || !id[0]) return false;
     pthread_mutex_lock(&s->tool_mu);
@@ -5097,10 +7420,15 @@ static void apply_openai_stream_tool_ids(tool_calls *calls,
  *   DS4 engine payload written by ds4_session_save_payload()
  *   optional tool-id map section
  *
- * The filename is SHA1(rendered text bytes), not SHA1(token ids).  The optional
- * tool-id map is not part of model state, but it is needed to render future
- * client JSON back to the exact DSML sampled by the model.  We persist only
- * mappings whose DSML block appears in the saved rendered text.
+ * The filename is SHA1(cache text bytes), not SHA1(token ids).  For ordinary
+ * checkpoints the cache text is the rendered token prefix.  For live Responses
+ * checkpoints it can instead be the client-visible transcript: the payload
+ * still contains hidden reasoning KV, but the lookup key must be what the
+ * client can replay after a process restart or session switch.
+ *
+ * The optional tool-id map is not part of model state, but it is needed to
+ * render future client JSON back to the exact DSML sampled by the model.  We
+ * persist only mappings whose DSML block appears in the saved cache text.
  */
 
 #define KV_CACHE_MAGIC0 'K'
@@ -5121,6 +7449,7 @@ static void apply_openai_stream_tool_ids(tool_calls *calls,
 #define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 10000
 #define KV_CACHE_DEFAULT_MB 4096
 #define KV_EXT_TOOL_MAP (1u << 0)
+#define KV_EXT_RESPONSES_VISIBLE (1u << 1)
 #define KV_TOOL_MAP_MAGIC0 'K'
 #define KV_TOOL_MAP_MAGIC1 'T'
 #define KV_TOOL_MAP_MAGIC2 'M'
@@ -5918,8 +8247,9 @@ static void kv_cache_rewrite_tool_map(server *s, const char *path, const char *t
     (void)ok;
 }
 
-static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
-                                       int store_len, const char *reason) {
+static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
+                                            int store_len, const char *reason,
+                                            const char *cache_text_override) {
     kv_disk_cache *kc = &s->kv;
     if (!kc->enabled) return false;
     if (!tokens || store_len < kc->opt.min_tokens) return false;
@@ -5958,7 +8288,14 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     }
 
     size_t text_len = 0;
-    char *text = render_tokens_text(s->engine, &store_tokens, &text_len);
+    char *text = NULL;
+    const bool visible_key = cache_text_override && cache_text_override[0];
+    if (visible_key) {
+        text = xstrdup(cache_text_override);
+        text_len = strlen(text);
+    } else {
+        text = render_tokens_text(s->engine, &store_tokens, &text_len);
+    }
     if (text_len > UINT32_MAX) {
         server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache skipped tokens=%d because rendered text is too large", store_tokens.len);
         free(text);
@@ -5997,6 +8334,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     const uint64_t now = (uint64_t)time(NULL);
     uint8_t h[KV_CACHE_FIXED_HEADER];
     uint8_t ext_flags = tool_memory_count_dsml_in_text(s, text) > 0 ? KV_EXT_TOOL_MAP : 0;
+    if (visible_key) ext_flags |= KV_EXT_RESPONSES_VISIBLE;
     kv_fill_header(h, (uint8_t)quant_bits, kv_reason_code(reason), ext_flags,
                    (uint32_t)store_tokens.len, 0,
                    (uint32_t)ds4_session_ctx(s->session), now, now, payload_bytes);
@@ -6028,10 +8366,11 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
         unlink(tmp);
     } else {
         server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: kv cache stored tokens=%d trimmed=%d reason=%s size=%.2f MiB save=%.1f ms",
+                   "ds4-server: kv cache stored tokens=%d trimmed=%d reason=%s key=%s size=%.2f MiB save=%.1f ms",
                    store_tokens.len,
                    original_len - store_tokens.len,
                    reason,
+                   visible_key ? "responses-visible" : "token-text",
                    (double)(KV_CACHE_FIXED_HEADER + 4ull + text_len + payload_bytes + tool_map_bytes) / (1024.0 * 1024.0),
                    save_ms);
         kv_cache_evict(kc, live_tokens);
@@ -6043,9 +8382,38 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     return ok;
 }
 
+static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
+                                       int store_len, const char *reason) {
+    return kv_cache_store_live_prefix_text(s, tokens, store_len, reason, NULL);
+}
+
 static void kv_cache_store_current(server *s, const char *reason) {
     const ds4_tokens *tokens = ds4_session_tokens(s->session);
-    if (tokens) kv_cache_store_live_prefix(s, tokens, tokens->len, reason);
+    if (!tokens) return;
+
+    char *responses_visible_text = NULL;
+    pthread_mutex_lock(&s->tool_mu);
+    if (s->responses_live.valid &&
+        s->responses_live.live_tokens == tokens->len &&
+        s->responses_live.visible_text &&
+        s->responses_live.visible_text[0])
+    {
+        responses_visible_text = xstrdup(s->responses_live.visible_text);
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+
+    /* A Responses live checkpoint can contain hidden reasoning that the client
+     * intentionally does not replay.  For disk recovery after a session switch,
+     * key that payload by the visible protocol transcript, not by rendering the
+     * hidden tokens.  On load, DS4 restores the hidden KV payload and tokenizes
+     * only the visible suffix that follows this key. */
+    if (responses_visible_text) {
+        kv_cache_store_live_prefix_text(s, tokens, tokens->len, reason,
+                                        responses_visible_text);
+        free(responses_visible_text);
+    } else {
+        kv_cache_store_live_prefix(s, tokens, tokens->len, reason);
+    }
 }
 
 static void kv_cache_note_store(kv_disk_cache *kc, int tokens) {
@@ -6091,8 +8459,10 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
 
 static int kv_cache_try_load_text(server *s, const char *prompt_text,
                                   ds4_tokens *effective_prompt,
-                                  char **loaded_path_out) {
+                                  char **loaded_path_out,
+                                  uint8_t *loaded_ext_flags_out) {
     if (loaded_path_out) *loaded_path_out = NULL;
+    if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
     if (effective_prompt) effective_prompt->len = 0;
     kv_disk_cache *kc = &s->kv;
     if (!kc->enabled || !prompt_text) return 0;
@@ -6174,17 +8544,20 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
     if (loaded > 0) {
         const double load_ms = (now_sec() - load_t0) * 1000.0;
         if (loaded_path_out) *loaded_path_out = xstrdup(path);
+        if (loaded_ext_flags_out) *loaded_ext_flags_out = hdr.ext_flags;
         kc->continued_last_store_tokens = loaded;
+        const char *key_kind = (hdr.ext_flags & KV_EXT_RESPONSES_VISIBLE) ?
+            "responses-visible" : "token-text";
         if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
             unlink(path);
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: kv cache hit text tokens=%d text=%u quant=%u load=%.1f ms consumed file=%s",
-                       loaded, text_bytes, hdr.quant_bits, load_ms, path);
+                       "ds4-server: kv cache hit text tokens=%d text=%u quant=%u key=%s load=%.1f ms consumed file=%s",
+                       loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
         } else {
             kv_cache_touch_file(path, hdr.hits + 1);
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: kv cache hit text tokens=%d text=%u quant=%u load=%.1f ms file=%s",
-                       loaded, text_bytes, hdr.quant_bits, load_ms, path);
+                       "ds4-server: kv cache hit text tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
+                       loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
         }
     }
     free(cached_text);
@@ -6194,9 +8567,11 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
 
 static int kv_cache_try_load(server *s, const request *req,
                              ds4_tokens *effective_prompt,
-                             char **loaded_path_out) {
+                             char **loaded_path_out,
+                             uint8_t *loaded_ext_flags_out) {
     return kv_cache_try_load_text(s, req ? req->prompt_text : NULL,
-                                  effective_prompt, loaded_path_out);
+                                  effective_prompt, loaded_path_out,
+                                  loaded_ext_flags_out);
 }
 
 static int live_text_prefix_prompt(server *s, const request *req,
@@ -6223,6 +8598,74 @@ static int live_text_prefix_prompt(server *s, const request *req,
         s->engine, live_tokens, req->prompt_text + live_text_len,
         effective_prompt);
     free(live_text);
+    return live_tokens->len;
+}
+
+/* Tool-output-only Responses continuation.
+ *
+ * Some clients send just the new tool outputs after a tool call.  There is no
+ * long visible prefix to match in that shape; the call_id itself is the
+ * protocol binding to the previous live assistant output.  Use it only when the
+ * remembered live frontier and call-id set match exactly. */
+static int responses_live_continuation_prompt(server *s, const request *req,
+                                              int live_pos,
+                                              ds4_tokens *effective_prompt,
+                                              int *matched_ids) {
+    if (!s || !req || !effective_prompt) return 0;
+    if (req->api != API_RESPONSES || !req->responses_live_suffix_text) return 0;
+    if (req->responses_live_call_ids.len == 0) return 0;
+    if (!responses_live_matches_request(s, &req->responses_live_call_ids,
+                                        live_pos)) return 0;
+
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    if (!live_tokens || live_tokens->len != live_pos) return 0;
+
+    build_prompt_from_exact_prefix_and_text_suffix(
+        s->engine, live_tokens, req->responses_live_suffix_text,
+        effective_prompt);
+    if (matched_ids) *matched_ids = req->responses_live_call_ids.len;
+    return live_tokens->len;
+}
+
+/* Visible-replay Responses continuation.
+ *
+ * Other clients send the full visible transcript on every turn even though the
+ * API semantics still make the request a continuation.  For Responses, exact
+ * token-prefix matching is the wrong first question: hidden reasoning may be
+ * live in KV but absent from the replay by design.  Instead, verify that the
+ * request's rendered text begins with the visible transcript remembered at the
+ * live frontier.  If it does, continue from the live token prefix and tokenize
+ * only the bytes after that visible boundary.
+ *
+ * If this check fails, DS4 has no special Responses state to trust.  The caller
+ * then uses normal token/text/disk matching, which is the correct fallback for
+ * cold starts, edits, restarts, or cross-client replays. */
+static int responses_live_visible_prefix_prompt(server *s, const request *req,
+                                                int live_pos,
+                                                ds4_tokens *effective_prompt) {
+    if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
+    if (req->api != API_RESPONSES) return 0;
+
+    const size_t prompt_len = strlen(req->prompt_text);
+    size_t visible_len = 0;
+    pthread_mutex_lock(&s->tool_mu);
+    bool ok = s->responses_live.valid &&
+              s->responses_live.live_tokens == live_pos &&
+              s->responses_live.visible_text &&
+              s->responses_live.visible_len < prompt_len &&
+              byte_prefix_match(req->prompt_text, prompt_len,
+                                s->responses_live.visible_text,
+                                s->responses_live.visible_len);
+    if (ok) visible_len = s->responses_live.visible_len;
+    pthread_mutex_unlock(&s->tool_mu);
+    if (!ok) return 0;
+
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    if (!live_tokens || live_tokens->len != live_pos) return 0;
+
+    build_prompt_from_exact_prefix_and_text_suffix(
+        s->engine, live_tokens, req->prompt_text + visible_len,
+        effective_prompt);
     return live_tokens->len;
 }
 
@@ -6709,6 +9152,31 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
     return buf_take(&suffix);
 }
 
+static char *build_responses_visible_assistant_suffix(const request *r,
+                                                      const char *content,
+                                                      const char *reasoning,
+                                                      const tool_calls *calls) {
+    buf suffix = {0};
+    /* This suffix mirrors what a Responses client can replay, not necessarily
+     * every token in KV.  Hidden reasoning stays live in the session unless the
+     * next client replay is expected to include it.  In practice, pi replays
+     * reasoning summaries for tool-call turns, but not for final assistant
+     * answers; Codex currently requests no summaries at all.  So only include
+     * reasoning in the remembered visible prefix when this assistant turn ended
+     * in tool calls.  A client that does replay final-answer reasoning will not
+     * match this visible shortcut and can still use exact token-prefix replay. */
+    if (ds4_think_mode_enabled(r->think_mode)) {
+        if (r->reasoning_summary_emit && calls && calls->len > 0) {
+            buf_puts(&suffix, reasoning ? reasoning : "");
+        }
+        buf_puts(&suffix, "</think>");
+    }
+    buf_puts(&suffix, content ? content : "");
+    append_dsml_tool_calls_text(&suffix, calls);
+    buf_puts(&suffix, "<｜end▁of▁sentence｜>");
+    return buf_take(&suffix);
+}
+
 /* In thinking mode without tools, old assistant reasoning is intentionally not
  * rendered back into later prompts.  The sampled live graph still contains the
  * reasoning bytes, so the next request would miss the session cache even though
@@ -6774,7 +9242,7 @@ static void canonicalize_thinking_checkpoint(server *s, const job *j, const char
         char *path = NULL;
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
-                                            &effective, &path);
+                                            &effective, &path, NULL);
         if (loaded == 0) ds4_session_invalidate(s->session);
 
         char sync_err[160] = {0};
@@ -6881,7 +9349,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
         char *path = NULL;
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
-                                            &effective, &path);
+                                            &effective, &path, NULL);
         if (loaded == 0) ds4_session_invalidate(s->session);
 
         char sync_err[160] = {0};
@@ -6950,16 +9418,58 @@ static void generate_job(server *s, job *j) {
     const int old_pos = ds4_session_pos(s->session);
     const int common = ds4_session_common_prefix(s->session, &j->req.prompt);
     trace_cache_diag cache_diag = {0};
-    if (s->trace) {
-        trace_cache_capture(&cache_diag, ds4_session_tokens(s->session),
-                            &j->req.prompt, old_pos, common);
-    }
+    trace_cache_capture(&cache_diag, ds4_session_tokens(s->session),
+                        &j->req.prompt, old_pos, common);
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
-    int cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
-    const char *cache_source = cached > 0 ? "memory-token" : "none";
+    bool responses_live_continuation = false;
+    const char *responses_live_match = NULL;
+    int responses_live_match_ids = 0;
+    /* Responses gets the first chance to continue from live state.  This is
+     * the whole point of the API shape: a request that is bound to prior live
+     * output by visible transcript or tool call ids does not need to prove an
+     * exact token-prefix match.  Exact token/text/disk matching remains the
+     * fallback when the live state is absent or no longer describes the
+     * request. */
+    int cached = responses_live_visible_prefix_prompt(s, &j->req, old_pos,
+                                                      &effective_prompt);
+    const char *cache_source = cached > 0 ? "responses-visible" : "none";
+    if (cached > 0) {
+        responses_live_match = "visible-prefix";
+        if (responses_live_matches_request(s, &j->req.responses_live_call_ids,
+                                           old_pos))
+        {
+            responses_live_match_ids = j->req.responses_live_call_ids.len;
+        }
+    }
+    if (cached == 0) {
+        cached = responses_live_continuation_prompt(s, &j->req, old_pos,
+                                                    &effective_prompt,
+                                                    &responses_live_match_ids);
+        cache_source = cached > 0 ? "responses-tool-output" : "none";
+        if (cached > 0) responses_live_match = "tool-output-ids";
+    }
+    if (cached > 0) {
+        responses_live_continuation = true;
+        prompt_for_sync = &effective_prompt;
+    } else if (j->req.api == API_RESPONSES &&
+               j->req.responses_requires_live_tool_state)
+    {
+        /* The parser saw a valid live call_id, but by worker execution time the
+         * live frontier no longer matches.  Since the request did not replay
+         * the prior assistant call, there is no stateless prefix to match and
+         * no disk key to search by. */
+        ds4_tokens_free(&effective_prompt);
+        http_error(j->fd, 400,
+                   "Responses tool output requires live call state; replay full input instead");
+        return;
+    } else {
+        cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
+        cache_source = cached > 0 ? "memory-token" : "none";
+    }
     int disk_cached = 0;
     char *disk_cache_path = NULL;
+    uint8_t disk_cache_ext_flags = 0;
     if (cached == 0) {
         int text_cached = live_text_prefix_prompt(s, &j->req, &effective_prompt);
         if (text_cached > 0) {
@@ -6967,6 +9477,12 @@ static void generate_job(server *s, job *j) {
             cache_source = "memory-text";
             prompt_for_sync = &effective_prompt;
         }
+    }
+    if (cached == 0 && old_pos > 0) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: live kv cache miss live=%d prompt=%d common=%d reason=%s",
+                   old_pos, j->req.prompt.len, common,
+                   trace_cache_miss_reason(&cache_diag));
     }
     if (cached == 0) s->kv.continued_last_store_tokens = 0;
     if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
@@ -6977,12 +9493,34 @@ static void generate_job(server *s, job *j) {
     }
     if (cached == 0) {
         disk_cached = kv_cache_try_load(s, &j->req, &effective_prompt,
-                                        &disk_cache_path);
+                                        &disk_cache_path,
+                                        &disk_cache_ext_flags);
         if (disk_cached > 0) {
             cached = disk_cached;
             cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
         }
+    }
+    if (j->req.api == API_RESPONSES &&
+        j->req.responses_requires_live_reasoning &&
+        !(cached > 0 &&
+          ((!strcmp(cache_source, "responses-visible") ||
+            !strcmp(cache_source, "responses-tool-output")) ||
+           (!strcmp(cache_source, "disk-text") &&
+            (disk_cache_ext_flags & KV_EXT_RESPONSES_VISIBLE)))))
+    {
+        /* A stateless replay that includes a prior tool call but omits the
+         * reasoning state is not equivalent to the live session.  Give disk
+         * recovery one chance first: a Responses-visible disk checkpoint is
+         * keyed by the visible transcript but carries the hidden KV payload and
+         * is therefore a valid substitute for live memory after client/session
+         * switching.  Ordinary token-text checkpoints before the missing
+         * reasoning are not enough. */
+        ds4_tokens_free(&effective_prompt);
+        free(disk_cache_path);
+        http_error(j->fd, 400,
+                   "Responses replay is missing reasoning state; retry with live state or full reasoning items");
+        return;
     }
     const int prompt_tokens = prompt_for_sync->len;
     const double t0 = now_sec();
@@ -7002,6 +9540,14 @@ static void generate_job(server *s, job *j) {
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
     char req_flags[64];
     log_flags(req_flags, sizeof(req_flags), j->req.has_tools, false, false, false);
+    if (responses_live_continuation) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: responses live continuation match=%s ids=%d cached=%d prompt=%d",
+                   responses_live_match ? responses_live_match : "unknown",
+                   responses_live_match_ids,
+                   cached,
+                   prompt_tokens);
+    }
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt start",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -7047,6 +9593,9 @@ static void generate_job(server *s, job *j) {
         http_error(j->fd, 500, err);
         return;
     }
+    /* Once a non-live request wins, the old Responses live binding is stale.
+     * Keep it only when the current request explicitly continued from it. */
+    if (!responses_live_continuation) responses_live_clear(s);
     ds4_session_set_progress(s->session, NULL, NULL);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
@@ -7068,7 +9617,10 @@ static void generate_job(server *s, job *j) {
     bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
     openai_stream openai_live = {0};
+    responses_stream responses_live = {0};
     const bool openai_live_chat = request_uses_openai_live_stream(&j->req);
+    const bool responses_live_chat = request_uses_responses_live_stream(&j->req);
+    long responses_created_at = (long)time(NULL);
     if (j->req.stream) {
         if (!sse_headers(j->fd)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: %s ctx=%s sse headers failed", j->req.kind == REQ_CHAT ? "chat" : "completion", ctx_span);
@@ -7089,6 +9641,16 @@ static void generate_job(server *s, job *j) {
             return;
         }
         if (openai_live_chat) openai_stream_start(&j->req, &openai_live);
+        if (responses_live_chat) {
+            responses_stream_init(&j->req, &responses_live);
+            responses_live.active = true;
+            if (!responses_sse_created(j->fd, &j->req, &responses_live, responses_created_at)) {
+                server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s responses created event failed", ctx_span);
+                responses_stream_free(&responses_live);
+                ds4_tokens_free(&effective_prompt);
+                return;
+            }
+        }
     }
 
     buf text = {0};
@@ -7237,6 +9799,16 @@ static void generate_job(server *s, job *j) {
                 stop_decode = true;
                 break;
             }
+            if (responses_live_chat &&
+                !responses_sse_stream_update(j->fd, &j->req,
+                                             &responses_live, text.ptr, stream_len,
+                                             false)) {
+                finish = "error";
+                snprintf(err, sizeof(err), "client stream write failed");
+                free(piece);
+                stop_decode = true;
+                break;
+            }
             free(piece);
 
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
@@ -7365,6 +9937,8 @@ static void generate_job(server *s, job *j) {
             assign_tool_call_ids(s, &parsed_calls, j->req.api);
             tool_memory_remember(s, &parsed_calls);
             final_finish = "tool_calls";
+        } else if (j->req.api == API_RESPONSES) {
+            responses_live_clear(s);
         }
     }
     log_tool_calls_summary(ctx_span, &parsed_calls);
@@ -7374,8 +9948,39 @@ static void generate_job(server *s, job *j) {
                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
 
+    if (j->req.api == API_RESPONSES) {
+        if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
+            /* Store the post-turn visible transcript plus the live token
+             * frontier.  The next Responses request may replay only this
+             * visible surface, while the real session also contains hidden
+             * reasoning and exact sampled tool-call bytes. */
+            char *visible_suffix =
+                build_responses_visible_assistant_suffix(&j->req,
+                    parsed_content ? parsed_content : "",
+                    parsed_reasoning,
+                    &parsed_calls);
+            buf visible = {0};
+            buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
+            buf_puts(&visible, visible_suffix ? visible_suffix : "");
+            responses_live_remember(s, visible.ptr ? visible.ptr : "",
+                                    parsed_calls.len ? &parsed_calls : NULL);
+            buf_free(&visible);
+            free(visible_suffix);
+        } else {
+            responses_live_clear(s);
+        }
+    }
+
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
-        should_canonicalize_tool_checkpoint(s, &parsed_calls)) {
+        j->req.api != API_RESPONSES &&
+        should_canonicalize_tool_checkpoint(s, &parsed_calls))
+    {
+        /* Chat/completions has no protocol object that binds the next request
+         * to this live KV state.  Canonicalize only the fallback tool-call
+         * path where we lack exact sampled DSML replay; when raw DSML is known,
+         * replaying those bytes keeps future prompts aligned without rebuilding
+         * hidden reasoning.  Responses deliberately skips this path because its
+         * previous_response_id contract binds the next turn to live state. */
         canonicalize_tool_checkpoint(s, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
@@ -7396,6 +10001,19 @@ static void generate_job(server *s, job *j) {
                                                  text.ptr ? text.ptr : "", text.len,
                                                  &parsed_calls, final_finish,
                                                  prompt_tokens, completion);
+        } else if (responses_live_chat) {
+            /* If parse recovered a malformed tool call back to plain text,
+             * pass parsed_content so the streaming tail can be flushed; in
+             * the normal path parsed_content is the assistant text we already
+             * streamed and the diff is empty. */
+            const char *recover =
+                recovered_tool_parse_failure ? parsed_content : NULL;
+            response_ok = responses_sse_finish_live(j->fd, &j->req, &responses_live,
+                                                    text.ptr ? text.ptr : "", text.len,
+                                                    recover,
+                                                    &parsed_calls, final_finish,
+                                                    prompt_tokens, completion,
+                                                    responses_created_at);
         } else if (structured_stream) {
             response_ok = sse_chat_finish(j->fd, &j->req, id,
                                           parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
@@ -7414,6 +10032,12 @@ static void generate_job(server *s, job *j) {
         }
     } else if (j->req.api == API_ANTHROPIC) {
         anthropic_final_response(j->fd, &j->req, id,
+                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                                 parsed_reasoning,
+                                 &parsed_calls, final_finish,
+                                 prompt_tokens, completion);
+    } else if (j->req.api == API_RESPONSES) {
+        responses_final_response(j->fd, &j->req, id,
                                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
@@ -7486,6 +10110,7 @@ static void generate_job(server *s, job *j) {
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
     openai_stream_free(&openai_live);
+    responses_stream_free(&responses_live);
     buf_free(&text);
     ds4_tokens_free(&effective_prompt);
 }
@@ -7719,6 +10344,9 @@ static void *client_main(void *arg) {
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
         ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
                                 ctx_size, &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/responses")) {
+        ok = parse_responses_request(s->engine, s, hr.body, s->default_tokens,
+                                     ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/completions")) {
         ok = parse_completion_request(s->engine, hr.body, s->default_tokens,
                                       ctx_size, &req, err, sizeof(err));
@@ -7878,6 +10506,7 @@ static void server_close_resources(server *s) {
     }
     kv_cache_close(&s->kv);
     tool_memory_free(&s->tool_mem);
+    responses_live_free(&s->responses_live);
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
     pthread_cond_destroy(&s->clients_cv);
@@ -7968,7 +10597,7 @@ static void usage(FILE *fp) {
         "  ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
         "\n"
         "Notes:\n"
-        "  Use /v1/chat/completions, /v1/completions, or /v1/messages.\n"
+        "  Use /v1/chat/completions, /v1/responses, /v1/completions, or /v1/messages.\n"
         "  Larger --ctx values allocate more KV memory at startup; the startup log prints the estimate.\n"
         "  Disk KV caching is best for agents that resend long prompts with stable prefixes.\n"
         "\n"
@@ -8273,6 +10902,237 @@ static void test_tool_schema_order_from_openai_tools(void) {
     TEST_ASSERT(order && !strcmp(order->prop[2], "newString"));
     free(schemas);
     tool_schema_orders_free(&orders);
+}
+
+static void test_tool_schema_order_from_responses_tool_search(void) {
+    const char *json =
+        "[{\"type\":\"tool_search\",\"execution\":\"client\","
+        "\"description\":\"Search deferred tools\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"query\":{\"type\":\"string\"},"
+        "\"limit\":{\"type\":\"number\"}},\"required\":[\"query\"]}}]";
+    const char *p = json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
+    TEST_ASSERT(schemas && strstr(schemas, "\"name\":\"tool_search\""));
+    TEST_ASSERT(schemas && strstr(schemas, "\"description\":\"Search deferred tools\""));
+    const tool_schema_order *order = tool_schema_orders_find(&orders, "tool_search");
+    TEST_ASSERT(order != NULL);
+    TEST_ASSERT(order && order->responses_tool_search);
+    TEST_ASSERT(order && order->len == 2);
+    TEST_ASSERT(order && !strcmp(order->prop[0], "query"));
+    TEST_ASSERT(order && !strcmp(order->prop[1], "limit"));
+    free(schemas);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_responses_function_named_tool_search_stays_function_call(void) {
+    const char *json =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"tool_search\","
+        "\"description\":\"A normal user function that happens to use a reserved name\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"query\":{\"type\":\"string\"}}}}}]";
+    const char *p = json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
+    const tool_schema_order *order = tool_schema_orders_find(&orders, "tool_search");
+    TEST_ASSERT(order != NULL);
+    TEST_ASSERT(order && !order->responses_tool_search);
+
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.id = xstrdup("call_user_tool_search");
+    tc.name = xstrdup("tool_search");
+    tc.arguments = xstrdup("{\"query\":\"plain function\"}");
+    tool_calls_push(&calls, tc);
+    responses_tool_item item = {
+        .fc_id = "fc_user_tool_search",
+        .call_id = "call_user_tool_search",
+        .is_custom = false,
+        .output_index = 0,
+    };
+
+    buf out = {0};
+    responses_append_function_call_item(&out, &calls.v[0], &item,
+                                        "completed", true, &orders);
+    TEST_ASSERT(strstr(out.ptr, "\"type\":\"function_call\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"type\":\"tool_search_call\"") == NULL);
+
+    buf_free(&out);
+    tool_calls_free(&calls);
+    free(schemas);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_responses_namespace_tool_schemas_restore_wire_namespace(void) {
+    const char *json =
+        "[{\"type\":\"namespace\",\"name\":\"mcp__perplexity__\","
+        "\"description\":\"Perplexity tools\","
+        "\"tools\":[{\"type\":\"function\",\"name\":\"perplexity_search\","
+        "\"description\":\"Search the web\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"query\":{\"type\":\"string\"},"
+        "\"recency\":{\"type\":\"number\"}}}}]}]";
+    const char *p = json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
+    TEST_ASSERT(schemas && strstr(schemas, "\"name\":\"mcp__perplexity__perplexity_search\""));
+    TEST_ASSERT(schemas && strstr(schemas, "\"name\":\"perplexity_search\"") == NULL);
+
+    const tool_schema_order *order =
+        tool_schema_orders_find(&orders, "mcp__perplexity__perplexity_search");
+    TEST_ASSERT(order != NULL);
+    TEST_ASSERT(order && order->namespace && !strcmp(order->namespace, "mcp__perplexity__"));
+    TEST_ASSERT(order && order->wire_name && !strcmp(order->wire_name, "perplexity_search"));
+    TEST_ASSERT(order && order->len == 2);
+
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.id = xstrdup("call_ns");
+    tc.name = xstrdup("mcp__perplexity__perplexity_search");
+    tc.arguments = xstrdup("{\"query\":\"deepseek\",\"recency\":7}");
+    tool_calls_push(&calls, tc);
+    responses_tool_item item = {
+        .fc_id = "fc_ns",
+        .call_id = "call_ns",
+        .is_custom = false,
+        .output_index = 0,
+    };
+    buf out = {0};
+    responses_append_function_call_item(&out, &calls.v[0], &item,
+                                        "completed", true, &orders);
+    TEST_ASSERT(strstr(out.ptr, "\"name\":\"perplexity_search\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"namespace\":\"mcp__perplexity__\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "mcp__perplexity__perplexity_search") == NULL);
+
+    buf_free(&out);
+    tool_calls_free(&calls);
+    free(schemas);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_responses_input_tool_search_output_loads_tools(void) {
+    const char *json =
+        "["
+        "{\"type\":\"tool_search_call\",\"call_id\":\"call_search\","
+        "\"execution\":\"client\",\"arguments\":{\"query\":\"perplexity\"}},"
+        "{\"type\":\"tool_search_output\",\"call_id\":\"call_search\","
+        "\"status\":\"completed\",\"execution\":\"client\",\"tools\":["
+        "{\"type\":\"namespace\",\"name\":\"mcp__perplexity__\","
+        "\"description\":\"Perplexity tools\","
+        "\"tools\":[{\"type\":\"function\",\"name\":\"perplexity_search\","
+        "\"description\":\"Search with Perplexity\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"query\":{\"type\":\"string\"}}}}]}]}"
+        "]";
+    const char *p = json;
+    chat_msgs msgs = {0};
+    buf loaded = {0};
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_responses_input(&p, &msgs, &loaded, &orders));
+    TEST_ASSERT(loaded.ptr && strstr(loaded.ptr, "\"name\":\"mcp__perplexity__perplexity_search\""));
+    const tool_schema_order *order =
+        tool_schema_orders_find(&orders, "mcp__perplexity__perplexity_search");
+    TEST_ASSERT(order != NULL);
+    TEST_ASSERT(order && order->namespace && !strcmp(order->namespace, "mcp__perplexity__"));
+    TEST_ASSERT(order && order->wire_name && !strcmp(order->wire_name, "perplexity_search"));
+    TEST_ASSERT(msgs.len == 2);
+    TEST_ASSERT(msgs.v[0].calls.len == 1);
+    TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].name, "tool_search"));
+    TEST_ASSERT(strstr(msgs.v[1].content, "mcp__perplexity__") != NULL);
+
+    buf_free(&loaded);
+    tool_schema_orders_free(&orders);
+    chat_msgs_free(&msgs);
+}
+
+static void test_responses_input_tool_search_output_rejects_bad_tools(void) {
+    const char *json =
+        "[{\"type\":\"tool_search_output\",\"call_id\":\"call_search\","
+        "\"status\":\"completed\",\"tools\":{\"not\":\"a tool array\"}}]";
+    const char *p = json;
+    chat_msgs msgs = {0};
+    buf loaded = {0};
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(!parse_responses_input(&p, &msgs, &loaded, &orders));
+    buf_free(&loaded);
+    tool_schema_orders_free(&orders);
+    chat_msgs_free(&msgs);
+}
+
+static void test_responses_input_function_call_namespace_round_trips_to_dsml(void) {
+    const char *tools_json =
+        "[{\"type\":\"namespace\",\"name\":\"mcp__perplexity__\","
+        "\"tools\":[{\"type\":\"function\",\"name\":\"perplexity_search\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"query\":{\"type\":\"string\"}}}}]}]";
+    const char *tools_p = tools_json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&tools_p, &schemas, &orders));
+
+    const char *input_json =
+        "[{\"type\":\"function_call\",\"call_id\":\"call_ns\","
+        "\"name\":\"perplexity_search\",\"namespace\":\"mcp__perplexity__\","
+        "\"arguments\":{\"query\":\"deepseek\"}}]";
+    const char *input_p = input_json;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_responses_input(&input_p, &msgs, NULL, NULL));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.v[0].calls.len == 1);
+    TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].name,
+                        "mcp__perplexity__perplexity_search"));
+
+    char *prompt = render_chat_prompt_text(&msgs, schemas, &orders, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<｜DSML｜invoke name=\"mcp__perplexity__perplexity_search\">") != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜DSML｜invoke name=\"perplexity_search\">") == NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+    free(schemas);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_responses_output_sends_tool_search_call_item(void) {
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.id = xstrdup("call_search");
+    tc.name = xstrdup("tool_search");
+    tc.arguments = xstrdup("{\"limit\":3,\"query\":\"perplexity\"}");
+    tool_calls_push(&calls, tc);
+    const char *tools_json =
+        "[{\"type\":\"tool_search\",\"execution\":\"client\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"query\":{\"type\":\"string\"},\"limit\":{\"type\":\"number\"}}}}]";
+    const char *tools_p = tools_json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&tools_p, &schemas, &orders));
+    responses_tool_item item = {
+        .fc_id = "fc_search",
+        .call_id = "call_search",
+        .is_custom = false,
+        .output_index = 0,
+    };
+
+    buf out = {0};
+    responses_append_function_call_item(&out, &calls.v[0], &item,
+                                        "completed", true, &orders);
+    TEST_ASSERT(strstr(out.ptr, "\"type\":\"tool_search_call\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"execution\":\"client\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"status\":\"completed\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"arguments\":{\"limit\":3,\"query\":\"perplexity\"}") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"type\":\"function_call\"") == NULL);
+
+    buf_free(&out);
+    free(schemas);
+    tool_schema_orders_free(&orders);
+    tool_calls_free(&calls);
 }
 
 static tool_calls make_swapped_bash_call(void) {
@@ -9358,6 +12218,182 @@ static void test_tool_checkpoint_canonicalization_gate_exact_replay(void) {
     tool_calls_free(&calls);
 }
 
+static void test_responses_live_tail_renders_tool_outputs_only(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.think_mode = DS4_THINK_HIGH;
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup("call_live");
+    tc.name = xstrdup("exec_command");
+    tc.arguments = xstrdup("{\"cmd\":\"pwd\"}");
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.tool_call_id = xstrdup("call_live");
+    tool.content = xstrdup("/tmp");
+    chat_msgs_push(&msgs, tool);
+
+    responses_prepare_live_continuation(&r, &msgs);
+    TEST_ASSERT(r.responses_live_call_ids.len == 1);
+    TEST_ASSERT(!strcmp(r.responses_live_call_ids.v[0], "call_live"));
+    TEST_ASSERT(r.responses_live_suffix_text != NULL);
+    TEST_ASSERT(!strncmp(r.responses_live_suffix_text,
+                         "<｜end▁of▁sentence｜><｜User｜><tool_result>",
+                         strlen("<｜end▁of▁sentence｜><｜User｜><tool_result>")));
+    TEST_ASSERT(strstr(r.responses_live_suffix_text, "/tmp</tool_result>") != NULL);
+    TEST_ASSERT(strstr(r.responses_live_suffix_text, "<｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(strstr(r.responses_live_suffix_text, "exec_command") == NULL);
+
+    chat_msgs_free(&msgs);
+    request_free(&r);
+}
+
+static void test_responses_tool_output_id_validation(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+
+    chat_msgs msgs = {0};
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.tool_call_id = xstrdup("call_missing");
+    tool.content = xstrdup("out");
+    chat_msgs_push(&msgs, tool);
+
+    char err[160] = {0};
+    TEST_ASSERT(!responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH, NULL, NULL,
+                                                 err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "unknown tool output call_id") != NULL);
+
+    pthread_mutex_lock(&s.tool_mu);
+    s.responses_live.valid = true;
+    s.responses_live.live_tokens = 10;
+    id_list_push_unique(&s.responses_live.call_ids, "call_missing");
+    pthread_mutex_unlock(&s.tool_mu);
+    err[0] = '\0';
+    bool needs_live_tool_state = false;
+    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH,
+                                                &needs_live_tool_state, NULL,
+                                                err, sizeof(err)));
+    TEST_ASSERT(needs_live_tool_state);
+
+    chat_msgs_free(&msgs);
+    responses_live_free(&s.responses_live);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+static void test_responses_stateless_tool_replay_requires_reasoning(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup("call_replay");
+    tc.name = xstrdup("exec_command");
+    tc.arguments = xstrdup("{\"cmd\":\"pwd\"}");
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.tool_call_id = xstrdup("call_replay");
+    tool.content = xstrdup("/tmp");
+    chat_msgs_push(&msgs, tool);
+
+    char err[160] = {0};
+    bool needs_live_reasoning = false;
+    bool needs_live_tool_state = false;
+    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH,
+                                                &needs_live_tool_state,
+                                                &needs_live_reasoning,
+                                                err, sizeof(err)));
+    TEST_ASSERT(!needs_live_tool_state);
+    TEST_ASSERT(needs_live_reasoning);
+
+    pthread_mutex_lock(&s.tool_mu);
+    s.responses_live.valid = true;
+    s.responses_live.live_tokens = 123;
+    id_list_push_unique(&s.responses_live.call_ids, "call_replay");
+    pthread_mutex_unlock(&s.tool_mu);
+    err[0] = '\0';
+    needs_live_reasoning = false;
+    needs_live_tool_state = false;
+    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH,
+                                                &needs_live_tool_state,
+                                                &needs_live_reasoning,
+                                                err, sizeof(err)));
+    TEST_ASSERT(!needs_live_tool_state);
+    TEST_ASSERT(needs_live_reasoning);
+
+    free(msgs.v[0].reasoning);
+    msgs.v[0].reasoning = xstrdup("replayed hidden reasoning");
+    err[0] = '\0';
+    needs_live_reasoning = false;
+    needs_live_tool_state = false;
+    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH,
+                                                &needs_live_tool_state,
+                                                &needs_live_reasoning,
+                                                err, sizeof(err)));
+    TEST_ASSERT(!needs_live_tool_state);
+    TEST_ASSERT(!needs_live_reasoning);
+
+    free(msgs.v[0].reasoning);
+    msgs.v[0].reasoning = NULL;
+    err[0] = '\0';
+    needs_live_reasoning = false;
+    needs_live_tool_state = false;
+    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_NONE,
+                                                &needs_live_tool_state,
+                                                &needs_live_reasoning,
+                                                err, sizeof(err)));
+    TEST_ASSERT(!needs_live_tool_state);
+    TEST_ASSERT(!needs_live_reasoning);
+
+    chat_msgs_free(&msgs);
+    responses_live_free(&s.responses_live);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+static void test_responses_visible_suffix_matches_client_replay(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.think_mode = DS4_THINK_HIGH;
+    r.reasoning_summary_emit = true;
+
+    char *suffix = build_responses_visible_assistant_suffix(&r, "5",
+                                                            "hidden summary",
+                                                            NULL);
+    TEST_ASSERT(strstr(suffix, "hidden summary") == NULL);
+    TEST_ASSERT(strstr(suffix, "</think>5") != NULL);
+    free(suffix);
+
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.id = xstrdup("call_live");
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&calls, tc);
+
+    suffix = build_responses_visible_assistant_suffix(&r, "",
+                                                      "tool summary",
+                                                      &calls);
+    TEST_ASSERT(strstr(suffix, "tool summary</think>") != NULL);
+    TEST_ASSERT(strstr(suffix, "<｜DSML｜tool_calls>") != NULL);
+    free(suffix);
+
+    tool_calls_free(&calls);
+    request_free(&r);
+}
+
 static void test_exact_dsml_tool_replay_can_be_disabled(void) {
     const char *dsml =
         "\n\n<｜DSML｜tool_calls>\n"
@@ -10326,6 +13362,13 @@ static void ds4_server_unit_tests_run(void) {
     test_render_preserves_reasoning_with_tools();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
+    test_tool_schema_order_from_responses_tool_search();
+    test_responses_function_named_tool_search_stays_function_call();
+    test_responses_namespace_tool_schemas_restore_wire_namespace();
+    test_responses_input_tool_search_output_loads_tools();
+    test_responses_input_tool_search_output_rejects_bad_tools();
+    test_responses_input_function_call_namespace_round_trips_to_dsml();
+    test_responses_output_sends_tool_search_call_item();
     test_dsml_tool_args_preserve_call_order();
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
@@ -10346,6 +13389,10 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
     test_tool_checkpoint_canonicalization_gate_exact_replay();
+    test_responses_live_tail_renders_tool_outputs_only();
+    test_responses_tool_output_id_validation();
+    test_responses_stateless_tool_replay_requires_reasoning();
+    test_responses_visible_suffix_matches_client_replay();
     test_exact_dsml_tool_replay_can_be_disabled();
     test_dsml_decode_state_separates_structure_and_payload();
     test_tool_memory_max_ids_prunes_oldest();

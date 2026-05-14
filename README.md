@@ -243,6 +243,7 @@ Supported endpoints:
 - `GET /v1/models`
 - `GET /v1/models/deepseek-v4-flash`
 - `POST /v1/chat/completions`
+- `POST /v1/responses`
 - `POST /v1/completions`
 - `POST /v1/messages`
 
@@ -252,18 +253,29 @@ Supported endpoints:
 Tool schemas are rendered into DeepSeek's DSML tool format, and generated DSML
 tool calls are mapped back to OpenAI tool calls.
 
+`/v1/responses` accepts OpenAI Responses-style `input`, `instructions`,
+`tools`, `tool_choice`, `max_output_tokens`, `temperature`, `top_p`, `stream`,
+and `reasoning`. It is the preferred endpoint for Codex CLI. The server keeps
+Responses continuations bound to live state when possible, and can fall back to
+the same DSML rendering and KV prefix reuse used by chat completions.
+
 `/v1/messages` is the Anthropic-compatible endpoint used by Claude Code style
 clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
 `temperature`, `top_p`, `top_k`, `stream`, `stop_sequences`, and thinking
 controls. Tool uses are returned as Anthropic `tool_use` blocks.
 
-Both APIs support SSE streaming. In thinking mode, reasoning is streamed in the
-native API shape instead of being mixed into final text. OpenAI chat streaming
+The chat, Responses, and Anthropic endpoints support SSE streaming. In thinking
+mode, reasoning is streamed in the native API shape instead of being mixed into
+final text. OpenAI chat streaming
 also streams tool calls as soon as the DSML invocation is recognized: the tool
 header is sent first, then parameter bytes are forwarded as
 `tool_calls[].function.arguments` deltas while generation continues. The
 Anthropic endpoint streams thinking and text live, then emits structured
 `tool_use` blocks when the generated tool block is complete.
+The Responses endpoint streams the Responses event lifecycle expected by Codex,
+including `response.output_text.delta`, function-call argument events, and
+terminal `response.completed` / `response.incomplete` / `response.failed`
+events.
 
 ### Tool call handling and canonicalization
 
@@ -423,6 +435,22 @@ Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
   "defaultProvider": "ds4",
   "defaultModel": "deepseek-v4-flash"
 }
+```
+
+For **Codex CLI**, use the Responses wire API:
+
+```toml
+[model_providers.ds4]
+name = "DS4"
+base_url = "http://127.0.0.1:8000/v1"
+wire_api = "responses"
+stream_idle_timeout_ms = 1000000
+```
+
+Then run:
+
+```sh
+codex --model deepseek-v4-flash -c model_provider=ds4
 ```
 
 For **Claude Code**, use the Anthropic-compatible endpoint. A wrapper like this
