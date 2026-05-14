@@ -6923,6 +6923,16 @@ done:
     free(suffix_text);
 }
 
+static bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *calls) {
+    if (!calls || calls->len == 0) return false;
+    if (s && !s->disable_exact_dsml_tool_replay &&
+        calls->raw_dsml && calls->raw_dsml[0])
+    {
+        return false;
+    }
+    return true;
+}
+
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -7364,7 +7374,8 @@ static void generate_job(server *s, job *j) {
                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
 
-    if (j->req.kind == REQ_CHAT && parsed_calls.len) {
+    if (j->req.kind == REQ_CHAT && parsed_calls.len &&
+        should_canonicalize_tool_checkpoint(s, &parsed_calls)) {
         canonicalize_tool_checkpoint(s, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
@@ -9318,6 +9329,35 @@ static void test_tool_memory_replays_sampled_dsml(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+static void test_tool_checkpoint_canonicalization_gate_exact_replay(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.id = xstrdup("call_exact");
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{}");
+    tool_calls_push(&calls, tc);
+    calls.raw_dsml = xstrdup(
+        "\n\n" DS4_TOOL_CALLS_START "\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "</｜DSML｜invoke>\n"
+        DS4_TOOL_CALLS_END);
+
+    TEST_ASSERT(!should_canonicalize_tool_checkpoint(&s, &calls));
+
+    s.disable_exact_dsml_tool_replay = true;
+    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &calls));
+
+    s.disable_exact_dsml_tool_replay = false;
+    free(calls.raw_dsml);
+    calls.raw_dsml = NULL;
+    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &calls));
+
+    tool_calls_free(&calls);
+}
+
 static void test_exact_dsml_tool_replay_can_be_disabled(void) {
     const char *dsml =
         "\n\n<｜DSML｜tool_calls>\n"
@@ -10305,6 +10345,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
+    test_tool_checkpoint_canonicalization_gate_exact_replay();
     test_exact_dsml_tool_replay_can_be_disabled();
     test_dsml_decode_state_separates_structure_and_payload();
     test_tool_memory_max_ids_prunes_oldest();
