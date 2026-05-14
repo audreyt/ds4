@@ -498,17 +498,18 @@ tool calls are mapped back to OpenAI tool calls.
 
 `/v1/responses` accepts OpenAI Responses-style `input`, `instructions`,
 `tools`, `tool_choice`, `max_output_tokens`, `temperature`, `top_p`, `stream`,
-and `reasoning`. It is the preferred endpoint for Codex CLI. The server still
-renders the same DSML prompt internally, so exact tool-call replay and KV cache
-prefix reuse follow the same path as chat completions.
+and `reasoning`. It is the preferred endpoint for Codex CLI. The server keeps
+Responses continuations bound to live state when possible, and can fall back to
+the same DSML rendering and KV prefix reuse used by chat completions.
 
 `/v1/messages` is the Anthropic-compatible endpoint used by Claude Code style
 clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
 `temperature`, `top_p`, `top_k`, `stream`, `stop_sequences`, and thinking
 controls. Tool uses are returned as Anthropic `tool_use` blocks.
 
-Both APIs support SSE streaming. In thinking mode, reasoning is streamed in the
-native API shape instead of being mixed into final text. OpenAI chat streaming
+The chat, Responses, and Anthropic endpoints support SSE streaming. In thinking
+mode, reasoning is streamed in the native API shape instead of being mixed into
+final text. OpenAI chat streaming
 also streams tool calls as soon as the DSML invocation is recognized: the tool
 header is sent first, then parameter bytes are forwarded as
 `tool_calls[].function.arguments` deltas while generation continues. The

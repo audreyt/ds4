@@ -404,3 +404,44 @@ More protocol negatives:
   executed, DS4 returned HTTP 400 with
   `Responses tool output requires live call state; replay full input instead`.
   This verifies the new guard prevents cold-prefilling an orphan tool result.
+
+Post-merge stress pass, 2026-05-14:
+
+- Merged the `responses-api` branch into `main` while preserving its branch
+  commits, then re-applied the exact sampled DSML tool-checkpoint gate on top of
+  the merged Responses live-continuation path.
+- Replaced eager tool-less thinking checkpoint rebuilds with a visible-transcript
+  live binding. A no-tool thinking answer now remembers the visible transcript
+  that clients replay, while keeping the sampled hidden reasoning in KV. The
+  next chat/completions or Anthropic request can continue with
+  `cache_source: thinking-visible` if its prompt extends that visible prefix.
+- Unit/build checks after the change:
+  `make ds4_test`, `./ds4_test --server`, and `make ds4-server` all passed.
+- Live stress server:
+  `./ds4-server -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf --ctx 100000 --kv-disk-dir /tmp/ds4-kv-stress --kv-disk-space-mb 8192 --trace /tmp/ds4-response-stress-trace.txt`.
+- Pi, using the OpenAI-compatible chat/completions path, completed a multi-tool
+  session and a resumed turn. The trace showed normal live-prefix reuse:
+  requests after the first cold prompt used `cache_source: memory-token` with
+  only short suffix prefills.
+- Codex CLI, using `/v1/responses`, completed one tool-heavy turn and a resumed
+  turn. Responses continuations used `cache_source: responses-visible`; the
+  first resume after the final answer logged `ids=0` and continued from the
+  remembered visible prefix, then tool-result turns logged `ids=1`.
+- Claude Code, using `/v1/messages`, completed real read/write/bash tool loops.
+  One apparent bad miss after a `Read` call was investigated in the rendered
+  trace: the client changed its tool schema block between requests
+  (`NotebookEdit` disappeared and `LSP` appeared), so the low common prefix was
+  a real prompt change, not a DSML replay failure. Disk recovery limited the
+  replay to the nearest checkpoint (`cached_tokens=22528` for a 24308-token
+  prompt).
+- opencode, using OpenAI-compatible chat/completions, completed a tool session
+  and a resumed tool session. Most tool-result turns used live memory; a few
+  used `cache_source: memory-text` because the exact token stream and rerendered
+  byte prefix were text-identical but had different tokenization around a
+  boundary, which is the intended text-prefix fallback.
+- A direct no-tool chat/completions test exercised the new thinking-visible
+  binding: first request logged `thinking live checkpoint remembered`, second
+  request logged `thinking live continuation match=visible-prefix cached=54
+  prompt=66`, with no rebuild and only the new suffix prefilling.
+- No trace line in this run showed `thinking checkpoint canonicalization needs
+  rebuild` or a tool checkpoint rebuild caused by exact sampled DSML replay.

@@ -253,7 +253,15 @@ static int ds4_gpu_scratch_needs_cpu_access(const char *label) {
 }
 
 #define DS4_METAL_MAX_MODEL_VIEWS 16
-#define DS4_METAL_MODEL_MAX_TENSOR_BYTES 704643072ull
+/*
+ * Adjacent no-copy mmap views overlap by more than the largest tensor we pass
+ * to a Metal kernel.  The 2-bit model fit under the old ~672 MiB value, but
+ * the high-memory Q4_K expert file has routed expert tensors of about 1.125
+ * GiB.  Machines whose Metal maxBufferLength is smaller than the whole Q4
+ * GGUF therefore need a larger overlap so every tensor is wholly contained in
+ * at least one view.
+ */
+#define DS4_METAL_MODEL_MAX_TENSOR_BYTES (2ull * 1024ull * 1024ull * 1024ull)
 
 typedef struct {
     __strong id<MTLBuffer> buffer;
