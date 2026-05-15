@@ -4738,6 +4738,52 @@ static bool http_error(int fd, int code, const char *msg) {
     return ok;
 }
 
+static const char *context_length_error_param(const request *r) {
+    if (!r) return "prompt";
+    if (r->api == API_RESPONSES) return "input";
+    return r->kind == REQ_COMPLETION ? "prompt" : "messages";
+}
+
+static bool request_exceeds_context(const request *r, int ctx_size) {
+    /* ds4_session_sync() rejects prompt->len >= ctx_size because generation
+     * needs at least one free context slot.  Catch the same boundary here so
+     * clients get a normal protocol error instead of a later backend failure. */
+    return r && r->prompt.len >= ctx_size;
+}
+
+static bool http_error_context_length_exceeded(int fd, const request *r,
+                                               int n_prompt_tokens,
+                                               int ctx_size) {
+    buf b = {0};
+    char msg[160];
+    snprintf(msg, sizeof(msg),
+             "Prompt has %d tokens, but the configured context size is %d tokens",
+             n_prompt_tokens, ctx_size);
+
+    if (r && r->api == API_ANTHROPIC) {
+        buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":");
+        json_escape(&b, msg);
+        buf_puts(&b, ",\"n_prompt_tokens\":");
+        buf_printf(&b, "%d", n_prompt_tokens);
+        buf_puts(&b, ",\"n_ctx\":");
+        buf_printf(&b, "%d", ctx_size);
+        buf_puts(&b, "}}\n");
+    } else {
+        buf_puts(&b, "{\"error\":{\"message\":");
+        json_escape(&b, msg);
+        buf_puts(&b, ",\"type\":\"invalid_request_error\",\"param\":");
+        json_escape(&b, context_length_error_param(r));
+        buf_puts(&b, ",\"code\":\"context_length_exceeded\",\"n_prompt_tokens\":");
+        buf_printf(&b, "%d", n_prompt_tokens);
+        buf_puts(&b, ",\"n_ctx\":");
+        buf_printf(&b, "%d", ctx_size);
+        buf_puts(&b, "}}\n");
+    }
+    bool ok = http_response(fd, 400, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 /* Streaming is a translation state machine over the raw DS4 text.  The model
  * may produce <think> and DSML tool blocks; clients should receive those as
  * protocol-native reasoning/tool deltas, never as visible assistant text. */
@@ -11567,6 +11613,11 @@ static void *client_main(void *arg) {
         http_error(fd, 400, err);
         goto done;
     }
+    if (request_exceeds_context(&req, ctx_size)) {
+        http_error_context_length_exceeded(fd, &req, req.prompt.len, ctx_size);
+        request_free(&req);
+        goto done;
+    }
 
     if (count_tokens_only) {
         char body[64];
@@ -12426,6 +12477,51 @@ static char *read_socket_text(int fd) {
         buf_append(&b, tmp, (size_t)n);
     }
     return buf_take(&b);
+}
+
+static void test_context_length_error_uses_protocol_standard_shape(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.prompt.len = 16;
+    TEST_ASSERT(request_exceeds_context(&r, 16));
+    TEST_ASSERT(!request_exceeds_context(&r, 17));
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(http_error_context_length_exceeded(sv[0], &r, 16, 16));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "HTTP/1.1 400") != NULL);
+        TEST_ASSERT(strstr(out, "\"type\":\"invalid_request_error\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"code\":\"context_length_exceeded\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"param\":\"messages\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"n_prompt_tokens\":16") != NULL);
+        TEST_ASSERT(strstr(out, "\"n_ctx\":16") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    request_free(&r);
+
+    request a;
+    request_init(&a, REQ_CHAT, 128);
+    a.api = API_ANTHROPIC;
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(http_error_context_length_exceeded(sv[0], &a, 20, 20));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "{\"type\":\"error\",\"error\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"type\":\"invalid_request_error\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"n_prompt_tokens\":20") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    request_free(&a);
 }
 
 static void test_anthropic_live_stream_sends_incremental_blocks(void) {
@@ -15253,6 +15349,7 @@ static void ds4_server_unit_tests_run(void) {
     test_dsml_tool_args_preserve_call_order();
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
+    test_context_length_error_uses_protocol_standard_shape();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
