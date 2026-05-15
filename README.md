@@ -1,17 +1,27 @@
-# ds4.c
+# DwarfStar 4
 
-`ds4.c` is a small native inference engine for DeepSeek V4 Flash. It is
+DwarfStar 4 is a small native inference engine specific for **DeepSeek V4 Flash**. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
-runtime, and not a framework. The main path is a DeepSeek V4 Flash-specific
-Metal and CUDA graph executor with DS4-specific loading, prompt rendering,
-KV state, and server API glue.
+runtime: it is completely self-contained. Other than running the model in a
+correct and fast way, the project goal is to provide DS4 specific loading,
+prompt rendering, tool calling, KV state handling (RAM and on-disk), and server
+API, all ready to work with coding agents or with the provided CLI interface.
+There are also tools for GGUF and imatrix generation, and for quality and
+speed testing.
+
+We support the following backends:
+* **Metal** is our primary target. Starting from MacBooks with 96GB of RAM.
+* **NVIDIA CUDA** with special care for the DGX Spark.
+* **AMD ROCm** is only supported in the [rocm](https://github.com/antirez/ds4/tree/rocm) branch. It is kept separate from main since I (antirez) don't have direct hardware access, so the community rebases the branch as needed.
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
 other contributors.
 
+## Motivations
+
 Now, back at this project. Why we believe DeepSeek v4 Flash to be a pretty special
-model deserving a stand alone engine? Because after comparing it with powerful smaller
+model deserving a standalone engine? Because after comparing it with powerful smaller
 dense models, we can report that:
 
 1. DeepSeek v4 Flash is faster because of less active parameters.
@@ -20,12 +30,12 @@ dense models, we can report that:
 4. Being so large, it knows more things if you go sampling at the edge of knowledge. For instance asking about Italian show or political questions soon uncovers that 284B parameters are a lot more than 27B or 35B parameters.
 5. It writes much better English and Italian. It *feels* a quasi-frontier model.
 6. The KV cache is incredibly compressed, allowing long context inference on local computers and **on disk KV cache persistence**.
-7. It works well with 2-bit quantization, if quantized in a special way (read later). This allows to run it in MacBooks with 128GB of RAM.
+7. It works well with 2-bit quantization, if quantized in a special way (read later). This allows to run it in MacBooks with 128GB of RAM (and many people reported it working with 96GB as well, even at 250k context window!).
 8. We expect DeepSeek to release **updated versions of v4 Flash** in the future, even better than the current one.
 
 That said, a few important things about this project:
 
-* The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: local inference credible on high end personal machines or Mac Studios, starting from 128GB of memory.
+* The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: local inference credible on high end personal machines or Mac Studios, starting from 96/128GB of memory.
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is just alpha quality code, so probably we are not still there.
@@ -53,6 +63,29 @@ However, we try to keep the project in a usable state, and we are making
 progresses. If you have issues, make sure to use `--trace` to log the
 sessions, and open issues including the full trace.
 
+## More Documentation
+
+If you are looking for very specific things, we have other
+sub-README files. Otherwise for normal usage keep reading the
+next sections.
+
+- [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
+  guide for contributors. **Read this before sending a pull request**.
+- [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
+  imatrix collection, quantization tooling, and quality checks.
+- [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): how the
+  routed-MoE imatrix is collected and used.
+- [gguf-tools/imatrix/dataset/README.md](gguf-tools/imatrix/dataset/README.md):
+  how the calibration prompt corpus is generated.
+- [gguf-tools/quality-testing/README.md](gguf-tools/quality-testing/README.md):
+  how local GGUFs are scored against official DeepSeek V4 Flash continuations.
+- [dir-steering/README.md](dir-steering/README.md): directional steering data,
+  vector generation, and usage.
+- [speed-bench/README.md](speed-bench/README.md): benchmark CSV files and graph
+  generation.
+- [tests/test-vectors/README.md](tests/test-vectors/README.md): official
+  continuation vectors used for regression checks.
+
 ## Model Weights
 
 This implementation only works with the DeepSeek V4 Flash GGUFs published for
@@ -65,29 +98,47 @@ experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
 majority of all the model space: the other components (shared experts,
 projections, routing) are left untouched to guarantee quality.
 
-Download one main model:
+Download one main model. **Prefer the imatrix versions.**
 
 ```sh
-./download_model.sh q2   # 128 GB RAM machines
-./download_model.sh q4   # >= 256 GB RAM machines
+./download_model.sh q2-imatrix   # 96/128 GB RAM machines, imatrix-tuned q2
+./download_model.sh q4-imatrix   # >= 256 GB RAM machines, imatrix-tuned q4
+```
+
+Legacy GGUF files are still available if you specifically need the older
+non-imatrix quants:
+
+```sh
+./download_model.sh q2           # 96/128 GB RAM machines, legacy non-imatrix
+./download_model.sh q4           # >= 256 GB RAM machines, legacy non-imatrix
 ```
 
 The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
 stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
-updates `./ds4flash.gguf` to point at the selected q2/q4 model. Authentication
-is optional for public downloads, but `--token TOKEN`, `HF_TOKEN`, or the local
-Hugging Face token cache are used when present.
+updates `./ds4flash.gguf` to point at the selected q2-imatrix/q4-imatrix/q2/q4
+model. The plain q2 XXS weights are produced with the weights importance vector
+only, without an imatrix. The imatrix variants are preferred.
+Authentication is optional for public downloads, but `--token TOKEN`,
+`HF_TOKEN`, or the local Hugging Face token cache are used when present.
+
+If you want to regenerate GGUF files or collect a new imatrix, see
+[gguf-tools/README.md](gguf-tools/README.md). Those tools are meant for offline
+model-building work and can take a long time on the full DeepSeek V4 Flash
+weights.
 
 `./download_model.sh mtp` fetches the optional speculative decoding support
-GGUF. It can be used with both q2 and q4, but must be enabled explicitly with
-`--mtp`. The current MTP/speculative decoding path is still experimental: it is
-correctness-gated and currently provides at most a slight speedup, not a
-meaningful generation-speed win.
+GGUF. It can be used with q2-imatrix, q4-imatrix, q2, and q4, but must be
+enabled explicitly with `--mtp`. The current MTP/speculative decoding path is
+still experimental: it is correctness-gated and currently provides at most a
+slight speedup, not a meaningful generation-speed win.
 
 Then build:
 
 ```sh
-make
+make                  # macOS Metal
+make cuda-spark       # Linux CUDA, DGX Spark / GB10
+make cuda-generic     # Linux CUDA, other local CUDA GPUs
+make cpu              # CPU-only diagnostics build
 ```
 
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
@@ -112,6 +163,84 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
 | DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
+
+![M3 Max t/s](speed-bench/m3_max_ts.svg)
+
+## Benchmarking
+
+`ds4-bench` measures instantaneous prefill and generation throughput at context
+frontiers instead of reporting one whole-run average. It loads the model once,
+walks a fixed token sequence to frontiers such as 2048, 4096, 6144, and uses
+incremental prefill so each row measures only the newly-added token interval.
+After each frontier it saves the live KV state to memory, generates a fixed
+greedy non-EOS probe, restores the memory snapshot, and continues prefill.
+
+```sh
+./ds4-bench \
+  -m ds4flash.gguf \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start 2048 \
+  --ctx-max 65536 \
+  --step-incr 2048 \
+  --gen-tokens 128
+```
+
+The example file is a cleaned public-domain Project Gutenberg text of
+Alessandro Manzoni's *I Promessi Sposi* (ebook #45334), with the Gutenberg
+header and footer removed: <https://www.gutenberg.org/ebooks/45334>.
+
+Use `--step-incr N` for different linear spacing, or `--step-mul F` for
+exponential sweeps. Output is CSV with one row per frontier: latest prefill
+interval tokens/sec, generation tokens/sec at that frontier, and
+`kvcache_bytes`.
+
+## Capability Evaluation
+
+`ds4-eval` is a small real-model integration benchmark. It is not a leaderboard
+runner and should not be reported as an official GPQA, SuperGPQA, or AIME score:
+the questions are an embedded 75-item subset chosen to make local regression
+testing useful and visually inspectable. The program loads the real GGUF,
+renders DS4 chat prompts, streams sampled tokens in a split-screen TUI, grades
+the final answer, and prints a per-question report with prompt tokens,
+generated tokens, pass/fail state, the model answer, and the correct answer.
+
+```sh
+./ds4-eval -m ds4flash.gguf --trace /tmp/ds4-eval.txt
+```
+
+The default run uses `--ctx 100000` and `--tokens 16000`, thinking mode enabled,
+and a soft/hard `</think>` budget cutoff so the model has room to produce a
+visible answer. Press `p` to pause, Up/Down to inspect or select another
+question, and Enter to run the selected question next. `--plain` disables the
+TUI.
+
+The 75 embedded questions are interleaved as 25 GPQA Diamond, 25 SuperGPQA, and
+25 AIME 2025 problems. The order is intentionally progressive: early questions
+are useful smoke tests, while later questions are hard enough that a strong
+reasoning model should still miss some of them.
+
+For a model like DeepSeek V4 Flash, the set should be treated as a hard
+capability regression suite rather than a pass/fail unit test:
+
+- **GPQA Diamond** contributes graduate-level science questions with
+  multiple-choice answers. DeepSeek's model card reports strong Flash results
+  on full GPQA Diamond in thinking mode, but individual items still require
+  careful physics, chemistry, or biology reasoning and are easy to lose with a
+  small prompt/rendering or sampling regression.
+- **SuperGPQA** contributes broad specialist knowledge and domain-transfer
+  questions. The model-card SuperGPQA number is much lower than GPQA Diamond,
+  so these items are expected to be uneven: some look mundane, others require
+  niche professional knowledge or exact interpretation of a translated-style
+  exam question.
+- **AIME 2025** contributes exact-answer contest math. These are often the most
+  unforgiving items in the set: no multiple-choice prior, no partial credit, and
+  a single arithmetic or algebraic slip changes the grade.
+
+In practice this means `ds4-eval` should not be expected to produce a perfect
+75/75 run. It is meant to answer a more useful engineering question: after a
+kernel, quantization, prompt-rendering, KV-cache, or tool-streaming change, does
+DeepSeek V4 Flash still solve a representative mix of hard science, broad
+knowledge, and exact math problems while using the same inference path users run?
 
 ## CLI
 
@@ -162,6 +291,7 @@ Supported endpoints:
 - `GET /v1/models`
 - `GET /v1/models/deepseek-v4-flash`
 - `POST /v1/chat/completions`
+- `POST /v1/responses`
 - `POST /v1/completions`
 - `POST /v1/messages`
 
@@ -171,18 +301,29 @@ Supported endpoints:
 Tool schemas are rendered into DeepSeek's DSML tool format, and generated DSML
 tool calls are mapped back to OpenAI tool calls.
 
+`/v1/responses` accepts OpenAI Responses-style `input`, `instructions`,
+`tools`, `tool_choice`, `max_output_tokens`, `temperature`, `top_p`, `stream`,
+and `reasoning`. It is the preferred endpoint for Codex CLI. The server keeps
+Responses continuations bound to live state when possible, and can fall back to
+the same DSML rendering and KV prefix reuse used by chat completions.
+
 `/v1/messages` is the Anthropic-compatible endpoint used by Claude Code style
 clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
 `temperature`, `top_p`, `top_k`, `stream`, `stop_sequences`, and thinking
 controls. Tool uses are returned as Anthropic `tool_use` blocks.
 
-Both APIs support SSE streaming. In thinking mode, reasoning is streamed in the
-native API shape instead of being mixed into final text. OpenAI chat streaming
+The chat, Responses, and Anthropic endpoints support SSE streaming. In thinking
+mode, reasoning is streamed in the native API shape instead of being mixed into
+final text. OpenAI chat streaming
 also streams tool calls as soon as the DSML invocation is recognized: the tool
 header is sent first, then parameter bytes are forwarded as
 `tool_calls[].function.arguments` deltas while generation continues. The
 Anthropic endpoint streams thinking and text live, then emits structured
 `tool_use` blocks when the generated tool block is complete.
+The Responses endpoint streams the Responses event lifecycle expected by Codex,
+including `response.output_text.delta`, function-call argument events, and
+terminal `response.completed` / `response.incomplete` / `response.failed`
+events.
 
 ### Tool call handling and canonicalization
 
@@ -243,7 +384,9 @@ You can use larger context and larger cache if you wish. Full context of
 alone will be like 22GB), so configure a context which makes sense in
 your system. With 128GB of RAM you would run the 2-bit quants, which are
 already 81GB, 26GB are going to be likely too much, so a context window
-of 100~300k tokens is wiser.
+of 100~300k tokens is wiser. However users reported being able to run 2bit
+quants with 250k ctx window in a Macs with just 96GB of system memory: make sure
+to kill processes that use too much memory, if you plan doing so ;)
 
 The `384000` output limit below avoids token caps since the model is able
 to generate very long replies otherwise (up to 384k tokens). The server
@@ -340,6 +483,22 @@ Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
   "defaultProvider": "ds4",
   "defaultModel": "deepseek-v4-flash"
 }
+```
+
+For **Codex CLI**, use the Responses wire API:
+
+```toml
+[model_providers.ds4]
+name = "DS4"
+base_url = "http://127.0.0.1:8000/v1"
+wire_api = "responses"
+stream_idle_timeout_ms = 1000000
+```
+
+Then run:
+
+```sh
+codex --model deepseek-v4-flash -c model_provider=ds4
 ```
 
 For **Claude Code**, use the Anthropic-compatible endpoint. A wrapper like this
@@ -565,11 +724,22 @@ the kv cache files include the verbatim prompt cached.
 
 ## Backends
 
-The default graph backend is Metal on macOS and CUDA on Linux CUDA builds:
+The default graph backend is Metal on macOS and CUDA in CUDA builds:
 
 ```sh
 ./ds4 -p "Hello" --metal
 ./ds4 -p "Hello" --cuda
+```
+
+On Linux, plain `make` prints the available build targets instead of selecting a
+CUDA target implicitly. Use `make cuda-spark` for DGX Spark / GB10. It omits an
+explicit `nvcc -arch` because that is currently the fastest path on GB10. Use
+`make cuda-generic` for a normal local CUDA build, or set `CUDA_ARCH` explicitly
+when cross-building or when you need a known target:
+
+```sh
+make cuda CUDA_ARCH=sm_120
+make cuda CUDA_ARCH=native
 ```
 
 There is also a CPU reference/debug path:
