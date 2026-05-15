@@ -4667,6 +4667,22 @@ static bool http_error(int fd, int code, const char *msg) {
     return ok;
 }
 
+static bool http_error_context_exceeded(int fd, int n_prompt_tokens, int ctx_size) {
+    buf b = {0};
+    buf_puts(&b, "{\"error\":{\"message\":\"Prompt tokens (");
+    buf_printf(&b, "%d", n_prompt_tokens);
+    buf_puts(&b, ") exceeds context size (");
+    buf_printf(&b, "%d", ctx_size);
+    buf_puts(&b, ")\",\"type\":\"context_exceeded\",\"n_prompt_tokens\":");
+    buf_printf(&b, "%d", n_prompt_tokens);
+    buf_puts(&b, ",\"n_ctx\":");
+    buf_printf(&b, "%d", ctx_size);
+    buf_puts(&b, "}}\n");
+    bool ok = http_response(fd, 400, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 /* Streaming is a translation state machine over the raw DS4 text.  The model
  * may produce <think> and DSML tool blocks; clients should receive those as
  * protocol-native reasoning/tool deltas, never as visible assistant text. */
@@ -11158,6 +11174,11 @@ static void *client_main(void *arg) {
     http_request_free(&hr);
     if (!ok) {
         http_error(fd, 400, err);
+        goto done;
+    }
+    if (req.prompt.len > ctx_size) {
+        http_error_context_exceeded(fd, req.prompt.len, ctx_size);
+        request_free(&req);
         goto done;
     }
 
