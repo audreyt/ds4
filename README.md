@@ -437,6 +437,54 @@ variables are set. The wide route is diagnostic only: the current long-code
 prompt fails full-model equivalence with wide F16 Tensor (`rms ~= 0.569`,
 `top20_max_abs ~= 1.48`), so it is not enabled by `auto`.
 
+## Capability Evaluation
+
+`ds4-eval` is a small real-model integration benchmark. It is not a leaderboard
+runner and should not be reported as an official GPQA, SuperGPQA, or AIME score:
+the questions are an embedded 75-item subset chosen to make local regression
+testing useful and visually inspectable. The program loads the real GGUF,
+renders DS4 chat prompts, streams sampled tokens in a split-screen TUI, grades
+the final answer, and prints a per-question report with prompt tokens,
+generated tokens, pass/fail state, the model answer, and the correct answer.
+
+```sh
+./ds4-eval -m ds4flash.gguf --trace /tmp/ds4-eval.txt
+```
+
+The default run uses `--ctx 100000` and `--tokens 16000`, thinking mode enabled,
+and a soft/hard `</think>` budget cutoff so the model has room to produce a
+visible answer. Press `p` to pause, Up/Down to inspect or select another
+question, and Enter to run the selected question next. `--plain` disables the
+TUI.
+
+The 75 embedded questions are interleaved as 25 GPQA Diamond, 25 SuperGPQA, and
+25 AIME 2025 problems. The order is intentionally progressive: early questions
+are useful smoke tests, while later questions are hard enough that a strong
+reasoning model should still miss some of them.
+
+For a model like DeepSeek V4 Flash, the set should be treated as a hard
+capability regression suite rather than a pass/fail unit test:
+
+- **GPQA Diamond** contributes graduate-level science questions with
+  multiple-choice answers. DeepSeek's model card reports strong Flash results
+  on full GPQA Diamond in thinking mode, but individual items still require
+  careful physics, chemistry, or biology reasoning and are easy to lose with a
+  small prompt/rendering or sampling regression.
+- **SuperGPQA** contributes broad specialist knowledge and domain-transfer
+  questions. The model-card SuperGPQA number is much lower than GPQA Diamond,
+  so these items are expected to be uneven: some look mundane, others require
+  niche professional knowledge or exact interpretation of a translated-style
+  exam question.
+- **AIME 2025** contributes exact-answer contest math. These are often the most
+  unforgiving items in the set: no multiple-choice prior, no partial credit, and
+  a single arithmetic or algebraic slip changes the grade.
+
+In practice this means `ds4-eval` should not be expected to produce a perfect
+75/75 run. It is meant to answer a more useful engineering question: after a
+kernel, quantization, prompt-rendering, KV-cache, or tool-streaming change, does
+DeepSeek V4 Flash still solve a representative mix of hard science, broad
+knowledge, and exact math problems while using the same inference path users run?
+
 ## CLI
 
 One-shot prompt:
