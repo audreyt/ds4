@@ -1083,6 +1083,8 @@ typedef struct {
     int ncases;
     eval_status *status;
     char (*guess)[EVAL_ANSWER_MAX];
+    int *prompt_tokens;
+    int *generated_tokens;
     int active_case;
     int generated;
     int max_tokens;
@@ -1090,6 +1092,9 @@ typedef struct {
     int prefill_total;
     double phase_start_sec;
     double speed_tps;
+    double run_elapsed_sec;
+    double run_last_sec;
+    bool run_clock_active;
     bool selection_active;
     int selected_case;
     int requested_case;
@@ -1102,6 +1107,46 @@ typedef struct {
 } eval_ui;
 
 static eval_ui *global_ui;
+
+static double run_clock_sec(void);
+
+static void tui_run_clock_tick(eval_ui *ui) {
+    if (!ui || !ui->run_clock_active) return;
+    double now = run_clock_sec();
+    double delta = now - ui->run_last_sec;
+    if (delta > 0.0) ui->run_elapsed_sec += delta;
+    ui->run_last_sec = now;
+}
+
+static void tui_run_clock_start(eval_ui *ui) {
+    if (!ui || ui->run_clock_active) return;
+    ui->run_last_sec = run_clock_sec();
+    ui->run_clock_active = true;
+}
+
+static void tui_run_clock_stop(eval_ui *ui) {
+    if (!ui || !ui->run_clock_active) return;
+    tui_run_clock_tick(ui);
+    ui->run_clock_active = false;
+}
+
+static double tui_run_clock_visible_sec(const eval_ui *ui) {
+    if (!ui) return 0.0;
+    double elapsed = ui->run_elapsed_sec;
+    if (ui->run_clock_active) {
+        double delta = run_clock_sec() - ui->run_last_sec;
+        if (delta > 0.0) elapsed += delta;
+    }
+    return elapsed;
+}
+
+static void format_run_elapsed(char *dst, size_t dstlen, double sec) {
+    if (sec < 0.0) sec = 0.0;
+    unsigned long long minutes = (unsigned long long)(sec / 60.0);
+    unsigned long long hours = minutes / 60ull;
+    minutes %= 60ull;
+    snprintf(dst, dstlen, "%02lluh:%02llum", hours, minutes);
+}
 
 typedef struct {
     bool enabled;
@@ -1200,6 +1245,18 @@ static void style_free(style_buf *b) {
 static double now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+static double run_clock_sec(void) {
+    struct timespec ts;
+#ifdef CLOCK_UPTIME_RAW
+    /* On Darwin this clock excludes system sleep, which is exactly what the TUI
+     * elapsed counter wants: benchmark runtime, not lid-closed wall time. */
+    clock_gettime(CLOCK_UPTIME_RAW, &ts);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
@@ -1640,7 +1697,21 @@ static void tui_restore(void) {
 }
 
 static void tui_signal_restore(int sig) {
-    tui_restore();
+    /* Signal handlers cannot safely run the full tui_restore() path: that path
+     * joins the input thread and uses stdio.  For Ctrl-C / termination, do the
+     * minimal terminal repair directly, then re-raise the signal with its
+     * default action so the process status remains correct. */
+    eval_ui *ui = global_ui;
+    global_input.running = 0;
+    if (global_input.raw_mode) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &global_input.orig_termios);
+        global_input.raw_mode = false;
+    }
+    if (ui && ui->active) {
+        const char restore[] = ANSI_RESET "\x1b[?25h\x1b[?1049l";
+        (void)write(STDOUT_FILENO, restore, sizeof(restore) - 1);
+        ui->active = false;
+    }
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -1648,7 +1719,10 @@ static void tui_signal_restore(int sig) {
 static void tui_draw_title(eval_ui *ui) {
     term_move(1, 1);
     tui_clear_left_line(ui, 1);
+    char elapsed[32];
+    format_run_elapsed(elapsed, sizeof(elapsed), tui_run_clock_visible_sec(ui));
     fputs(ANSI_BOLD "ds4-eval" ANSI_RESET, stdout);
+    printf(" %s", elapsed);
     if (ui->paused) {
         fputs(" " ANSI_RED ANSI_BOLD "PAUSED" ANSI_RESET, stdout);
     }
@@ -1688,10 +1762,14 @@ static void tui_draw_left(eval_ui *ui) {
     const int shown = ui->ncases < visible_rows ? ui->ncases : visible_rows;
     int first = 0;
     if (shown > 0 && ui->ncases > shown) {
-        /* Keep the active question centered while there are enough hidden rows
-         * before and after it. Near the beginning or end, clamp the window so
-         * the left pane stays full instead of leaving unused space. */
-        first = ui->active_case - shown / 2;
+        /* The list follows the selection cursor, not the running test.  This
+         * makes arrow navigation visible immediately.  When normal execution
+         * advances, main() moves the selection to the new active case so the
+         * viewport naturally follows the work again. */
+        int anchor = ui->selected_case;
+        if (anchor < 0) anchor = ui->active_case;
+        if (anchor >= ui->ncases) anchor = ui->ncases - 1;
+        first = anchor - shown / 2;
         if (first < 0) first = 0;
         if (first > ui->ncases - shown) first = ui->ncases - shown;
     }
@@ -1951,7 +2029,9 @@ static void tui_start(eval_ui *ui, const eval_case *cases, int ncases, int max_t
     ui->requested_case = -1;
     ui->status = calloc((size_t)ncases, sizeof(*ui->status));
     ui->guess = calloc((size_t)ncases, sizeof(*ui->guess));
-    if (!ui->status || !ui->guess) {
+    ui->prompt_tokens = calloc((size_t)ncases, sizeof(*ui->prompt_tokens));
+    ui->generated_tokens = calloc((size_t)ncases, sizeof(*ui->generated_tokens));
+    if (!ui->status || !ui->guess || !ui->prompt_tokens || !ui->generated_tokens) {
         fprintf(stderr, "ds4-eval: out of memory\n");
         exit(1);
     }
@@ -1974,6 +2054,12 @@ static void tui_start(eval_ui *ui, const eval_case *cases, int ncases, int max_t
     atexit(tui_restore);
     signal(SIGINT, tui_signal_restore);
     signal(SIGTERM, tui_signal_restore);
+#ifdef SIGHUP
+    signal(SIGHUP, tui_signal_restore);
+#endif
+#ifdef SIGQUIT
+    signal(SIGQUIT, tui_signal_restore);
+#endif
 
     fputs("\x1b[?1049h\x1b[?25l", stdout);
     ui->active = true;
@@ -1986,6 +2072,8 @@ static void tui_free(eval_ui *ui) {
     if (ui->active) tui_restore();
     free(ui->status);
     free(ui->guess);
+    free(ui->prompt_tokens);
+    free(ui->generated_tokens);
     buf_free(&ui->stream);
     style_free(&ui->styles);
     memset(ui, 0, sizeof(*ui));
@@ -2317,6 +2405,8 @@ static void mark_case_pending(eval_ui *ui, int idx) {
 
 static double tui_wait_if_paused(eval_ui *ui, const char *phase) {
     if (!ui->enabled || !ui->paused) return 0.0;
+    bool was_running = ui->run_clock_active;
+    if (was_running) tui_run_clock_stop(ui);
     double start = now_sec();
     tui_refresh(ui, phase);
     while (ui->paused) {
@@ -2324,6 +2414,7 @@ static double tui_wait_if_paused(eval_ui *ui, const char *phase) {
         tui_consume_input(ui);
         tui_refresh(ui, phase);
     }
+    if (was_running) tui_run_clock_start(ui);
     tui_refresh(ui, phase);
     return now_sec() - start;
 }
@@ -2332,6 +2423,7 @@ static void eval_prefill_progress(void *ud, const char *event, int current, int 
     eval_ui *ui = ud;
     if (!ui || !event || strcmp(event, "prefill_chunk")) return;
     tui_consume_input(ui);
+    tui_run_clock_tick(ui);
     ui->prefill_current = current;
     ui->prefill_total = total;
     double elapsed = now_sec() - ui->phase_start_sec;
@@ -2360,6 +2452,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
 
     ds4_tokens prompt = {0};
     ds4_encode_chat_prompt(engine, system, question, think_mode, &prompt);
+    ui->prompt_tokens[idx] = prompt.len;
+    ui->generated_tokens[idx] = 0;
 
     if (prompt.len >= cfg->ctx_size) {
         fprintf(stderr, "ds4-eval: prompt for %s has %d tokens, ctx=%d\n",
@@ -2377,6 +2471,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     ui->requested_case = -1;
     ui->guess[idx][0] = '\0';
     ui->status[idx] = EVAL_PREFILL;
+    tui_run_clock_start(ui);
     if (tty) {
         tui_reset_stream(ui, tc, ds4_think_mode_enabled(think_mode));
         tui_refresh(ui, "prefill");
@@ -2396,6 +2491,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     ds4_session_set_progress(session, eval_prefill_progress, ui);
     if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
         ds4_session_set_progress(session, NULL, NULL);
+        tui_run_clock_stop(ui);
         fprintf(stderr, "ds4-eval: prefill failed for %s: %s\n", tc->id, err);
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR", err,
                          system, question, "", think_mode, prompt.len, 0, 0.0, "?", NULL);
@@ -2405,12 +2501,14 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     }
     ds4_session_set_progress(session, NULL, NULL);
     int prompt_tokens = prompt.len;
+    ui->prompt_tokens[idx] = prompt_tokens;
     ds4_tokens_free(&prompt);
 
     tui_consume_input(ui);
     tui_wait_if_paused(ui, "prefill");
     if (tui_has_switch_request(ui, idx)) {
         mark_case_pending(ui, idx);
+        tui_run_clock_stop(ui);
         tui_refresh(ui, "idle");
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "SWITCHED", NULL,
                          system, question, "", think_mode, prompt_tokens, 0, 0.0, "?", NULL);
@@ -2439,6 +2537,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
             tui_consume_input(ui);
             if (tui_has_switch_request(ui, idx)) {
                 mark_case_pending(ui, idx);
+                ui->generated_tokens[idx] = ui->generated;
+                tui_run_clock_stop(ui);
                 tui_refresh(ui, "idle");
                 trace_write_case(trace, cfg, tc, idx, ui->ncases, "SWITCHED", NULL,
                                  system, question, raw.v ? raw.v : "", think_mode,
@@ -2456,6 +2556,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
             }
             if (tui_has_switch_request(ui, idx)) {
                 mark_case_pending(ui, idx);
+                ui->generated_tokens[idx] = ui->generated;
+                tui_run_clock_stop(ui);
                 tui_refresh(ui, "idle");
                 trace_write_case(trace, cfg, tc, idx, ui->ncases, "SWITCHED", NULL,
                                  system, question, raw.v ? raw.v : "", think_mode,
@@ -2510,6 +2612,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         }
         if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
             plain_reset_color(use_plain_color);
+            ui->generated_tokens[idx] = ui->generated;
+            tui_run_clock_stop(ui);
             fprintf(stderr, "ds4-eval: decode failed for %s: %s\n", tc->id, err);
             trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR", err,
                              system, question, raw.v ? raw.v : "", think_mode,
@@ -2525,6 +2629,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         char *text = ds4_token_text(engine, token, &len);
         buf_append(&raw, text, len);
         ui->generated++;
+        ui->generated_tokens[idx] = ui->generated;
+        tui_run_clock_tick(ui);
         if (generation_in_think && raw.v && strstr(raw.v, "</think>")) {
             generation_in_think = false;
             if (think_close.kind == EVAL_THINK_CLOSE_NONE) {
@@ -2563,6 +2669,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     snprintf(ui->guess[idx], EVAL_ANSWER_MAX, "%s", got);
     bool pass = answer_matches(tc, got);
     ui->status[idx] = pass ? EVAL_PASSED : EVAL_FAILED;
+    ui->generated_tokens[idx] = ui->generated;
+    tui_run_clock_stop(ui);
     double sec = now_sec() - t0;
     tui_refresh(ui, pass ? "passed" : "failed");
     trace_write_case(trace, cfg, tc, idx, ui->ncases, pass ? "PASSED" : "FAILED", NULL,
@@ -2603,6 +2711,62 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
             m.prefill_cap,
             m.raw_cap,
             m.comp_cap);
+}
+
+static const char *report_status_name(eval_status st) {
+    switch (st) {
+    case EVAL_PASSED: return "PASSED";
+    case EVAL_FAILED: return "FAILED";
+    case EVAL_PREFILL: return "PREFILL";
+    case EVAL_THINKING: return "RUNNING";
+    case EVAL_PENDING:
+    default: return "PENDING";
+    }
+}
+
+static const char *report_status_color(eval_status st, bool color) {
+    if (!color) return "";
+    switch (st) {
+    case EVAL_PASSED: return ANSI_GREEN;
+    case EVAL_FAILED: return ANSI_RED;
+    case EVAL_PREFILL:
+    case EVAL_THINKING: return ANSI_YELLOW;
+    case EVAL_PENDING:
+    default: return ANSI_DIM;
+    }
+}
+
+static void print_eval_report(const eval_ui *ui, int ncases, int passed, int failed) {
+    bool color = isatty(STDOUT_FILENO);
+    char elapsed[32];
+    format_run_elapsed(elapsed, sizeof(elapsed), tui_run_clock_visible_sec(ui));
+
+    printf("ds4-eval: %d/%d passed", passed, ncases);
+    if (failed) printf(", %d failed", failed);
+    printf(", runtime %s\n", elapsed);
+    printf("%-3s %-8s %8s %8s %8s %-8s %-8s %s\n",
+           "#", "state", "prompt", "gen", "total", "given", "correct", "test");
+    for (int i = 0; i < ncases; i++) {
+        int prompt_tokens = ui->prompt_tokens ? ui->prompt_tokens[i] : 0;
+        int generated_tokens = ui->generated_tokens ? ui->generated_tokens[i] : 0;
+        int total_tokens = prompt_tokens + generated_tokens;
+        const char *given = ui->guess && ui->guess[i][0] ? ui->guess[i] : "-";
+        const char *color_start = report_status_color(ui->status[i], color);
+        const char *color_end = color ? ANSI_RESET : "";
+        printf("%3d %s%-8s%s %8d %8d %8d %-8s %-8s %s/%s %s\n",
+               i + 1,
+               color_start,
+               report_status_name(ui->status[i]),
+               color_end,
+               prompt_tokens,
+               generated_tokens,
+               total_tokens,
+               given,
+               ui->cases[i].answer,
+               ui->cases[i].source,
+               ui->cases[i].id,
+               ui->cases[i].title);
+    }
 }
 
 int main(int argc, char **argv) {
@@ -2667,6 +2831,7 @@ int main(int argc, char **argv) {
             next = ui.requested_case;
             ui.requested_case = -1;
             ui.selection_active = false;
+            ui.selected_case = next;
         }
 
         eval_run_result result = run_one_case(engine, session, &cfg, &ui, trace, next, &rng);
@@ -2678,9 +2843,14 @@ int main(int argc, char **argv) {
             next = ui.requested_case;
             ui.requested_case = -1;
             ui.selection_active = false;
+            ui.selected_case = next;
             continue;
         }
         next = next_pending_case(&ui, next + 1);
+        if (next >= 0) {
+            ui.selected_case = next;
+            ui.selection_active = false;
+        }
     }
 
     int passed = 0;
@@ -2690,10 +2860,8 @@ int main(int argc, char **argv) {
         else if (ui.status[i] == EVAL_FAILED) failed++;
     }
 
-    tui_free(&ui);
-    printf("ds4-eval: %d/%d passed", passed, ncases);
-    if (failed) printf(", %d failed", failed);
-    printf("\n");
+    if (ui.active) tui_restore();
+    print_eval_report(&ui, ncases, passed, failed);
     if (trace) {
         fprintf(trace,
                 "===== SUMMARY =====\n"
@@ -2704,6 +2872,7 @@ int main(int argc, char **argv) {
         fflush(trace);
     }
 
+    tui_free(&ui);
     ds4_session_free(session);
     ds4_engine_close(engine);
     if (trace) fclose(trace);
