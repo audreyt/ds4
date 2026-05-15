@@ -15,6 +15,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <float.h>
 #include <limits.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -8086,6 +8087,7 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
 #define KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS 2048
 #define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 10000
 #define KV_CACHE_DEFAULT_MB 4096
+#define KV_EVICTION_FRESH_GUARD_SECONDS 60u
 #define KV_EXT_TOOL_MAP (1u << 0)
 #define KV_EXT_RESPONSES_VISIBLE (1u << 1)
 #define KV_EXT_THINKING_VISIBLE (1u << 2)
@@ -8644,7 +8646,8 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
     id_list_free(&wanted);
 }
 
-static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live) {
+static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live,
+                                      uint64_t now_seconds) {
     if (!e || e->file_size == 0) return 0.0;
     (void)live;
     /*
@@ -8652,9 +8655,28 @@ static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live)
      * it may be the only copy of the session that is about to be evicted from
      * RAM.  Continued checkpoints are deliberately aligned restart frontiers,
      * so do not demote them just because they are a prefix of the live session.
-     * Use hits+1 for eviction value so a just-written checkpoint does not get
-     * deleted immediately just because its persisted hit counter is still 0.
+     *
+     * Plain `(hits + 1) * tokens / file_size` rewards entries with high token
+     * coverage per stored byte.  That is the right long-run ranking, but it
+     * has one pathology: a fresh cold-save written at the start of a new
+     * conversation is, by construction, smaller and less token-dense per byte
+     * than a mature multi-thousand-token snapshot, so the formula values it
+     * lowest right when its lookup is about to happen.  Under budget pressure
+     * the eviction loop then reaps it on the same wall-clock second it was
+     * written, before the session's next turn issues its first lookup.
+     *
+     * Guard exactly that case: a never-hit entry whose last_used (== created)
+     * is within KV_EVICTION_FRESH_GUARD_SECONDS gets a +INF score so the
+     * eviction loop can never pick it.  The condition is narrow on purpose —
+     * any entry that has been hit once is already protected by the (hits + 1)
+     * factor, any entry older than the guard window is back under normal
+     * scoring, and any entry that ages past the window without being hit was
+     * never going to be hit anyway.
      */
+    if (e->hits == 0 && now_seconds >= e->last_used &&
+        now_seconds - e->last_used < KV_EVICTION_FRESH_GUARD_SECONDS) {
+        return DBL_MAX;
+    }
     return ((double)e->hits + 1.0) * (double)e->tokens / (double)e->file_size;
 }
 
@@ -8663,11 +8685,12 @@ static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live) {
     kv_cache_refresh(kc);
     uint64_t total = 0;
     for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
+    const uint64_t now_seconds = (uint64_t)time(NULL);
     while (total > kc->budget_bytes && kc->len > 0) {
         int victim = 0;
-        double victim_score = kv_entry_eviction_score(&kc->entry[0], live);
+        double victim_score = kv_entry_eviction_score(&kc->entry[0], live, now_seconds);
         for (int i = 1; i < kc->len; i++) {
-            double score = kv_entry_eviction_score(&kc->entry[i], live);
+            double score = kv_entry_eviction_score(&kc->entry[i], live, now_seconds);
             if (score < victim_score ||
                 (score == victim_score && kc->entry[i].last_used < kc->entry[victim].last_used))
             {
@@ -8675,6 +8698,7 @@ static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live) {
                 victim_score = score;
             }
         }
+        if (victim_score == DBL_MAX) break;  /* nothing evictable; let cache overrun until guard expires */
         kv_entry e = kc->entry[victim];
         if (unlink(e.path) == 0) {
             server_log(DS4_LOG_KVCACHE,
@@ -14292,6 +14316,57 @@ static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_eviction_guards_just_written_never_hit_entry(void) {
+    /* A fresh cold-save written at the start of a new conversation is, by
+     * construction, smaller and less token-dense per byte than a mature
+     * snapshot.  Without the fresh-entry guard the plain `(hits+1)*tokens/size`
+     * score values it lowest right when its lookup is about to happen, so the
+     * eviction loop reaps it on the same wall-clock second it was written.
+     *
+     * This test sets up that exact pathology: an old high-density entry that
+     * dominates score-by-formula, and a freshly-written low-density entry that
+     * has the higher real-world value.  Under tight budget the eviction loop
+     * must evict the old high-density entry, keeping the fresh one.
+     */
+    char tmpl[] = "/tmp/ds4-kv-fresh-guard-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *old_sha = "1111111111111111111111111111111111111111";
+    const char *fresh_sha = "2222222222222222222222222222222222222222";
+    /* Old: high token density (4096 tokens packed in 4096 payload bytes), aged. */
+    test_kv_stub_file(dir, old_sha, KV_REASON_UNKNOWN, 4096, 0, 100, 4096);
+    /* Fresh: lower token density (2048 tokens in 4096 payload bytes), just written. */
+    const uint64_t now = (uint64_t)time(NULL);
+    test_kv_stub_file(dir, fresh_sha, KV_REASON_COLD, 2048, 0, now, 4096);
+
+    char old_name[44], fresh_name[44];
+    snprintf(old_name, sizeof(old_name), "%.40s.kv", old_sha);
+    snprintf(fresh_name, sizeof(fresh_name), "%.40s.kv", fresh_sha);
+    char *old_path = path_join(dir, old_name);
+    char *fresh_path = path_join(dir, fresh_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    /* Budget large enough for exactly one entry. */
+    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 4096u) + 16u;
+    kv_cache_evict(&kc, NULL);
+
+    /* Fresh entry must survive even though its plain score is lower. */
+    TEST_ASSERT(access(old_path, F_OK) != 0);
+    TEST_ASSERT(access(fresh_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(old_path);
+    unlink(fresh_path);
+    free(old_path);
+    free(fresh_path);
+    rmdir(dir);
+}
+
 static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     /* Simulate: user sends a single message, thinking mode on, no tools.
      * Model generates reasoning + content.  The next request will drop the
@@ -14629,6 +14704,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
+    test_kv_cache_eviction_guards_just_written_never_hit_entry();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN
