@@ -2260,6 +2260,12 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
     int last_user_idx = -1;
     buf system = {0};
+    /* Render tool schemas before the client system content so
+     * --kv-cache-boundary-trim-tokens chops a dynamic tail from the client
+     * message instead of the much larger tool-schema region. */
+    if (tool_schemas && tool_schemas[0]) {
+        append_tools_prompt_text(&system, tool_schemas);
+    }
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (!role_is_system(m->role)) continue;
@@ -2269,11 +2275,6 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_user_like(m->role)) last_user_idx = i;
-    }
-
-    if (tool_schemas && tool_schemas[0]) {
-        if (system.len) buf_puts(&system, "\n\n");
-        append_tools_prompt_text(&system, tool_schemas);
     }
 
     buf out = {0};
@@ -12992,6 +12993,34 @@ static void test_render_preserves_reasoning_with_tools(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_render_chat_prompt_text_renders_tools_before_system(void) {
+    /* The tool-schema block must sit at the head of the system region so the
+     * client's system content stays at the tail, right before <｜User｜>.
+     * That keeps a per-request dynamic tail (e.g. a timestamp) out of the
+     * cached prefix without losing the tool schemas to the trim. */
+    chat_msgs msgs = {0};
+    chat_msg sys = {0};
+    sys.role = xstrdup("system");
+    sys.content = xstrdup("CLIENT_SYSTEM_MARKER");
+    chat_msgs_push(&msgs, sys);
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("hello");
+    chat_msgs_push(&msgs, user);
+
+    char *prompt = render_chat_prompt_text(&msgs, "TOOL_SCHEMA_MARKER", NULL,
+                                           DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    const char *tools  = strstr(prompt, "## Tools");
+    const char *client = strstr(prompt, "CLIENT_SYSTEM_MARKER");
+    const char *user_m = strstr(prompt, "<｜User｜>");
+    TEST_ASSERT(tools && client && user_m);
+    TEST_ASSERT(tools  < client);
+    TEST_ASSERT(client < user_m);
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
 static void test_dsml_tool_args_preserve_call_order(void) {
     tool_calls calls = make_swapped_bash_call();
     buf b = {0};
@@ -14859,6 +14888,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
+    test_render_chat_prompt_text_renders_tools_before_system();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
     test_tool_schema_order_from_responses_tool_search();
