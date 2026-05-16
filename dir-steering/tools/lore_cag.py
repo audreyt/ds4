@@ -374,24 +374,127 @@ def score_record(query_tokens: collections.Counter[str], query_text: str, record
     counts = collections.Counter(tokenize(haystack))
     if not counts:
         return 0.0
+    return score_counts(query_tokens, query_text, record, counts, haystack.lower())
 
+
+def score_counts(
+    query_tokens: collections.Counter[str],
+    query_text: str,
+    record: LoreRecord,
+    counts: collections.Counter[str],
+    haystack_lower: str,
+) -> float:
     score = 0.0
+    term_lowers = {term.lower() for term in record.terms}
     for token, q_count in query_tokens.items():
         tf = counts.get(token, 0)
         if tf:
             score += (1.0 + math.log(tf)) * (1.0 + math.log(q_count))
-            if token in {term.lower() for term in record.terms}:
+            if token in term_lowers:
                 score += 1.5
             if token in record.path.lower():
                 score += 1.0
 
     for phrase in re.findall(r"`([^`]+)`", query_text):
         phrase = phrase.strip().lower()
-        if phrase and phrase in haystack.lower():
+        if phrase and phrase in haystack_lower:
             score += 8.0
 
     # Prefer compact chunks when the lexical evidence is otherwise similar.
     return score / (1.0 + len(record.text) / 8000.0)
+
+
+class LoreIndex:
+    """In-memory inverted index for repeated retrieval over large lore packs."""
+
+    def __init__(self, records: list[LoreRecord]):
+        self.records = records
+        self.counts: list[collections.Counter[str]] = []
+        self.haystack_lowers: list[str] = []
+        self.postings: dict[str, list[int]] = collections.defaultdict(list)
+        for i, record in enumerate(records):
+            haystack = f"{record.path}\n{record.source_date}\n{record.title}\n{record.anchor}\n{' '.join(record.terms)}\n{record.text}"
+            counts = collections.Counter(tokenize(haystack))
+            self.counts.append(counts)
+            self.haystack_lowers.append(haystack.lower())
+            for token in counts:
+                self.postings[token].append(i)
+
+    def retrieve(
+        self,
+        query: str,
+        top_k: int,
+        min_score: float = 0.0,
+        after: str = "",
+        before: str = "",
+        neighbor_chunks: int = 0,
+        mmr_lambda: float = 0.9,
+    ) -> list[LoreRecord]:
+        query_tokens = expanded_query_tokens(query)
+        candidates = self.candidate_indexes(query, query_tokens, top_k)
+
+        scored: list[LoreRecord] = []
+        for idx in candidates:
+            record = self.records[idx]
+            if not date_in_range(record.source_date, after, before):
+                continue
+            score = score_counts(query_tokens, query, record, self.counts[idx], self.haystack_lowers[idx])
+            if score >= min_score:
+                scored.append(LoreRecord(
+                    id=record.id,
+                    path=record.path,
+                    chunk=record.chunk,
+                    anchor=record.anchor,
+                    terms=record.terms,
+                    text=record.text,
+                    source_date=record.source_date,
+                    title=record.title,
+                    score=score,
+                ))
+        scored.sort(key=lambda item: item.score, reverse=True)
+        selected = mmr_select(scored, top_k, max(0.0, min(1.0, mmr_lambda)))
+        filtered_records = [
+            record for record in self.records
+            if date_in_range(record.source_date, after, before)
+        ]
+        return expand_neighbor_records(selected, filtered_records, neighbor_chunks)
+
+    def candidate_indexes(self, query: str, query_tokens: collections.Counter[str], top_k: int) -> set[int]:
+        phrase_tokens: collections.Counter[str] = collections.Counter()
+        for phrase in re.findall(r"`([^`]+)`", query):
+            phrase_tokens.update(tokenize(phrase))
+
+        base_tokens = phrase_tokens or query_tokens
+        token_postings = [
+            (token, self.postings[token])
+            for token in base_tokens
+            if token in self.postings
+        ]
+        if not token_postings:
+            return set(range(len(self.records)))
+
+        token_postings.sort(key=lambda item: len(item[1]))
+        min_candidates = max(top_k * 30, 80)
+        candidates = set(token_postings[0][1])
+
+        # For quoted needle queries, intersect rare phrase terms aggressively.
+        # For open-ended queries, keep enough recall by stopping before the pool
+        # collapses too far.
+        for _, postings in token_postings[1:8]:
+            narrowed = candidates & set(postings)
+            if phrase_tokens:
+                if narrowed:
+                    candidates = narrowed
+            elif len(narrowed) >= min_candidates:
+                candidates = narrowed
+
+        if len(candidates) < max(top_k, 3) and len(token_postings) > 1:
+            fallback: set[int] = set()
+            for _, postings in token_postings[:8]:
+                fallback.update(postings)
+            if fallback:
+                candidates = fallback
+        return candidates
 
 
 def token_set(record: LoreRecord) -> set[str]:
@@ -471,36 +574,17 @@ def retrieve_records_from_list(
     neighbor_chunks: int = 0,
     mmr_lambda: float = 0.9,
 ) -> list[LoreRecord]:
+    return LoreIndex(records).retrieve(query, top_k, min_score, after, before, neighbor_chunks, mmr_lambda)
+
+
+def expanded_query_tokens(query: str) -> collections.Counter[str]:
     query_tokens = collections.Counter(tokenize(query))
     for token, count in list(query_tokens.items()):
         for expanded in QUERY_EXPANSIONS.get(token, []):
             query_tokens[expanded] += max(1, int(math.ceil(count * 0.5)))
     if not query_tokens:
         raise SystemExit("query produced no retrieval tokens")
-    filtered_records = [
-        record for record in records
-        if date_in_range(record.source_date, after, before)
-    ]
-    if not filtered_records:
-        raise SystemExit(f"no lore records match date filters after={after or '*'} before={before or '*'}")
-    scored: list[LoreRecord] = []
-    for record in filtered_records:
-        score = score_record(query_tokens, query, record)
-        if score >= min_score:
-            scored.append(LoreRecord(
-                id=record.id,
-                path=record.path,
-                chunk=record.chunk,
-                anchor=record.anchor,
-                terms=record.terms,
-                text=record.text,
-                source_date=record.source_date,
-                title=record.title,
-                score=score,
-            ))
-    scored.sort(key=lambda item: item.score, reverse=True)
-    selected = mmr_select(scored, top_k, max(0.0, min(1.0, mmr_lambda)))
-    return expand_neighbor_records(selected, filtered_records, neighbor_chunks)
+    return query_tokens
 
 
 def retrieve_records(

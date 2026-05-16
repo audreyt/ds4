@@ -506,6 +506,30 @@ python3 dir-steering/tools/lore_cag_eval.py \
   --tokens 180
 ```
 
+Train a lightweight outcome policy from the sweep rows:
+
+```sh
+python3 dir-steering/tools/train_lore_policy.py train \
+  --outcome dir-steering/out/audrey-cag-eval-live.jsonl \
+  --model-dir dir-steering/out/audrey-policy-live \
+  --leave-one-case-out
+```
+
+Predict a runtime policy for a new query:
+
+```sh
+python3 dir-steering/tools/train_lore_policy.py predict \
+  --model-dir dir-steering/out/audrey-policy-live \
+  --query "Which transcript discusses local Kami systems with charters?"
+```
+
+The policy model is intentionally small and outcome-trained: it scores candidate
+retrieval/steering configurations from the JSONL rows produced by
+`lore_cag_eval.py`. Use compose-only rows to learn retrieval shape, and live
+rows to learn whether CAG-only or CAG plus steering actually improves answers.
+Do not treat this policy as a factual memory or as a replacement for live evals;
+it is the routing layer that decides which CAG/steering setting deserves to run.
+
 Live steering-strength sweep:
 
 ```sh

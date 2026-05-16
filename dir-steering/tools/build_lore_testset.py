@@ -86,11 +86,11 @@ def choose_needle(
     df: collections.Counter[str],
     doc_count: int,
     max_needle_chars: int,
+    source_lowers: list[str],
 ) -> str:
     title_tokens = set(lore_cag.tokenize(lore_cag.source_title(path, text)))
     path_tokens = set(lore_cag.tokenize(path.name))
-    best = ""
-    best_score = -1e18
+    scored: list[tuple[float, str]] = []
     for passage in candidate_passages(text, max_needle_chars):
         tokens = [token for token in lore_cag.tokenize(passage) if token not in title_tokens and token not in path_tokens]
         if len(set(tokens)) < 3:
@@ -99,12 +99,12 @@ def choose_needle(
         length_bonus = min(len(passage), max_needle_chars) / max_needle_chars
         cjk_bonus = 0.2 if lore_cag.CJK_RE.search(passage) else 0.0
         score = rarity + length_bonus + cjk_bonus
-        if score > best_score:
-            best = passage
-            best_score = score
-    if not best:
-        raise ValueError(f"{path}: could not extract a usable needle passage")
-    return best
+        scored.append((score, passage))
+    for _, passage in sorted(scored, reverse=True)[:80]:
+        passage_lower = passage.lower()
+        if sum(1 for source in source_lowers if passage_lower in source) == 1:
+            return passage
+    raise ValueError(f"{path}: could not extract a source-unique needle passage")
 
 
 def make_case(path: Path, text: str, needle: str, index: int) -> dict:
@@ -151,15 +151,19 @@ def main() -> None:
     paths = lore_cag.iter_paths(args.doc, root, {".md"}, set(lore_cag.DEFAULT_EXCLUDES))
     paths = lore_cag.filter_paths_by_date(paths, args.after, args.before)
     paths.sort(key=lambda item: (lore_cag.source_date(item), item.name))
-    df = build_document_frequencies(paths, args.max_file_chars)
+    source_texts = [lore_cag.read_text(path, args.max_file_chars) for path in paths]
+    source_lowers = [text.lower() for text in source_texts]
+    df: collections.Counter[str] = collections.Counter()
+    for text in source_texts:
+        df.update(set(lore_cag.tokenize(text)))
     selected = select_evenly(paths, args.limit)
 
     cases: list[dict] = []
     skipped: list[str] = []
     for path in selected:
-        text = lore_cag.read_text(path, args.max_file_chars)
+        text = source_texts[paths.index(path)]
         try:
-            needle = choose_needle(path, text, df, len(paths), args.max_needle_chars)
+            needle = choose_needle(path, text, df, len(paths), args.max_needle_chars, source_lowers)
         except ValueError as exc:
             skipped.append(str(exc))
             continue

@@ -19,6 +19,7 @@ HYPERNET = ROOT / "dir-steering" / "tools" / "doc_steering_hypernetwork.py"
 LORE_CAG = ROOT / "dir-steering" / "tools" / "lore_cag.py"
 LORE_EVAL = ROOT / "dir-steering" / "tools" / "lore_cag_eval.py"
 LORE_TESTSET = ROOT / "dir-steering" / "tools" / "build_lore_testset.py"
+LORE_POLICY = ROOT / "dir-steering" / "tools" / "train_lore_policy.py"
 N_LAYER = 43
 N_EMBD = 4096
 VECTOR_FLOATS = N_LAYER * N_EMBD
@@ -330,6 +331,42 @@ class DocSteeringToolTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertGreaterEqual(rows[0]["score"], 1.0)
             self.assertFalse(rows[0]["forbidden_hits"])
+
+    def test_lore_policy_trains_from_outcome_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            outcomes = root / "outcomes.jsonl"
+            model_dir = root / "policy"
+            rows = [
+                {"case": "alpha", "query": "alpha civic assembly", "top_k": 3, "max_context_chars": 8000, "neighbor_chunks": 1, "scale": "none", "hnet": False, "score": 1.0},
+                {"case": "alpha", "query": "alpha civic assembly", "top_k": 3, "max_context_chars": 8000, "neighbor_chunks": 1, "scale": "-0.75", "hnet": True, "score": 0.5},
+                {"case": "beta", "query": "beta steering posture", "top_k": 3, "max_context_chars": 8000, "neighbor_chunks": 1, "scale": "none", "hnet": False, "score": 0.4},
+                {"case": "beta", "query": "beta steering posture", "top_k": 3, "max_context_chars": 8000, "neighbor_chunks": 1, "scale": "-0.75", "hnet": True, "score": 1.0},
+            ]
+            outcomes.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+            subprocess.run([
+                sys.executable, str(LORE_POLICY), "train",
+                "--outcome", str(outcomes),
+                "--model-dir", str(model_dir),
+                "--feature-dim", "512",
+                "--epochs", "80",
+            ], cwd=ROOT, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.assertTrue((model_dir / "model.json").exists())
+
+            pred = root / "prediction.json"
+            subprocess.run([
+                sys.executable, str(LORE_POLICY), "predict",
+                "--model-dir", str(model_dir),
+                "--query", "beta steering posture",
+                "--top-k", "3",
+                "--max-context-chars", "8000",
+                "--neighbor-chunks", "1",
+                "--scales", "none,-0.75",
+                "--out", str(pred),
+            ], cwd=ROOT, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            payload = json.loads(pred.read_text(encoding="utf-8"))
+            self.assertEqual(payload["best"]["scale"], "-0.75")
 
 
 if __name__ == "__main__":

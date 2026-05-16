@@ -104,6 +104,7 @@ def score_answer(answer: str, case: dict) -> dict:
 
 def run_capture(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, cwd=cwd, check=True, text=True,
+                          encoding="utf-8", errors="replace",
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
@@ -116,14 +117,13 @@ def resolve_pack(path: str) -> Path:
 
 def compose_prompt(
     args: argparse.Namespace,
-    pack_records: list[lore_cag.LoreRecord],
+    pack_index: lore_cag.LoreIndex,
     case: dict,
     top_k: int,
     max_context_chars: int,
     prompt_path: Path,
 ) -> None:
-    records = lore_cag.retrieve_records_from_list(
-        pack_records,
+    records = pack_index.retrieve(
         case["query"],
         top_k,
         args.min_score,
@@ -217,6 +217,7 @@ def main() -> None:
         out = repo_root() / out
     out.parent.mkdir(parents=True, exist_ok=True)
     pack_records = lore_cag.load_pack(resolve_pack(args.pack))
+    pack_index = lore_cag.LoreIndex(pack_records)
 
     results: list[dict] = []
     run_count = 0
@@ -227,7 +228,7 @@ def main() -> None:
                 for top_k in top_ks:
                     for max_context in contexts:
                         prompt_path = root / f"{case['id']}-k{top_k}-c{max_context}.txt"
-                        compose_prompt(args, pack_records, case, top_k, max_context, prompt_path)
+                        compose_prompt(args, pack_index, case, top_k, max_context, prompt_path)
                         for scale in scales:
                             if args.limit and run_count >= args.limit:
                                 break
@@ -248,8 +249,12 @@ def main() -> None:
                                 "query": case["query"],
                                 "top_k": top_k,
                                 "max_context_chars": max_context,
+                                "neighbor_chunks": args.neighbor_chunks,
+                                "mmr_lambda": args.mmr_lambda,
                                 "scale": scale,
                                 "hnet": bool(args.hnet_model_dir and scale != "none"),
+                                "hnet_top_k": args.hnet_top_k if args.hnet_model_dir and scale != "none" else 0,
+                                "hnet_temperature": args.hnet_temperature if args.hnet_model_dir and scale != "none" else 0.0,
                                 **scored,
                                 "answer": answer.strip(),
                                 "stderr_tail": stderr[-1200:],
