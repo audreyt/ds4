@@ -435,6 +435,31 @@ python3 dir-steering/tools/lore_cag.py prompt \
   --out /tmp/ds4_lore_prompt.txt
 ```
 
+Stream a cited prompt through an Ollama-compatible API and convert `[1]`
+citations in the answer into Markdown footnotes linked to `archive.tw`:
+
+```sh
+python3 dir-steering/tools/lore_cag.py prompt \
+  --pack dir-steering/out/audrey-transcript-lore.jsonl \
+  --query "用 #zh-tw 回答：地神香火如何" \
+  --top-k 2 \
+  --max-context-chars 0 \
+  --neighbor-chunks 1 \
+  --out /tmp/cag-prompt.txt
+
+( jq -n \
+    --arg model 'kimi-k2.6:cloud' \
+    --rawfile prompt /tmp/cag-prompt.txt \
+    '{model:$model,prompt:$prompt,stream:true}' |
+  curl -sS -N http://localhost:11434/api/generate \
+    -H 'Content-Type: application/json' \
+    -d @- |
+  jq -rj --unbuffered 'select(.response) | .response' |
+  python3 dir-steering/tools/lore_cag.py footnotes \
+    --prompt /tmp/cag-prompt.txt
+); echo
+```
+
 Run CAG through DS4:
 
 ```sh

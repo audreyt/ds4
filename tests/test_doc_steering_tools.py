@@ -268,6 +268,32 @@ class DocSteeringToolTests(unittest.TestCase):
             self.assertEqual(payload["records"][0]["source_date"], "2024-06-13")
             self.assertIn("演算法", "\n".join(item["text"] for item in payload["records"]))
 
+    def test_lore_cag_streams_markdown_footnotes_from_prompt_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            prompt = root / "prompt.txt"
+            prompt.write_text(
+                "[1] file: /Users/au/w/transcript/2025-09-05-AI-倫理加速-關懷六力.md "
+                "chunk: 27 date: 2025-09-05 title: 2025-09-05 AI 倫理加速：關懷六力 "
+                "anchor: 唐鳳： score: 5.026\n"
+                "[2] file: /Users/au/w/transcript/2026-03-24-為何唐鳳不害怕-AI-智慧體與-OpenClaw.md "
+                "chunk: 11 date: 2026-03-24 title: 2026-03-24 為何唐鳳不害怕 AI 智慧體與 OpenClaw "
+                "anchor: 劉光瑩： score: 4.158\n",
+                encoding="utf-8",
+            )
+
+            proc = subprocess.run([
+                sys.executable,
+                str(LORE_CAG),
+                "footnotes",
+                "--prompt", str(prompt),
+            ], cwd=ROOT, check=True, input="地神是地方性的照護 AI [1]，也可在地修正 [2]。",
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            self.assertIn("照護 AI [^1]，也可在地修正 [^2]。", proc.stdout)
+            self.assertIn("[^1]: [2025-09-05 AI 倫理加速：關懷六力, chunk 27](https://archive.tw/2025-09-05-AI-", proc.stdout)
+            self.assertIn("[^2]: [2026-03-24 為何唐鳳不害怕 AI 智慧體與 OpenClaw, chunk 11](https://archive.tw/2026-03-24-", proc.stdout)
+
     def test_lore_testset_builds_honest_compose_only_cases(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

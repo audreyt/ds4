@@ -22,6 +22,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -80,6 +81,13 @@ SQLITE_INDEX_FORMAT = "ds4-lore-sqlite-index-v1"
 SQLITE_INDEX_AUTOBUILD_BYTES = 32 * 1024 * 1024
 SQLITE_INDEX_TOKEN_LIMIT = 192
 SQLITE_MAX_VARS = 900
+PROMPT_SOURCE_RE = re.compile(
+    r"^\[(\d+)\]\s+file:\s+(.*?)\s+chunk:\s+(\d+)"
+    r"(?:\s+date:\s+(.*?))?"
+    r"(?:\s+title:\s+(.*?))?"
+    r"\s+anchor:\s+(.*?)\s+score:\s+([0-9.]+)",
+    re.MULTILINE,
+)
 
 
 @dataclass
@@ -1173,6 +1181,76 @@ def prompt_cmd(args: argparse.Namespace) -> None:
         print(prompt)
 
 
+def archive_url_for_path(path: str, archive_base: str) -> str:
+    stem = Path(path).stem
+    return f"{archive_base.rstrip('/')}/{urllib.parse.quote(stem)}"
+
+
+def parse_prompt_sources(prompt: str, archive_base: str) -> dict[int, str]:
+    sources: dict[int, str] = {}
+    for match in PROMPT_SOURCE_RE.finditer(prompt):
+        index = int(match.group(1))
+        path = match.group(2).strip()
+        chunk = int(match.group(3))
+        title = (match.group(5) or Path(path).stem).strip()
+        url = archive_url_for_path(path, archive_base)
+        sources[index] = f"[{title}, chunk {chunk}]({url})"
+    return sources
+
+
+def stream_markdown_footnotes(sources: dict[int, str], all_sources: bool) -> None:
+    used: set[int] = set()
+    state = "text"
+    digits = ""
+
+    def write(value: str) -> None:
+        sys.stdout.write(value)
+        sys.stdout.flush()
+
+    while True:
+        char = sys.stdin.read(1)
+        if not char:
+            break
+        if state == "text":
+            if char == "[":
+                state = "citation"
+                digits = ""
+            else:
+                write(char)
+            continue
+
+        if state == "citation":
+            if char.isdigit() and len(digits) < 9:
+                digits += char
+                continue
+            if char == "]" and digits:
+                index = int(digits)
+                used.add(index)
+                write(f"[^{index}]")
+                state = "text"
+                digits = ""
+                continue
+            write("[" + digits + char)
+            state = "text"
+            digits = ""
+
+    if state == "citation":
+        write("[" + digits)
+
+    footnote_indexes = sorted(sources) if all_sources else sorted(index for index in used if index in sources)
+    if footnote_indexes:
+        write("\n\n")
+        for index in footnote_indexes:
+            write(f"[^{index}]: {sources[index]}\n")
+
+
+def footnotes_cmd(args: argparse.Namespace) -> None:
+    prompt_path = resolve_cli_path(args.prompt)
+    prompt = prompt_path.read_text(encoding="utf-8")
+    sources = parse_prompt_sources(prompt, args.archive_base)
+    stream_markdown_footnotes(sources, args.all)
+
+
 def predict_steering(args: argparse.Namespace, records: list[LoreRecord], temp_dir: Path) -> Path:
     hnet = Path(args.hnet_model_dir)
     if not hnet.is_absolute():
@@ -1299,6 +1377,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_retrieval_args(prompt_ap)
     prompt_ap.add_argument("--out", default="")
     prompt_ap.set_defaults(func=prompt_cmd)
+
+    footnotes_ap = sub.add_parser("footnotes")
+    footnotes_ap.add_argument("--prompt", required=True,
+                              help="prompt file produced by the prompt subcommand")
+    footnotes_ap.add_argument("--archive-base", default="https://archive.tw")
+    footnotes_ap.add_argument("--all", action="store_true",
+                              help="append footnotes for every prompt source, not just cited sources")
+    footnotes_ap.set_defaults(func=footnotes_cmd)
 
     run_ap = sub.add_parser("run")
     add_retrieval_args(run_ap)
