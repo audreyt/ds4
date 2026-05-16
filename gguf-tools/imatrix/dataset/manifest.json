@@ -1,9 +1,9 @@
 {
   "version": 4,
   "purpose": "DeepSeek V4 Flash imatrix calibration prompts",
-  "record_count": 4682,
-  "rendered_utf8_bytes": 11647999,
-  "rough_token_estimate_bytes_div_4": 2911999,
+  "record_count": 4690,
+  "rendered_utf8_bytes": 11670191,
+  "rough_token_estimate_bytes_div_4": 2917547,
   "categories": {
     "agent": 1106,
     "algorithms": 32,
@@ -12,22 +12,22 @@
     "language": 1024,
     "long_context": 36,
     "programming": 48,
-    "source": 2066,
+    "source": 2074,
     "translation": 180
   },
   "modes": {
-    "nothink": 2341,
-    "think": 2341
+    "nothink": 2345,
+    "think": 2345
   },
   "bytes_by_category": {
     "agent": 4428393,
     "algorithms": 9388,
-    "eval_reasoning": 145165,
+    "eval_reasoning": 144853,
     "general": 11902,
     "language": 725152,
-    "long_context": 357186,
+    "long_context": 357114,
     "programming": 14320,
-    "source": 5900343,
+    "source": 5922919,
     "translation": 56150
   },
   "files": {

@@ -818,9 +818,9 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->model = xstrdup("deepseek-v4-flash");
     r->max_tokens = max_tokens;
     r->top_k = 0;
-    r->temperature = 1.0f;
-    r->top_p = 1.0f;
-    r->min_p = 0.0f;
+    r->temperature = DS4_DEFAULT_TEMPERATURE;
+    r->top_p = DS4_DEFAULT_TOP_P;
+    r->min_p = DS4_DEFAULT_MIN_P;
     r->think_mode = DS4_THINK_HIGH;
 }
 
@@ -4317,6 +4317,17 @@ static const char *skip_ascii_ws(const char *p) {
     return p;
 }
 
+static const char *find_last_substr(const char *s, const char *needle) {
+    if (!s || !needle || !needle[0]) return NULL;
+    const char *last = NULL;
+    const char *p = s;
+    while ((p = strstr(p, needle)) != NULL) {
+        last = p;
+        p++;
+    }
+    return last;
+}
+
 /* The prompt renderer escapes DSML text so a tool argument can safely contain
  * shell operators or closing tags.  The generated-DSML parser must undo exactly
  * those entities before it turns parameters back into JSON; otherwise
@@ -4472,29 +4483,49 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
     free(s);
 }
 
-static bool parse_generated_message(const char *text, char **content_out,
-                                    char **reasoning_out, tool_calls *calls) {
-    const char *start = strstr(text, "\n\n" DS4_TOOL_CALLS_START);
+static bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
+                                       char **content_out, char **reasoning_out,
+                                       tool_calls *calls) {
+    text = text ? text : "";
+    const char *tool_search = text;
+
+    /* When thinking mode is enabled the model is expected to close
+     * </think> before it enters the executable assistant surface.  DSML inside
+     * reasoning is just model text: it may be a mistaken attempt, a quotation,
+     * or an explanation of the protocol.  Treating it as a real tool call
+     * duplicates it into both reasoning and structured tool_calls, and can make
+     * clients execute something the assistant had not actually emitted as its
+     * post-thinking action. */
+    if (require_thinking_closed) {
+        const char *think_end = find_last_substr(text, "</think>");
+        if (!think_end) {
+            split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+            return true;
+        }
+        tool_search = think_end + 8;
+    }
+
+    const char *start = strstr(tool_search, "\n\n" DS4_TOOL_CALLS_START);
     int style = 0; /* 0: DSML, 1: plain XML, 2: DSML with the first vertical bar omitted. */
-    if (!start) start = strstr(text, DS4_TOOL_CALLS_START);
+    if (!start) start = strstr(tool_search, DS4_TOOL_CALLS_START);
     if (!start) {
-        start = strstr(text, "\n\n" DS4_TOOL_CALLS_START_SHORT);
+        start = strstr(tool_search, "\n\n" DS4_TOOL_CALLS_START_SHORT);
         style = start ? 2 : style;
     }
     if (!start) {
-        start = strstr(text, DS4_TOOL_CALLS_START_SHORT);
+        start = strstr(tool_search, DS4_TOOL_CALLS_START_SHORT);
         style = start ? 2 : style;
     }
     if (!start) {
-        start = strstr(text, "\n\n<tool_calls>");
+        start = strstr(tool_search, "\n\n<tool_calls>");
         style = start ? 1 : style;
     }
     if (!start) {
-        start = strstr(text, "<tool_calls>");
+        start = strstr(tool_search, "<tool_calls>");
         style = start ? 1 : style;
     }
     if (!start) {
-        split_reasoning_content(text, text ? strlen(text) : 0, content_out, reasoning_out);
+        split_reasoning_content(text, strlen(text), content_out, reasoning_out);
         return true;
     }
 
@@ -4642,6 +4673,7 @@ static const char *tool_parse_failure_recovery_finish(const char *finish) {
 static bool parse_generated_message_for_response(const char *text,
                                                  bool has_tools,
                                                  bool saw_tool_start,
+                                                 bool require_thinking_closed,
                                                  const char **finish_io,
                                                  char *err,
                                                  size_t errlen,
@@ -4651,8 +4683,10 @@ static bool parse_generated_message_for_response(const char *text,
                                                  bool *recovered_out) {
     if (recovered_out) *recovered_out = false;
 
-    bool parsed_ok = parse_generated_message(text ? text : "", content_out,
-                                             reasoning_out, calls);
+    bool parsed_ok = parse_generated_message_ex(text ? text : "",
+                                                require_thinking_closed,
+                                                content_out, reasoning_out,
+                                                calls);
     if (parsed_ok) return true;
 
     free(*content_out);
@@ -11127,6 +11161,9 @@ static void generate_job(server *s, job *j) {
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
+    const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
+    bool tool_scan_waiting_for_think_close =
+        thinking_gates_tool_markers && thinking.inside;
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
     decode_repetition_guard repeat_guard = {0};
@@ -11361,36 +11398,52 @@ static void generate_job(server *s, job *j) {
             free(piece);
 
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
-                const char *tool_scan = text.ptr ? text.ptr + tool_scan_from : "";
-                bool orphan_end = false;
-                bool old_start = saw_tool_start;
-                bool old_end = saw_tool_end;
-                observe_tool_markers(tool_scan, &saw_tool_start, &saw_tool_end, &orphan_end);
-                if (orphan_end && !saw_orphan_tool_end) {
-                    saw_orphan_tool_end = true;
-                    server_log(DS4_LOG_WARNING,
-                               "ds4-server: chat ctx=%s%s%s ignored orphan tool-call end marker after %d generated tokens",
-                               ctx_span,
-                               req_flags[0] ? " " : "",
-                               req_flags,
-                               completion);
-                    trace_event(s, trace_id,
-                                "ignored orphan tool-call end marker after %d generated tokens",
-                                completion);
-                }
-                if (saw_tool_start && !old_start) {
-                    trace_event(s, trace_id, "entered tool-call block after %d generated tokens", completion);
-                }
-                if (saw_tool_end && !old_end) {
-                    trace_event(s, trace_id, "closed tool-call block after %d generated tokens", completion);
-                }
-                const size_t marker_hold = 80;
-                tool_scan_from = text.len > marker_hold ? text.len - marker_hold : 0;
-                if (s->trace && completion >= next_tool_progress) {
-                    trace_event(s, trace_id,
-                                "progress gen=%d dsml_start=%d dsml_end=%d",
-                                completion, saw_tool_start ? 1 : 0, saw_tool_end ? 1 : 0);
-                    next_tool_progress += 128;
+                if (thinking_gates_tool_markers && thinking.inside) {
+                    /* A DSML block inside reasoning is not executable.  This is
+                     * the live guard: do not let a quoted or mistaken marker in
+                     * <think> stop decoding as a real tool call. */
+                    tool_scan_waiting_for_think_close = true;
+                    tool_scan_from = text.len;
+                } else {
+                    if (tool_scan_waiting_for_think_close) {
+                        const char *think_end = find_last_substr(text.ptr, "</think>");
+                        tool_scan_from = think_end ? (size_t)((think_end + 8) - text.ptr) : text.len;
+                        if (tool_scan_from > text.len) tool_scan_from = text.len;
+                        tool_scan_waiting_for_think_close = false;
+                    }
+                    if (tool_scan_from > text.len) tool_scan_from = text.len;
+                    const char *tool_scan = text.ptr ? text.ptr + tool_scan_from : "";
+                    bool orphan_end = false;
+                    bool old_start = saw_tool_start;
+                    bool old_end = saw_tool_end;
+                    observe_tool_markers(tool_scan, &saw_tool_start, &saw_tool_end, &orphan_end);
+                    if (orphan_end && !saw_orphan_tool_end) {
+                        saw_orphan_tool_end = true;
+                        server_log(DS4_LOG_WARNING,
+                                   "ds4-server: chat ctx=%s%s%s ignored orphan tool-call end marker after %d generated tokens",
+                                   ctx_span,
+                                   req_flags[0] ? " " : "",
+                                   req_flags,
+                                   completion);
+                        trace_event(s, trace_id,
+                                    "ignored orphan tool-call end marker after %d generated tokens",
+                                    completion);
+                    }
+                    if (saw_tool_start && !old_start) {
+                        trace_event(s, trace_id, "entered tool-call block after %d generated tokens", completion);
+                    }
+                    if (saw_tool_end && !old_end) {
+                        trace_event(s, trace_id, "closed tool-call block after %d generated tokens", completion);
+                    }
+                    const size_t marker_hold = 80;
+                    size_t hold_from = text.len > marker_hold ? text.len - marker_hold : 0;
+                    if (hold_from > tool_scan_from) tool_scan_from = hold_from;
+                    if (s->trace && completion >= next_tool_progress) {
+                        trace_event(s, trace_id,
+                                    "progress gen=%d dsml_start=%d dsml_end=%d",
+                                    completion, saw_tool_start ? 1 : 0, saw_tool_end ? 1 : 0);
+                        next_tool_progress += 128;
+                    }
                 }
             }
 
@@ -11469,6 +11522,7 @@ static void generate_job(server *s, job *j) {
             text.ptr ? text.ptr : "",
             j->req.has_tools,
             saw_tool_start,
+            ds4_think_mode_enabled(j->req.think_mode),
             &final_finish,
             err,
             sizeof(err),
@@ -12048,6 +12102,7 @@ typedef struct {
     int port;
     int ctx_size;
     int default_tokens;
+    const char *chdir_path;
     const char *trace_path;
     const char *kv_disk_dir;
     uint64_t kv_disk_space_mb;
@@ -12157,6 +12212,8 @@ static void usage(FILE *fp) {
         "      Default max output tokens when the client omits a limit. Default: 393216 (384K)\n"
         "  -t, --threads N\n"
         "      CPU helper threads for lightweight host-side work.\n"
+        "  --chdir DIR\n"
+        "      Change working directory before loading the model or runtime assets.\n"
         "  --quality\n"
         "      Prefer exact kernels where faster approximate paths exist; disables Metal Tensor routes; MTP uses strict verification.\n"
         "  -mt MODE, --mt MODE\n"
@@ -12190,7 +12247,7 @@ static void usage(FILE *fp) {
         "  Only reasoning_effort=max or output_config.effort=max requests Think Max.\n"
         "  Think Max is applied only when --ctx is at least 393216 tokens; smaller contexts use high.\n"
         "  thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.\n"
-        "  API defaults are temperature=1, top_p=1, min_p=0, and no top-k cap.\n"
+        "  API defaults are temperature=1, top_p=1, min_p=0.05, and no top-k cap.\n"
         "  In thinking mode, client sampling knobs are ignored like the official API.\n"
         "\n"
         "Disk KV cache:\n"
@@ -12313,6 +12370,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.n_threads = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-mt") || !strcmp(arg, "--mt") || !strcmp(arg, "--mpp")) {
             c.engine.mpp_mode = parse_mpp_mode_arg(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--chdir")) {
+            c.chdir_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--host")) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
@@ -12394,6 +12453,11 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
 
     server_config cfg = parse_options(argc, argv);
+    if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to chdir to %s: %s",
+                   cfg.chdir_path, strerror(errno));
+        return 1;
+    }
 
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
@@ -13033,8 +13097,8 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     char *parsed_content = NULL;
     char *parsed_reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message(raw_complete, &parsed_content,
-                                        &parsed_reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(raw_complete, false, &parsed_content,
+                                           &parsed_reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
     apply_anthropic_stream_tool_ids(&calls, &st);
     TEST_ASSERT(calls.v[0].id != NULL);
@@ -13370,7 +13434,7 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     char *parsed_content = NULL;
     char *parsed_reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message(raw_complete, &parsed_content, &parsed_reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(raw_complete, false, &parsed_content, &parsed_reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
     apply_openai_stream_tool_ids(&calls, &st);
     TEST_ASSERT(calls.v[0].id != NULL);
@@ -13673,14 +13737,14 @@ static void test_streaming_holds_partial_utf8(void) {
     close(sv[1]);
 }
 
-static void test_request_defaults_match_deepseek_api(void) {
+static void test_request_defaults_use_min_p_filtering(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
     TEST_ASSERT(r.think_mode == DS4_THINK_HIGH);
-    TEST_ASSERT(r.temperature == 1.0f);
-    TEST_ASSERT(r.top_p == 1.0f);
+    TEST_ASSERT(r.temperature == DS4_DEFAULT_TEMPERATURE);
+    TEST_ASSERT(r.top_p == DS4_DEFAULT_TOP_P);
     TEST_ASSERT(r.top_k == 0);
-    TEST_ASSERT(r.min_p == 0.0f);
+    TEST_ASSERT(r.min_p == DS4_DEFAULT_MIN_P);
     request_free(&r);
 }
 
@@ -13916,7 +13980,7 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message(generated, &content, &reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
     TEST_ASSERT(reasoning && !strcmp(reasoning, "need a tool"));
     TEST_ASSERT(content && content[0] == '\0');
     TEST_ASSERT(calls.len == 1);
@@ -13956,7 +14020,7 @@ static void test_dsml_parser_recovers_loose_nested_parameters(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message(generated, &content, &reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
     TEST_ASSERT(content && !strcmp(content, "review done"));
     TEST_ASSERT(calls.len == 1);
     TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "edit"));
@@ -13987,6 +14051,7 @@ static void test_tool_parse_failure_returns_recoverable_finish(void) {
     TEST_ASSERT(!parse_generated_message_for_response(generated,
                                                        true,
                                                        true,
+                                                       false,
                                                        &finish,
                                                        err,
                                                        sizeof(err),
@@ -14000,6 +14065,55 @@ static void test_tool_parse_failure_returns_recoverable_finish(void) {
     TEST_ASSERT(content && strstr(content, DS4_TOOL_CALLS_START) != NULL);
     TEST_ASSERT(reasoning == NULL);
     TEST_ASSERT(calls.len == 0);
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_thinking_dsml_is_not_executable_before_think_close(void) {
+    const char *generated =
+        "<think>I might mention a malformed or tentative tool call here:\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">true" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END
+        "\nBut it is still reasoning, not an assistant action.</think>Final answer.";
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex(generated, true,
+                                           &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 0);
+    TEST_ASSERT(reasoning && strstr(reasoning, DS4_TOOL_CALLS_START) != NULL);
+    TEST_ASSERT(content && !strcmp(content, "Final answer."));
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_thinking_dsml_after_think_close_is_executable(void) {
+    const char *generated =
+        "<think>need a shell check</think>\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">pwd" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex(generated, true,
+                                           &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "need a shell check"));
+    TEST_ASSERT(content && content[0] == '\0');
+    TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"pwd\"") != NULL);
 
     free(content);
     free(reasoning);
@@ -14031,7 +14145,7 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message(generated, &content, &reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
     TEST_ASSERT(strstr(calls.v[0].arguments, "cd /tmp && git diff 2>/dev/null") != NULL);
     TEST_ASSERT(strstr(calls.v[0].arguments, "&amp;&amp;") == NULL);
@@ -14110,7 +14224,7 @@ static void test_tool_checkpoint_minifies_json_parameters(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message(generated, &content, &reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
 
     request r;
@@ -14167,7 +14281,7 @@ static void test_tool_memory_replays_sampled_dsml(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls sampled = {0};
-    TEST_ASSERT(parse_generated_message(generated, &content, &reasoning, &sampled));
+    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &sampled));
     TEST_ASSERT(sampled.len == 1);
 
     server s;
@@ -15002,7 +15116,7 @@ static void test_tool_separator_whitespace_is_not_content(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message(generated, &content, &reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
     TEST_ASSERT(reasoning && !strcmp(reasoning, "need a tool"));
     TEST_ASSERT(content && !strcmp(content, "I will inspect the files."));
     TEST_ASSERT(calls.len == 1);
@@ -16134,7 +16248,7 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 }
 
 static void ds4_server_unit_tests_run(void) {
-    test_request_defaults_match_deepseek_api();
+    test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
@@ -16175,6 +16289,8 @@ static void ds4_server_unit_tests_run(void) {
     test_parse_short_dsml_and_canonical_suffix();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_tool_parse_failure_returns_recoverable_finish();
+    test_thinking_dsml_is_not_executable_before_think_close();
+    test_thinking_dsml_after_think_close_is_executable();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();

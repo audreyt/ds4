@@ -229,9 +229,10 @@ per-layer chunk dispatch path.
 ## Capability Evaluation
 
 `ds4-eval` is a small real-model integration benchmark. It is not a leaderboard
-runner and should not be reported as an official GPQA, SuperGPQA, or AIME score:
-the questions are an embedded 75-item subset chosen to make local regression
-testing useful and visually inspectable. The program loads the real GGUF,
+runner and should not be reported as an official GPQA, SuperGPQA, AIME, or
+security benchmark score: the questions are an embedded 92-item subset chosen
+to make local regression testing useful and visually inspectable. The program
+loads the real GGUF,
 renders DS4 chat prompts, streams sampled tokens in a split-screen TUI, grades
 the final answer, and prints a per-question report with prompt tokens,
 generated tokens, pass/fail state, the model answer, and the correct answer.
@@ -240,16 +241,26 @@ generated tokens, pass/fail state, the model answer, and the correct answer.
 ./ds4-eval -m ds4flash.gguf --trace /tmp/ds4-eval.txt
 ```
 
-The default run uses `--ctx 100000` and `--tokens 16000`, thinking mode enabled,
-and a soft/hard `</think>` budget cutoff so the model has room to produce a
-visible answer. Press `p` to pause, Up/Down to inspect or select another
-question, and Enter to run the selected question next. `--plain` disables the
-TUI.
+The default run uses `--tokens 16000`, thinking mode enabled, and a soft/hard
+`</think>` budget cutoff so the model has room to produce a visible answer.
+`ds4-eval` sizes the context internally from the largest selected prompt plus
+the generation budget, and refuses runs that would need more than 1M context
+tokens. Press `p` to pause, `q` to exit and print the report, Up/Down to
+inspect or select another question, and Enter to run the selected question next.
+`--plain` disables the TUI.
 
-The 75 embedded questions are interleaved as 25 GPQA Diamond, 25 SuperGPQA, and
-25 AIME 2025 problems. The order is intentionally progressive: early questions
-are useful smoke tests, while later questions are hard enough that a strong
-reasoning model should still miss some of them.
+The first 75 embedded questions are interleaved as 25 GPQA Diamond, 25 audited
+SuperGPQA, and 25 AIME 2025 problems. The final 17 are an audited COMPSEC
+subset of reduced single-function C/C++ vulnerability-localization questions.
+The model is asked for the single best source line, or the smallest exact line
+set only when the bug cannot be localized to one line; the scorer accepts small
+audited ranges only when adjacent lines are equivalent locations for the same
+bug. The order is
+intentionally progressive: early questions are useful smoke tests, while later
+questions are hard enough that a strong reasoning model should still miss some
+of them. The SuperGPQA slice is curated rather than blind: upstream rows with
+wrong keys, missing figures, or underspecified prompts are replaced with cleaner
+rows.
 
 For a model like DeepSeek V4 Flash, the set should be treated as a hard
 capability regression suite rather than a pass/fail unit test:
@@ -267,12 +278,17 @@ capability regression suite rather than a pass/fail unit test:
 - **AIME 2025** contributes exact-answer contest math. These are often the most
   unforgiving items in the set: no multiple-choice prior, no partial credit, and
   a single arithmetic or algebraic slip changes the grade.
+- **COMPSEC** contributes single-function C/C++ security reasoning items
+  reduced from public CVE writeups. These are not exploit prompts: the task is
+  to identify the best source line where the defensive code flaw is introduced,
+  or return `0` for a safe function.
 
 In practice this means `ds4-eval` should not be expected to produce a perfect
-75/75 run. It is meant to answer a more useful engineering question: after a
+92/92 run. It is meant to answer a more useful engineering question: after a
 kernel, quantization, prompt-rendering, KV-cache, or tool-streaming change, does
 DeepSeek V4 Flash still solve a representative mix of hard science, broad
-knowledge, and exact math problems while using the same inference path users run?
+knowledge, exact math, and security-code problems while using the same inference
+path users run?
 
 ## Metal 4 and M5 Neural Accelerators
 
@@ -306,12 +322,25 @@ the default route policy, `-mt on` to force Tensor routes where the Metal tensor
 path is available, and `-mt off` for the legacy Metal reference path. The old
 `--mpp` spelling remains accepted as a compatibility alias. Auto currently
 enables the F16 compressor Tensor path, enables attention-output low Tensor in
-all layers, and runs routed-MoE Tensor only in its conservative layer window
-while preserving same-top1/same-greedy agreement. The dense Q8_0 prefill Tensor
-route is **default-off on M5** because bisection traced the entire `-mt auto`
-vs `-mt off` drift on M5 Max to that single route; it stays default-on for
-pre-M5 devices, where it uses the late-safe `attn_q_b` 32..37 plus all-Q8
-38..42 window. Opt back in on M5 with `DS4_METAL_MPP_Q8_0_ENABLE=1`.
+all layers, and runs routed-MoE Tensor only in the q1..q4-token-count-safe late
+window from layer 40 through layer 42 while preserving same-top1/same-greedy
+agreement. Wider routed-MoE windows caused deterministic `ds4-eval` generation
+drift, so the earlier conservative 12/15 layer window is now reachable only via
+explicit route enables (`DS4_METAL_MPP_MOE_*_ENABLE`), `DS4_METAL_MPP_FAST=1`,
+or `-mt on`. The dense Q8_0 prefill Tensor route is **default-off on M5**
+because bisection traced the entire `-mt auto` vs `-mt off` drift on M5 Max to
+that single route; it stays default-on for pre-M5 devices, where it uses the
+late-safe `attn_q_b` 32..37 plus all-Q8 38..42 window. Opt back in on M5 with
+`DS4_METAL_MPP_Q8_0_ENABLE=1`.
+
+The next prefill optimization target beyond the late MoE Tensor window is a new
+isolated quantized prefill matmul experiment that targets the high-impact
+routed-MoE and dense-attention shapes with Metal 4 cooperative matrix
+primitives, while keeping the legacy dequantization/reduction behavior close
+enough to pass the five-fixture quality gate before it can become part of
+`-mt auto`. Any Apple Neural Engine work should be a separate Core ML/Metal 4
+machine-learning pass investigation; it is not something the current custom
+compute shaders get automatically by changing their matrix instructions.
 
 The environment controls `DS4_METAL_MPP_ENABLE` and
 `DS4_METAL_MPP_DISABLE` accept `1/true/yes/on` and `0/false/no/off`;
@@ -402,32 +431,33 @@ can narrow that candidate before promotion, and the existing MoE route filters,
 route disables, comparator, and stage profiler still apply.
 
 Current Tensor route status balances drift with prefill throughput: `auto`
-enables F16 compressor, attention-output low projection, and routed-MoE Tensor.
-Attention-output low projection is enabled for all layers by default, and
-routed-MoE Tensor uses the lower-drift conservative default window: down from
-layer 12 and gate/up from layer 15. This gives up some of the all-layer
-routed-MoE prefill speedup to avoid the larger drift seen with layer-0
-routed-MoE Tensor windows while keeping the dense Q8_0 prefill route default-off
-on M5. The attention-output low Tensor kernels stage activation tiles through
-half to match the legacy Metal matmul input path, which removes the first
-attention-output comparator breach. The current auto policy uses direct-RHS
-Tensor inputs and 64-token tiles for attention-output low projections. The F16
-compressor route did not introduce measurable drift in the current prompt set.
+enables F16 compressor, attention-output low projection, and routed-MoE Tensor
+in the late layer 40..42 window. Attention-output low projection is enabled for
+all layers by default. The previous routed-MoE conservative window, down from
+layer 12 and gate/up from layer 15, remains available only through explicit MoE
+route enables or forced Tensor mode because it changes deterministic
+`ds4-eval` q1..q4 generation lengths. The late default window recovers part of
+the routed-MoE prefill speedup while keeping the normal decode path aligned with
+the q1..q4 token-count baseline. The attention-output low Tensor kernels stage
+activation tiles through half to match the legacy Metal matmul input path, which
+removes the first attention-output comparator breach. The current auto policy
+uses direct-RHS Tensor inputs and 64-token tiles for attention-output low
+projections. The F16 compressor route did not introduce measurable drift in the
+current prompt set. The dense Q8_0 prefill route stays default-off on M5; this
+keeps the M5 auto profile aligned with `-mt off` decode while the narrower MoE
+window is being benchmarked.
 
-The current auto suite on M5 Max reports same-top1/same-greedy agreement on all
-five fixtures with minimum top-5 overlap `5/5`, minimum top-20 overlap `19/20`,
-`worst_rms ~= 0.434`, and `worst_top20_max_abs ~= 0.77` (three short fixtures
-are bit-exact; residual drift is on the two long-context fixtures and comes
-from the F16/attn-out/MoE Tensor routes compounding through 43 layers).
-
-In a local M5 Max `ds4-bench` sweep with `--gen-tokens 128`, this auto profile
-(`-mt auto`) sampled prefill at `317/330/336/343/336` tokens/sec for
-`512/2048/4096/8192/16384`-token contexts, versus `247/268/275/298/287` t/s
-for standard Metal (`-mt off`) and `257/306/297/305/282` t/s for `--quality`.
-Generation tokens/sec stayed within noise of standard Metal across the sweep
-(`~34` t/s at 512, `~31` at 4096, `~30` at 16384) and beat `--quality` on the
-two longest contexts. Numbers are from one desktop run on a quiet machine;
-full sweeps still show visible desktop-load variance.
+Under the layer-40..42 routed-MoE default, the local M5 Max
+`--metal-tensor-equivalence` diagnostic against `-mt off` reports
+same-top1/same-greedy agreement on all five fixtures with minimum top-5
+overlap `5/5`, top-20 overlap `20/20` across every fixture (no rank
+displacement), `worst_rms ~= 0.0026`, and `worst_top20_max_abs ~= 0.0151`
+(three short fixtures are bit-exact; the residual drift is on the two
+long-context fixtures and comes from the F16/attn-out routes compounding
+through 43 layers). The narrower MoE Tensor window cuts roughly 25× off the
+prior worst-case drift envelope, at the cost of giving up the all-layer MoE
+prefill speedup; a fresh `ds4-bench --gen-tokens 128` sweep across
+`512/2048/4096/8192/16384`-token contexts is still pending under this profile.
 
 The `DS4_METAL_MPP_FAST=1` profile is the measured high-throughput diagnostic
 profile under the relaxed same-top1/same-greedy gate. In the current prompt
@@ -451,8 +481,11 @@ but gives up the strongest long-context prefill gains and has a -2.7%
 generation point at 65k. Neither variant is promoted to the default policy; use
 them only for explicit eval runs.
 
-The routed-MoE Tensor projections are enabled by default from layer 12 for down
-and layer 15 for gate/up. For route isolation, use
+The routed-MoE Tensor projections are enabled by default from layer 40 for gate,
+up, and down. Use `DS4_METAL_MPP_MOE_ENABLE=1`, route-specific enables,
+`DS4_METAL_MPP_FAST=1`, or `-mt on` to test wider windows; the previous
+conservative window starts at layer 12 for down and layer 15 for gate/up when
+routed-MoE Tensor is explicitly widened. For route isolation, use
 `DS4_METAL_MPP_MOE_GATE_ENABLE/DISABLE`,
 `DS4_METAL_MPP_MOE_UP_ENABLE/DISABLE`, and
 `DS4_METAL_MPP_MOE_DOWN_ENABLE/DISABLE`; `DS4_METAL_MPP_MOE_DISABLE=1`
@@ -496,14 +529,14 @@ Long-context decode uses the indexed mixed-attention kernel once ratio-4
 compressed rows exceed the dense-attention window. The default decode
 specialization stages sixteen selected rows per threadgroup block; set
 `DS4_METAL_INDEXED_ATTN_RB4=1` to compare the older four-row staging variant.
-Set `DS4_METAL_DECODE_INDEXER_TOP_K=64`, `128`, `256`, or `512` to cap the
-decode indexer candidate count for speed/quality diagnostics. The normal
-non-quality decode path keeps the legacy dense-attention window until there are
-more than `1024` compressed rows, then selects `256` rows in sparse indexed
-attention. Set `DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD` to `64`, `128`,
-`256`, `512`, `1024`, `2048`, or `4096` to tune the sparse-decode crossover
-separately. `--quality` keeps the full `512` candidate path unless this
-environment override is set explicitly.
+Set `DS4_METAL_DECODE_INDEXER_TOP_K` to a power of two from `4` through `512`
+to cap the decode indexer candidate count for speed/quality diagnostics. The
+normal non-quality decode path keeps the legacy dense-attention window until
+there are more than `1024` compressed rows, then selects `256` rows in sparse
+indexed attention. Set `DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD` to `64`,
+`128`, `256`, `512`, `1024`, `2048`, or `4096` to tune the sparse-decode
+crossover separately. `--quality` keeps the full `512` candidate path unless
+this environment override is set explicitly.
 
 The attention-output low-projection Tensor route applies to full 32-token
 multiples in all layers by default, using a 64-token Tensor tile by default and
@@ -563,6 +596,9 @@ Start a local OpenAI/Anthropic-compatible server:
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
+Use `--chdir /path/to/ds4` when launching `ds4-server` from another directory,
+so relative runtime files such as `metal/*.metal` resolve from the project tree.
+
 The server keeps one mutable backend/KV checkpoint in memory,
 so stateless clients that resend a longer version of the same prompt can reuse
 the shared prefix instead of pre-filling from token zero.
@@ -597,6 +633,11 @@ the same DSML rendering and KV prefix reuse used by chat completions.
 clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
 `temperature`, `top_p`, `top_k`, `stream`, `stop_sequences`, and thinking
 controls. Tool uses are returned as Anthropic `tool_use` blocks.
+
+Default sampled API generation uses `temperature=1`, `top_p=1`, and
+`min_p=0.05`, so the default filter is relative probability rather than
+nucleus mass. In thinking mode DS4 uses those fixed sampling defaults and
+ignores client sampling knobs, matching DeepSeek's fixed-thinking API behavior.
 
 The chat, Responses, and Anthropic endpoints support SSE streaming. In thinking
 mode, reasoning is streamed in the native API shape instead of being mixed into

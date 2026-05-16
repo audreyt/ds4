@@ -56,6 +56,10 @@ typedef struct {
     float logprob;
 } ds4_token_score;
 
+#define DS4_DEFAULT_TEMPERATURE 1.0f
+#define DS4_DEFAULT_TOP_P 1.0f
+#define DS4_DEFAULT_MIN_P 0.05f
+
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
 
