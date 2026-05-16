@@ -194,6 +194,30 @@ class DocSteeringToolTests(unittest.TestCase):
             self.assertTrue(payload["records"][0]["path"].endswith("alpha.md"))
             self.assertIn("build_direction.py", payload["records"][0]["text"])
 
+            index = root / "pack.sqlite"
+            retrieved_index = root / "retrieved-index.json"
+            subprocess.run([
+                sys.executable,
+                str(LORE_CAG),
+                "index",
+                "--pack", str(pack),
+                "--out", str(index),
+            ], cwd=ROOT, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.assertTrue(index.exists())
+            subprocess.run([
+                sys.executable,
+                str(LORE_CAG),
+                "retrieve",
+                "--pack", str(pack),
+                "--index", str(index),
+                "--query", "How do I build a directional steering vector with good-file bad-file?",
+                "--top-k", "1",
+                "--out", str(retrieved_index),
+            ], cwd=ROOT, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            index_payload = json.loads(retrieved_index.read_text(encoding="utf-8"))
+            self.assertEqual(len(index_payload["records"]), 1)
+            self.assertTrue(index_payload["records"][0]["path"].endswith("alpha.md"))
+
             prompt = root / "prompt.txt"
             subprocess.run([
                 sys.executable,

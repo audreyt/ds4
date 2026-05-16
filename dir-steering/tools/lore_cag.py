@@ -18,6 +18,7 @@ import json
 import math
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -74,6 +75,11 @@ TOKEN_RE = re.compile(
 HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", re.MULTILINE)
 FUNC_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{3,})\s*\(")
 SPACE_RE = re.compile(r"[ \t]+")
+
+SQLITE_INDEX_FORMAT = "ds4-lore-sqlite-index-v1"
+SQLITE_INDEX_AUTOBUILD_BYTES = 32 * 1024 * 1024
+SQLITE_INDEX_TOKEN_LIMIT = 192
+SQLITE_MAX_VARS = 900
 
 
 @dataclass
@@ -299,8 +305,7 @@ def record_to_payload(record: LoreRecord) -> dict:
     return payload
 
 
-def load_pack(path: Path) -> list[LoreRecord]:
-    records: list[LoreRecord] = []
+def iter_pack_records(path: Path):
     with path.open("r", encoding="utf-8") as f:
         for lineno, line in enumerate(f, 1):
             line = line.strip()
@@ -310,9 +315,13 @@ def load_pack(path: Path) -> list[LoreRecord]:
             if payload.get("format") == "ds4-lore-pack-v1":
                 continue
             try:
-                records.append(record_from_payload(payload))
+                yield record_from_payload(payload)
             except KeyError as exc:
                 raise SystemExit(f"{path}:{lineno}: malformed lore record missing {exc}") from exc
+
+
+def load_pack(path: Path) -> list[LoreRecord]:
+    records = list(iter_pack_records(path))
     if not records:
         raise SystemExit(f"{path}: lore pack is empty")
     return records
@@ -369,8 +378,12 @@ def pack_cmd(args: argparse.Namespace) -> None:
     print(f"packed {len(records)} chunks from {len(paths)} files")
 
 
+def record_haystack(record: LoreRecord) -> str:
+    return f"{record.path}\n{record.source_date}\n{record.title}\n{record.anchor}\n{' '.join(record.terms)}\n{record.text}"
+
+
 def score_record(query_tokens: collections.Counter[str], query_text: str, record: LoreRecord) -> float:
-    haystack = f"{record.path}\n{record.source_date}\n{record.title}\n{record.anchor}\n{' '.join(record.terms)}\n{record.text}"
+    haystack = record_haystack(record)
     counts = collections.Counter(tokenize(haystack))
     if not counts:
         return 0.0
@@ -413,7 +426,7 @@ class LoreIndex:
         self.haystack_lowers: list[str] = []
         self.postings: dict[str, list[int]] = collections.defaultdict(list)
         for i, record in enumerate(records):
-            haystack = f"{record.path}\n{record.source_date}\n{record.title}\n{record.anchor}\n{' '.join(record.terms)}\n{record.text}"
+            haystack = record_haystack(record)
             counts = collections.Counter(tokenize(haystack))
             self.counts.append(counts)
             self.haystack_lowers.append(haystack.lower())
@@ -577,6 +590,400 @@ def retrieve_records_from_list(
     return LoreIndex(records).retrieve(query, top_k, min_score, after, before, neighbor_chunks, mmr_lambda)
 
 
+def default_sqlite_index_path(pack: Path) -> Path:
+    return pack.with_name(f"{pack.name}.sqlite")
+
+
+def resolve_cli_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = repo_root() / path
+    return path
+
+
+def sqlite_index_meta(pack: Path) -> dict[str, str]:
+    stat = pack.stat()
+    return {
+        "format": SQLITE_INDEX_FORMAT,
+        "pack": str(pack.resolve()),
+        "pack_size": str(stat.st_size),
+        "pack_mtime_ns": str(stat.st_mtime_ns),
+        "token_limit": str(SQLITE_INDEX_TOKEN_LIMIT),
+    }
+
+
+def sqlite_index_is_fresh(index_path: Path, pack: Path) -> bool:
+    if not index_path.exists():
+        return False
+    expected = sqlite_index_meta(pack)
+    try:
+        conn = sqlite3.connect(index_path)
+        rows = dict(conn.execute("SELECT key, value FROM meta"))
+        conn.close()
+    except sqlite3.Error:
+        return False
+    return all(rows.get(key) == value for key, value in expected.items())
+
+
+def index_tokens_for_record(record: LoreRecord) -> list[str]:
+    counts = term_counts(record_haystack(record))
+    metadata_counts = term_counts(f"{record.path}\n{record.source_date}\n{record.title}\n{record.anchor}\n{' '.join(record.terms)}")
+    for token, count in metadata_counts.items():
+        counts[token] += count + 6
+
+    selected: list[str] = []
+    seen: set[str] = set()
+    priority_text = f"{record.path}\n{record.source_date}\n{record.title}\n{record.anchor}\n{' '.join(record.terms)}"
+    for token in tokenize(priority_text):
+        if token not in seen:
+            selected.append(token)
+            seen.add(token)
+    for token, _ in counts.most_common(SQLITE_INDEX_TOKEN_LIMIT):
+        if token not in seen:
+            selected.append(token)
+            seen.add(token)
+        if len(selected) >= SQLITE_INDEX_TOKEN_LIMIT:
+            break
+    return selected
+
+
+def build_sqlite_index(pack: Path, index_path: Path, rebuild: bool = False) -> None:
+    if not rebuild and sqlite_index_is_fresh(index_path, pack):
+        print(f"lore index is current: {index_path}", file=sys.stderr)
+        return
+
+    print(f"building lore index {index_path} from {pack}", file=sys.stderr)
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = index_path.with_name(f"{index_path.name}.tmp")
+    if tmp.exists():
+        tmp.unlink()
+
+    conn: sqlite3.Connection | None = None
+    count = 0
+    try:
+        conn = sqlite3.connect(tmp)
+        conn.execute("PRAGMA journal_mode=OFF")
+        conn.execute("PRAGMA synchronous=OFF")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.executescript("""
+            CREATE TABLE meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE records (
+                rid INTEGER PRIMARY KEY,
+                id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                chunk INTEGER NOT NULL,
+                anchor TEXT NOT NULL,
+                terms TEXT NOT NULL,
+                source_date TEXT NOT NULL,
+                title TEXT NOT NULL,
+                text TEXT NOT NULL
+            );
+            CREATE TABLE postings (
+                token TEXT NOT NULL,
+                rid INTEGER NOT NULL
+            );
+        """)
+        conn.executemany(
+            "INSERT INTO meta(key, value) VALUES (?, ?)",
+            sorted(sqlite_index_meta(pack).items()),
+        )
+
+        record_rows: list[tuple[int, str, str, int, str, str, str, str, str]] = []
+        posting_rows: list[tuple[str, int]] = []
+
+        def flush() -> None:
+            nonlocal record_rows, posting_rows
+            if record_rows:
+                conn.executemany(
+                    """
+                    INSERT INTO records(rid, id, path, chunk, anchor, terms, source_date, title, text)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    record_rows,
+                )
+                record_rows = []
+            if posting_rows:
+                conn.executemany("INSERT INTO postings(token, rid) VALUES (?, ?)", posting_rows)
+                posting_rows = []
+
+        for record in iter_pack_records(pack):
+            count += 1
+            rid = count
+            record_rows.append((
+                rid,
+                record.id,
+                record.path,
+                record.chunk,
+                record.anchor,
+                json.dumps(record.terms, ensure_ascii=False),
+                record.source_date,
+                record.title,
+                record.text,
+            ))
+            posting_rows.extend((token, rid) for token in index_tokens_for_record(record))
+            if count % 1000 == 0:
+                flush()
+            if count % 25000 == 0:
+                print(f"indexed {count} lore chunks...", file=sys.stderr)
+        flush()
+        if count == 0:
+            raise SystemExit(f"{pack}: lore pack is empty")
+        conn.execute("CREATE INDEX postings_token_idx ON postings(token)")
+        conn.execute("CREATE INDEX records_path_chunk_idx ON records(path, chunk)")
+        conn.commit()
+        conn.close()
+        conn = None
+        tmp.replace(index_path)
+        print(f"wrote lore index {index_path} ({count} chunks)", file=sys.stderr)
+    except Exception:
+        if conn is not None:
+            conn.close()
+        if tmp.exists():
+            tmp.unlink()
+        raise
+
+
+def sqlite_record_from_row(row: tuple) -> LoreRecord:
+    return LoreRecord(
+        id=str(row[1]),
+        path=str(row[2]),
+        chunk=int(row[3]),
+        anchor=str(row[4]),
+        terms=[str(term) for term in json.loads(row[5])],
+        source_date=str(row[6]),
+        title=str(row[7]),
+        text=str(row[8]),
+    )
+
+
+def sqlite_fetch_records(conn: sqlite3.Connection, rids: set[int]) -> list[LoreRecord]:
+    if not rids:
+        return []
+    out: list[LoreRecord] = []
+    ordered = sorted(rids)
+    for start in range(0, len(ordered), SQLITE_MAX_VARS):
+        chunk = ordered[start:start + SQLITE_MAX_VARS]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"""
+            SELECT rid, id, path, chunk, anchor, terms, source_date, title, text
+            FROM records
+            WHERE rid IN ({placeholders})
+            """,
+            chunk,
+        )
+        out.extend(sqlite_record_from_row(row) for row in rows)
+    return out
+
+
+def sqlite_fetch_record_by_path_chunk(conn: sqlite3.Connection, path: str, chunk: int) -> LoreRecord | None:
+    row = conn.execute(
+        """
+        SELECT rid, id, path, chunk, anchor, terms, source_date, title, text
+        FROM records
+        WHERE path = ? AND chunk = ?
+        """,
+        (path, chunk),
+    ).fetchone()
+    return sqlite_record_from_row(row) if row else None
+
+
+def escape_like_fragment(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def query_like_fragments(query: str) -> list[str]:
+    fragments: list[str] = []
+    for phrase in re.findall(r"`([^`]+)`", query):
+        phrase = phrase.strip()
+        if len(phrase) >= 3:
+            fragments.append(phrase)
+    for raw in TOKEN_RE.findall(query):
+        if CJK_RE.match(raw):
+            if len(raw) <= 8:
+                fragments.append(raw)
+            for size in (6, 5, 4, 3):
+                if len(raw) >= size:
+                    fragments.extend(raw[i:i + size] for i in range(0, len(raw) - size + 1))
+        else:
+            token = raw.lower()
+            if len(token) >= 4 and token not in STOPWORDS:
+                fragments.append(raw)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for fragment in sorted(fragments, key=len, reverse=True):
+        if fragment not in seen:
+            out.append(fragment)
+            seen.add(fragment)
+        if len(out) >= 16:
+            break
+    return out
+
+
+def sqlite_like_candidate_ids(conn: sqlite3.Connection, query: str, limit: int) -> set[int]:
+    out: set[int] = set()
+    for fragment in query_like_fragments(query):
+        pattern = f"%{escape_like_fragment(fragment)}%"
+        rows = conn.execute(
+            """
+            SELECT rid
+            FROM records
+            WHERE text LIKE ? ESCAPE '\\'
+               OR title LIKE ? ESCAPE '\\'
+               OR anchor LIKE ? ESCAPE '\\'
+               OR path LIKE ? ESCAPE '\\'
+            LIMIT ?
+            """,
+            (pattern, pattern, pattern, pattern, limit),
+        )
+        out.update(int(row[0]) for row in rows)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def sqlite_candidate_ids(
+    conn: sqlite3.Connection,
+    query: str,
+    query_tokens: collections.Counter[str],
+    top_k: int,
+) -> set[int]:
+    phrase_tokens: collections.Counter[str] = collections.Counter()
+    for phrase in re.findall(r"`([^`]+)`", query):
+        phrase_tokens.update(tokenize(phrase))
+
+    base_tokens = phrase_tokens or query_tokens
+    tokens = list(base_tokens)
+    candidate_cap = max(top_k * 5000, 20000)
+    if not tokens:
+        return set()
+
+    placeholders = ",".join("?" for _ in tokens)
+    token_rows = conn.execute(
+        f"""
+        SELECT token, COUNT(*) AS doc_count
+        FROM postings
+        WHERE token IN ({placeholders})
+        GROUP BY token
+        ORDER BY doc_count ASC
+        """,
+        tokens,
+    ).fetchall()
+    if not token_rows:
+        return sqlite_like_candidate_ids(conn, query, candidate_cap)
+
+    min_candidates = max(top_k * 30, 80)
+    token_postings: list[tuple[str, set[int]]] = []
+    for token, _ in token_rows[:8]:
+        rows = conn.execute("SELECT rid FROM postings WHERE token = ?", (token,))
+        token_postings.append((str(token), {int(row[0]) for row in rows}))
+
+    candidates = set(token_postings[0][1])
+    for _, postings in token_postings[1:]:
+        narrowed = candidates & postings
+        if phrase_tokens:
+            if narrowed:
+                candidates = narrowed
+        elif len(narrowed) >= min_candidates:
+            candidates = narrowed
+
+    if len(candidates) < max(top_k, 3) and len(token_postings) > 1:
+        fallback: set[int] = set()
+        for _, postings in token_postings:
+            fallback.update(postings)
+        if fallback:
+            candidates = fallback
+
+    if len(candidates) < max(top_k * 2, 6):
+        candidates.update(sqlite_like_candidate_ids(conn, query, candidate_cap))
+
+    if len(candidates) > candidate_cap:
+        rare_token_candidates = sorted(candidates)[:candidate_cap]
+        candidates = set(rare_token_candidates)
+    return candidates
+
+
+def expand_neighbor_records_sqlite(
+    conn: sqlite3.Connection,
+    selected: list[LoreRecord],
+    after: str,
+    before: str,
+    neighbor_chunks: int,
+) -> list[LoreRecord]:
+    if neighbor_chunks <= 0:
+        return selected
+    out: list[LoreRecord] = []
+    seen: set[tuple[str, int]] = set()
+    selected_by_key = {(record.path, record.chunk): record for record in selected}
+    for record in selected:
+        for chunk in range(record.chunk - neighbor_chunks, record.chunk + neighbor_chunks + 1):
+            key = (record.path, chunk)
+            if key in seen:
+                continue
+            neighbor = selected_by_key.get(key)
+            if neighbor is None:
+                neighbor = sqlite_fetch_record_by_path_chunk(conn, record.path, chunk)
+            if not neighbor or not date_in_range(neighbor.source_date, after, before):
+                continue
+            distance = abs(chunk - record.chunk)
+            score = record.score if distance == 0 else record.score * max(0.25, 0.72 ** distance)
+            out.append(LoreRecord(
+                id=neighbor.id,
+                path=neighbor.path,
+                chunk=neighbor.chunk,
+                anchor=neighbor.anchor,
+                terms=neighbor.terms,
+                text=neighbor.text,
+                source_date=neighbor.source_date,
+                title=neighbor.title,
+                score=score,
+            ))
+            seen.add(key)
+    return out
+
+
+def retrieve_records_sqlite(
+    index_path: Path,
+    query: str,
+    top_k: int,
+    min_score: float = 0.0,
+    after: str = "",
+    before: str = "",
+    neighbor_chunks: int = 0,
+    mmr_lambda: float = 0.9,
+) -> list[LoreRecord]:
+    query_tokens = expanded_query_tokens(query)
+    conn = sqlite3.connect(index_path)
+    try:
+        candidate_ids = sqlite_candidate_ids(conn, query, query_tokens, top_k)
+        scored: list[LoreRecord] = []
+        for record in sqlite_fetch_records(conn, candidate_ids):
+            if not date_in_range(record.source_date, after, before):
+                continue
+            score = score_record(query_tokens, query, record)
+            if score >= min_score:
+                scored.append(LoreRecord(
+                    id=record.id,
+                    path=record.path,
+                    chunk=record.chunk,
+                    anchor=record.anchor,
+                    terms=record.terms,
+                    text=record.text,
+                    source_date=record.source_date,
+                    title=record.title,
+                    score=score,
+                ))
+        scored.sort(key=lambda item: item.score, reverse=True)
+        selected = mmr_select(scored, top_k, max(0.0, min(1.0, mmr_lambda)))
+        return expand_neighbor_records_sqlite(conn, selected, after, before, neighbor_chunks)
+    finally:
+        conn.close()
+
+
 def expanded_query_tokens(query: str) -> collections.Counter[str]:
     query_tokens = collections.Counter(tokenize(query))
     for token, count in list(query_tokens.items()):
@@ -607,6 +1014,12 @@ def retrieve_records(
         neighbor_chunks,
         mmr_lambda,
     )
+
+
+def index_cmd(args: argparse.Namespace) -> None:
+    pack = resolve_cli_path(args.pack)
+    index_path = resolve_cli_path(args.out) if args.out else default_sqlite_index_path(pack)
+    build_sqlite_index(pack, index_path, args.rebuild)
 
 
 def trim_excerpt(text: str, limit: int) -> str:
@@ -647,9 +1060,32 @@ def cap_total(records: list[LoreRecord], max_total_chars: int, excerpt_chars: in
 
 
 def retrieve_for_prompt(args: argparse.Namespace) -> list[LoreRecord]:
-    pack = Path(args.pack)
-    if not pack.is_absolute():
-        pack = repo_root() / pack
+    pack = resolve_cli_path(args.pack)
+    index_path: Path | None = None
+    if not args.no_index:
+        explicit_index = bool(args.index)
+        index_path = resolve_cli_path(args.index) if explicit_index else default_sqlite_index_path(pack)
+        should_use_index = (
+            explicit_index
+            or args.rebuild_index
+            or index_path.exists()
+            or pack.stat().st_size >= SQLITE_INDEX_AUTOBUILD_BYTES
+        )
+        if should_use_index:
+            if args.rebuild_index or not sqlite_index_is_fresh(index_path, pack):
+                build_sqlite_index(pack, index_path, args.rebuild_index)
+            records = retrieve_records_sqlite(
+                index_path,
+                args.query,
+                args.top_k,
+                args.min_score,
+                args.after,
+                args.before,
+                args.neighbor_chunks,
+                args.mmr_lambda,
+            )
+            return cap_total(records, args.max_context_chars, args.excerpt_chars)
+
     records = retrieve_records(
         pack,
         args.query,
@@ -821,6 +1257,12 @@ def add_retrieval_args(ap: argparse.ArgumentParser) -> None:
                     help="also include this many adjacent chunks around each selected chunk")
     ap.add_argument("--mmr-lambda", type=float, default=0.9,
                     help="MMR relevance/diversity tradeoff; 1.0 is pure score ranking")
+    ap.add_argument("--index", default="",
+                    help="SQLite lore index path; defaults to PACK.sqlite when present or for large packs")
+    ap.add_argument("--rebuild-index", action="store_true",
+                    help="rebuild the SQLite lore index before retrieving")
+    ap.add_argument("--no-index", action="store_true",
+                    help="disable the SQLite sidecar index and scan the JSONL pack in memory")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -841,6 +1283,12 @@ def build_parser() -> argparse.ArgumentParser:
     pack_ap.add_argument("--after", default="", help="include only sources dated on or after YYYY-MM-DD")
     pack_ap.add_argument("--before", default="", help="include only sources dated on or before YYYY-MM-DD")
     pack_ap.set_defaults(func=pack_cmd)
+
+    index_ap = sub.add_parser("index")
+    index_ap.add_argument("--pack", required=True)
+    index_ap.add_argument("--out", default="", help="defaults to PACK.sqlite")
+    index_ap.add_argument("--rebuild", action="store_true")
+    index_ap.set_defaults(func=index_cmd)
 
     retrieve_ap = sub.add_parser("retrieve")
     add_retrieval_args(retrieve_ap)

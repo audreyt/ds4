@@ -407,6 +407,15 @@ python3 dir-steering/tools/lore_cag.py pack \
   --min-chunk-chars 160
 ```
 
+For large packs, build the persistent SQLite sidecar once. `retrieve`, `prompt`,
+and `run` will automatically use `PACK.sqlite` when it exists, and will
+auto-build it for packs larger than 32 MiB.
+
+```sh
+python3 dir-steering/tools/lore_cag.py index \
+  --pack dir-steering/out/audrey-transcript-lore.jsonl
+```
+
 Inspect retrieval:
 
 ```sh
