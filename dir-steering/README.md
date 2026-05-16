@@ -264,3 +264,274 @@ Style control:
 The method is not a fine-tune. It is a low-rank runtime edit, so it works best
 for coarse behavior, topic, or style directions that are consistently present in
 the activation captures.
+
+## Doc-to-Steering Prototype
+
+`tools/build_doc_direction.py` generates paired target/contrast probes from a
+document set, then can call `build_direction.py` to capture a normal DS4
+direction. The target probes include short reference excerpts and ask for a
+DS4-maintainer answer. The contrast probes ask for the same kind of answer in
+generic terms without repository-local details.
+
+Generate prompt sidecars only:
+
+```sh
+python3 dir-steering/tools/build_doc_direction.py \
+  --doc README.md \
+  --doc MODEL_CARD.md \
+  --doc AGENT.md \
+  --out dir-steering/out/ds4_docs.json \
+  --max-prompts 64
+```
+
+This writes:
+
+```text
+dir-steering/out/ds4_docs.doc-good.txt
+dir-steering/out/ds4_docs.doc-bad.txt
+dir-steering/out/ds4_docs.doc-to-steering.json
+```
+
+Capture the steering vector by adding `--build`:
+
+```sh
+python3 dir-steering/tools/build_doc_direction.py \
+  --doc README.md \
+  --doc MODEL_CARD.md \
+  --doc AGENT.md \
+  --out dir-steering/out/ds4_docs.json \
+  --max-prompts 64 \
+  --ctx 768 \
+  --component ffn_out \
+  --build
+```
+
+Then try it with a gentle negative FFN scale:
+
+```sh
+./ds4 -m ds4flash.gguf --nothink --temp 0 -n 220 \
+  --dir-steering-file dir-steering/out/ds4_docs.f32 \
+  --dir-steering-ffn -0.5 \
+  -p "How should I debug a DS4 tool-call regression?"
+```
+
+This is a document-conditioned register and behavior nudge, not a fact store.
+Use it to make answers lean toward the corpus' terminology, maintenance
+constraints, and debugging posture. Pair it with normal context, retrieval, or
+KV-cache reuse when exact document facts matter.
+
+## Doc-to-Steering Hypernetwork
+
+`tools/doc_steering_hypernetwork.py` trains a tiny dependency-free
+learned-basis hypernetwork from captured steering examples. It maps document
+text to learned coefficients over known `.f32` directions, mixes those
+directions, and normalizes the result layer by layer. The output layer is still
+a basis of DS4 steering vectors, but the text-to-coefficients mapping is trained
+with a sparse softmax model rather than selected by nearest neighbor.
+
+Train it on one or more recipes produced by the doc-to-steering builder:
+
+```sh
+python3 dir-steering/tools/doc_steering_hypernetwork.py train \
+  --recipe dir-steering/out \
+  --model-dir dir-steering/out/doc-hnet \
+  --kind learned-basis \
+  --top-k 4 \
+  --epochs 240
+```
+
+Predict a new steering file:
+
+```sh
+python3 dir-steering/tools/doc_steering_hypernetwork.py predict \
+  --model-dir dir-steering/out/doc-hnet \
+  --doc README.md \
+  --doc MODEL_CARD.md \
+  --out dir-steering/out/predicted_docs.f32
+```
+
+Evaluate reconstruction, or leave-one-out generalization when there are enough
+examples:
+
+```sh
+python3 dir-steering/tools/doc_steering_hypernetwork.py eval \
+  --model-dir dir-steering/out/doc-hnet
+
+python3 dir-steering/tools/doc_steering_hypernetwork.py eval \
+  --model-dir dir-steering/out/doc-hnet \
+  --leave-one-out
+```
+
+This first hypernetwork is a real trained coefficient model, but deliberately
+small: no Torch dependency, no backprop through DS4, and no attempt to invent
+directions outside the captured basis. Its job is to make the interface
+reliable: recipes in, model directory out, document text in, normalized DS4
+steering vector out. Once a larger corpus of successful document directions
+exists, the same train/eval split can be used to replace the encoder with a
+larger neural mapper.
+
+Do not evaluate this by asking a no-context factual question and expecting the
+steering vector to recite file names or commands from the source document.
+Steering can bias register, terminology, and answer posture, but it is not a
+reliable document memory. For factual doc questions, put the relevant excerpts
+in context and use the predicted steering vector as a companion nudge.
+
+## Context-Augmented Lore
+
+`tools/lore_cag.py` is the factual-memory layer for document-conditioned
+steering. It builds a cited lore pack, retrieves exact excerpts for a query,
+composes a guarded prompt, and can run `./ds4` with either a fixed steering file
+or a predicted hypernetwork steering file.
+
+Build a lore pack:
+
+```sh
+python3 dir-steering/tools/lore_cag.py pack \
+  --doc README.md \
+  --doc MODEL_CARD.md \
+  --doc AGENT.md \
+  --doc dir-steering \
+  --out dir-steering/out/ds4_lore.jsonl
+```
+
+For dated long-lore directories, filter by source date and keep adjacent chunks
+around each retrieval hit:
+
+```sh
+python3 dir-steering/tools/lore_cag.py pack \
+  --doc /Users/au/w/transcript \
+  --out dir-steering/out/audrey-transcript-lore.jsonl \
+  --after 2024-05-20 \
+  --before 2026-05-16 \
+  --max-chunk-chars 2200 \
+  --min-chunk-chars 160
+```
+
+Inspect retrieval:
+
+```sh
+python3 dir-steering/tools/lore_cag.py retrieve \
+  --pack dir-steering/out/ds4_lore.jsonl \
+  --query "How do I build and test a directional-steering vector?" \
+  --top-k 5 \
+  --neighbor-chunks 1
+```
+
+Write the cited prompt without running the model:
+
+```sh
+python3 dir-steering/tools/lore_cag.py prompt \
+  --pack dir-steering/out/ds4_lore.jsonl \
+  --query "How do I build and test a directional-steering vector?" \
+  --out /tmp/ds4_lore_prompt.txt
+```
+
+Run CAG through DS4:
+
+```sh
+python3 dir-steering/tools/lore_cag.py run \
+  --pack dir-steering/out/ds4_lore.jsonl \
+  --query "How do I build and test a directional-steering vector?" \
+  --tokens 220 \
+  --out-prompt /tmp/ds4_lore_prompt.txt
+```
+
+Run CAG plus the document-steering hypernetwork:
+
+```sh
+python3 dir-steering/tools/lore_cag.py run \
+  --pack dir-steering/out/ds4_lore.jsonl \
+  --query "How do I build and test a directional-steering vector?" \
+  --hnet-model-dir dir-steering/out/doc-hnet \
+  --dir-steering-ffn -0.5 \
+  --tokens 220
+```
+
+The prompt tells the model to cite bracketed lore excerpts for concrete repo
+facts and to say when the supplied lore does not contain an answer. This is the
+part that prevents invented paths such as nonexistent steering scripts. The
+steering vector still helps with register; the lore excerpts carry the facts.
+
+Long-lore retrieval is date-aware and CJK-aware. Pack records include source
+dates and titles, hidden worktree directories are excluded by default, and
+retrieval can use MMR diversity plus neighbor chunks so a single long transcript
+does not monopolize the prompt or lose the paragraph next to the exact hit.
+
+## Lore Evaluation Loop
+
+`tools/lore_cag_eval.py` sweeps lore retrieval and steering settings, runs DS4,
+and scores each answer for expected source-backed terms, forbidden hallucinated
+terms, and citations.
+
+Create a deterministic test set from a [dated corpus](https://github.com/audreyt/transcript):
+
+```sh
+python3 dir-steering/tools/build_lore_testset.py \
+  --doc /Users/au/w/transcript \
+  --out dir-steering/out/audrey-transcript-cases.json \
+  --after 2024-05-20 \
+  --before 2026-05-16 \
+  --limit 32
+```
+
+The generated cases quote short "needle" passages from selected transcripts and
+score the model on returning the source date/title with citations. The expected
+source fields are intentionally not included in the query, so compose-only mode
+checks retrieval rather than merely rediscovering words from the question.
+
+Compose-only retrieval coverage check:
+
+```sh
+python3 dir-steering/tools/lore_cag_eval.py \
+  --pack dir-steering/out/ds4_lore.jsonl \
+  --out dir-steering/out/cag-eval-compose.jsonl \
+  --top-k 4,6 \
+  --max-context-chars 7000,10000 \
+  --neighbor-chunks 1 \
+  --scales none \
+  --compose-only
+```
+
+Long-lore live source-identification check:
+
+```sh
+python3 dir-steering/tools/lore_cag_eval.py \
+  --pack dir-steering/out/audrey-transcript-lore.jsonl \
+  --case-file dir-steering/out/audrey-transcript-cases.json \
+  --out dir-steering/out/audrey-cag-eval-live.jsonl \
+  --top-k 3 \
+  --max-context-chars 8000 \
+  --neighbor-chunks 1 \
+  --scales none \
+  --tokens 180
+```
+
+Live steering-strength sweep:
+
+```sh
+python3 dir-steering/tools/lore_cag_eval.py \
+  --pack dir-steering/out/ds4_lore.jsonl \
+  --out dir-steering/out/cag-eval-live.jsonl \
+  --top-k 4 \
+  --max-context-chars 7000 \
+  --scales none,-0.25,-0.5,-1.0 \
+  --hnet-model-dir dir-steering/out/doc-hnet \
+  --tokens 260
+```
+
+Filter to selected cases:
+
+```sh
+python3 dir-steering/tools/lore_cag_eval.py \
+  --pack dir-steering/out/ds4_lore.jsonl \
+  --out dir-steering/out/cag-eval-metal.jsonl \
+  --case metal_drift \
+  --scales none,-1.0 \
+  --hnet-model-dir dir-steering/out/doc-hnet
+```
+
+Current local seed results with five captured basis directions show that the
+best setting is case-dependent: `steering_build_test` improved at `ffn=-1.0`,
+`server_api` improved slightly at `ffn=-1.0`, while `quality_vectors` and
+`metal_drift` preferred no steering. Treat the scale as a policy selected by
+evaluation, not a global constant.

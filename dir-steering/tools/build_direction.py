@@ -16,6 +16,7 @@ import json
 import math
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -116,8 +117,13 @@ def run_capture(
         "--prompt-file", str(prompt_path),
         "-n", "1",
     ]
-    subprocess.run(cmd, cwd=ds4.parent, env=env, check=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        subprocess.run(cmd, cwd=ds4.parent, env=env, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as exc:
+        if exc.stderr:
+            sys.stderr.write(exc.stderr.decode("utf-8", errors="replace"))
+        raise
 
     rows: list[list[float]] = []
     for layer in range(N_LAYER):
