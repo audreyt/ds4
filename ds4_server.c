@@ -11687,6 +11687,7 @@ typedef struct {
     int port;
     int ctx_size;
     int default_tokens;
+    const char *chdir_path;
     const char *trace_path;
     const char *kv_disk_dir;
     uint64_t kv_disk_space_mb;
@@ -11786,6 +11787,8 @@ static void usage(FILE *fp) {
         "      Default max output tokens when the client omits a limit. Default: 393216 (384K)\n"
         "  -t, --threads N\n"
         "      CPU helper threads for lightweight host-side work.\n"
+        "  --chdir DIR\n"
+        "      Change working directory before loading the model or runtime assets.\n"
         "  --quality\n"
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
         "  --dir-steering-file FILE\n"
@@ -11912,6 +11915,8 @@ static server_config parse_options(int argc, char **argv) {
             c.default_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--chdir")) {
+            c.chdir_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--host")) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
@@ -11990,6 +11995,11 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
 
     server_config cfg = parse_options(argc, argv);
+    if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to chdir to %s: %s",
+                   cfg.chdir_path, strerror(errno));
+        return 1;
+    }
 
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;

@@ -293,6 +293,9 @@ Start a local OpenAI/Anthropic-compatible server:
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
+Use `--chdir /path/to/ds4` when launching `ds4-server` from another directory,
+so relative runtime files such as `metal/*.metal` resolve from the project tree.
+
 The server keeps one mutable backend/KV checkpoint in memory,
 so stateless clients that resend a longer version of the same prompt can reuse
 the shared prefix instead of pre-filling from token zero.
