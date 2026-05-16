@@ -51,6 +51,7 @@
 
 #define EVAL_MAX_CHOICES 10
 #define EVAL_ANSWER_MAX 16
+#define EVAL_MAX_CONTEXT 1000000
 
 typedef enum {
     EVAL_PENDING,
@@ -1096,6 +1097,7 @@ typedef struct {
     int active_case;
     int generated;
     int max_tokens;
+    int think_max_tokens;
     int prefill_current;
     int prefill_total;
     double phase_start_sec;
@@ -1346,7 +1348,6 @@ static void usage(FILE *fp) {
         "  --warm-weights         Touch mapped tensor pages before evaluation.\n"
         "\n"
         "Evaluation:\n"
-        "  -c, --ctx N            Context size. Default: 100000\n"
         "  -n, --tokens N         Max generated tokens per question. Default: 16000\n"
         "  --questions N          Run only the first N embedded questions.\n"
         "  --temp F               Sampling temperature. Default: 0\n"
@@ -1374,7 +1375,6 @@ static eval_config parse_options(int argc, char **argv) {
     eval_config c = {
         .model_path = "ds4flash.gguf",
         .backend = default_backend(),
-        .ctx_size = 100000,
         .max_tokens = 16000,
         .top_p = 1.0f,
         .pause_ms = 350,
@@ -1393,8 +1393,6 @@ static eval_config parse_options(int argc, char **argv) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
-            c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.max_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--questions")) {
@@ -1440,6 +1438,12 @@ static eval_config parse_options(int argc, char **argv) {
             usage(stderr);
             exit(2);
         }
+    }
+    if (c.max_tokens > EVAL_MAX_CONTEXT) {
+        fprintf(stderr,
+                "ds4-eval: --tokens (%d) exceeds the %d token context cap\n",
+                c.max_tokens, EVAL_MAX_CONTEXT);
+        exit(2);
     }
     if (c.hard_limit_reply_budget >= c.max_tokens) {
         fprintf(stderr,
@@ -2026,8 +2030,12 @@ static void tui_draw_right_status(eval_ui *ui, const char *phase) {
                  ui->speed_tps, short_phase_name(phase), cur, total, pct,
                  tc->source, id);
     } else {
-        format_short_count(gen, sizeof(gen), ui->generated);
-        format_short_count(max, sizeof(max), ui->max_tokens);
+        int phase_max = !strcmp(phase, "thinking") ? ui->think_max_tokens : ui->max_tokens;
+        int phase_gen = ui->generated;
+        if (phase_max < 0) phase_max = 0;
+        if (!strcmp(phase, "thinking") && phase_gen > phase_max) phase_gen = phase_max;
+        format_short_count(gen, sizeof(gen), phase_gen);
+        format_short_count(max, sizeof(max), phase_max);
         snprintf(line, sizeof(line),
                  "Speed %.2f t/s  %s %s/%s  %s/%s",
                  ui->speed_tps, short_phase_name(phase), gen, max,
@@ -2114,6 +2122,11 @@ static void plain_reset_color(bool use_color) {
     if (use_color) fputs(ANSI_RESET, stdout);
 }
 
+static const char *eval_system_prompt(void) {
+    return "You are solving a hard benchmark question. Reason carefully. "
+           "The final answer must follow the requested format exactly.";
+}
+
 static char *build_question_prompt(const eval_case *tc) {
     byte_buf b = {0};
     int nchoices = eval_case_nchoices(tc);
@@ -2143,6 +2156,69 @@ static char *build_question_prompt(const eval_case *tc) {
     char *empty = malloc(1);
     if (empty) empty[0] = '\0';
     return empty;
+}
+
+static int eval_max_prompt_tokens(ds4_engine *engine,
+                                  const eval_config *cfg,
+                                  const eval_case *cases,
+                                  int ncases,
+                                  int ctx_for_think_mode,
+                                  int *max_case_out)
+{
+    int max_prompt = 0;
+    int max_case = -1;
+    const ds4_think_mode think_mode =
+        ds4_think_mode_for_context(cfg->think_mode, ctx_for_think_mode);
+
+    for (int i = 0; i < ncases; i++) {
+        char *question = build_question_prompt(&cases[i]);
+        if (!question) {
+            fprintf(stderr, "ds4-eval: failed to allocate prompt\n");
+            exit(1);
+        }
+        ds4_tokens prompt = {0};
+        ds4_encode_chat_prompt(engine, eval_system_prompt(), question, think_mode, &prompt);
+        if (prompt.len > max_prompt) {
+            max_prompt = prompt.len;
+            max_case = i;
+        }
+        ds4_tokens_free(&prompt);
+        free(question);
+    }
+    if (max_case_out) *max_case_out = max_case;
+    return max_prompt;
+}
+
+static int eval_auto_context_size(ds4_engine *engine,
+                                  eval_config *cfg,
+                                  const eval_case *cases,
+                                  int ncases,
+                                  int *max_prompt_out,
+                                  int *max_case_out)
+{
+    int ctx = EVAL_MAX_CONTEXT;
+    int max_prompt = 0;
+    int max_case = -1;
+
+    /* Think Max downgrades to normal thinking under its minimum context.  Size
+     * the prompts iteratively so the prompt tokenizer sees the same effective
+     * thinking mode that the actual run will use. */
+    for (int iter = 0; iter < 3; iter++) {
+        max_prompt = eval_max_prompt_tokens(engine, cfg, cases, ncases, ctx, &max_case);
+        long long required = (long long)max_prompt + (long long)cfg->max_tokens;
+        if (required > EVAL_MAX_CONTEXT) {
+            fprintf(stderr,
+                    "ds4-eval: largest prompt (%d tokens, case %d) + --tokens (%d) exceeds the %d token context cap\n",
+                    max_prompt, max_case + 1, cfg->max_tokens, EVAL_MAX_CONTEXT);
+            exit(2);
+        }
+        if ((int)required == ctx) break;
+        ctx = (int)required;
+    }
+
+    if (max_prompt_out) *max_prompt_out = max_prompt;
+    if (max_case_out) *max_case_out = max_case;
+    return ctx;
 }
 
 static void trace_write_block(FILE *trace, const char *label, const char *text) {
@@ -2182,7 +2258,7 @@ static int token_rank_in_top(ds4_session *session, int token, int max_rank) {
     return rank;
 }
 
-static void trace_write_header(FILE *trace, const eval_config *cfg, int ncases) {
+static void trace_write_header(FILE *trace, const eval_config *cfg, int ncases, int max_prompt_tokens) {
     if (!trace) return;
     fprintf(trace,
             "# ds4-eval trace\n"
@@ -2191,6 +2267,7 @@ static void trace_write_header(FILE *trace, const eval_config *cfg, int ncases) 
             "backend: %s\n"
             "ctx: %d\n"
             "max_tokens: %d\n"
+            "max_prompt_tokens: %d\n"
             "questions: %d\n"
             "temperature: %.6g\n"
             "top_p: %.6g\n"
@@ -2205,6 +2282,7 @@ static void trace_write_header(FILE *trace, const eval_config *cfg, int ncases) 
             ds4_backend_name(cfg->backend),
             cfg->ctx_size,
             cfg->max_tokens,
+            max_prompt_tokens,
             ncases,
             cfg->temperature,
             cfg->top_p,
@@ -2471,9 +2549,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     const bool tty = ui->enabled;
     const bool use_plain_color = !tty && isatty(STDOUT_FILENO);
     const ds4_think_mode think_mode = ds4_think_mode_for_context(cfg->think_mode, cfg->ctx_size);
-    const char *system =
-        "You are solving a hard benchmark question. Reason carefully. "
-        "The final answer must follow the requested format exactly.";
+    const char *system = eval_system_prompt();
 
     char *question = build_question_prompt(tc);
     if (!question) {
@@ -2505,7 +2581,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     }
 
     int generation_limit = cfg->max_tokens;
-    int ctx_generation_limit = cfg->ctx_size - prompt.len - 2;
+    int ctx_generation_limit = cfg->ctx_size - prompt.len;
     if (ctx_generation_limit < generation_limit) generation_limit = ctx_generation_limit;
     if (generation_limit < 1) {
         ui->active_case = idx;
@@ -2531,6 +2607,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     ui->guess[idx][0] = '\0';
     ui->status[idx] = EVAL_PREFILL;
     ui->max_tokens = generation_limit;
+    ui->think_max_tokens = generation_limit - cfg->hard_limit_reply_budget;
+    if (ui->think_max_tokens < 0) ui->think_max_tokens = 0;
     tui_run_clock_start(ui);
     if (tty) {
         tui_reset_stream(ui, tc, ds4_think_mode_enabled(think_mode));
@@ -2860,6 +2938,11 @@ int main(int argc, char **argv) {
                 sizeof(eval_cases) / sizeof(eval_cases[0]));
         return 2;
     }
+    if (!cfg.seed) {
+        cfg.seed = (uint64_t)time(NULL) ^
+                   ((uint64_t)getpid() << 32) ^
+                   (uint64_t)clock();
+    }
 
     FILE *trace = NULL;
     if (cfg.trace_path) {
@@ -2869,10 +2952,8 @@ int main(int argc, char **argv) {
                     cfg.trace_path, strerror(errno));
             return 2;
         }
-        trace_write_header(trace, &cfg, ncases);
     }
 
-    log_context_memory(cfg.backend, cfg.ctx_size);
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
         .mtp_path = cfg.mtp_path,
@@ -2890,6 +2971,17 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    int max_prompt_tokens = 0;
+    int max_prompt_case = -1;
+    cfg.ctx_size = eval_auto_context_size(engine, &cfg, eval_cases, ncases,
+                                          &max_prompt_tokens, &max_prompt_case);
+    fprintf(stderr,
+            "ds4-eval: context auto-sized to %d tokens "
+            "(largest prompt=%d tokens, case=%d, generation budget=%d)\n",
+            cfg.ctx_size, max_prompt_tokens, max_prompt_case + 1, cfg.max_tokens);
+    trace_write_header(trace, &cfg, ncases, max_prompt_tokens);
+    log_context_memory(cfg.backend, cfg.ctx_size);
+
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
         fprintf(stderr, "ds4-eval: failed to create session\n");
@@ -2902,8 +2994,7 @@ int main(int argc, char **argv) {
     bool split_ui = !cfg.plain && isatty(STDOUT_FILENO);
     tui_start(&ui, eval_cases, ncases, cfg.max_tokens, split_ui);
 
-    uint64_t rng = cfg.seed ? cfg.seed :
-        ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
+    uint64_t rng = cfg.seed;
     int rc = 0;
     int next = 0;
     while (next >= 0) {

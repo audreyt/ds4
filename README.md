@@ -208,11 +208,13 @@ generated tokens, pass/fail state, the model answer, and the correct answer.
 ./ds4-eval -m ds4flash.gguf --trace /tmp/ds4-eval.txt
 ```
 
-The default run uses `--ctx 100000` and `--tokens 16000`, thinking mode enabled,
-and a soft/hard `</think>` budget cutoff so the model has room to produce a
-visible answer. Press `p` to pause, `q` to exit and print the report, Up/Down
-to inspect or select another question, and Enter to run the selected question
-next. `--plain` disables the TUI.
+The default run uses `--tokens 16000`, thinking mode enabled, and a soft/hard
+`</think>` budget cutoff so the model has room to produce a visible answer.
+`ds4-eval` sizes the context internally from the largest selected prompt plus
+the generation budget, and refuses runs that would need more than 1M context
+tokens. Press `p` to pause, `q` to exit and print the report, Up/Down to
+inspect or select another question, and Enter to run the selected question next.
+`--plain` disables the TUI.
 
 The 75 embedded questions are interleaved as 25 GPQA Diamond, 25 audited
 SuperGPQA, and 25 AIME 2025 problems. The order is intentionally progressive:
