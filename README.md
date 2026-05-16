@@ -455,9 +455,19 @@ displacement), `worst_rms ~= 0.0026`, and `worst_top20_max_abs ~= 0.0151`
 (three short fixtures are bit-exact; the residual drift is on the two
 long-context fixtures and comes from the F16/attn-out routes compounding
 through 43 layers). The narrower MoE Tensor window cuts roughly 25× off the
-prior worst-case drift envelope, at the cost of giving up the all-layer MoE
-prefill speedup; a fresh `ds4-bench --gen-tokens 128` sweep across
-`512/2048/4096/8192/16384`-token contexts is still pending under this profile.
+prior worst-case drift envelope.
+
+In a fresh local M5 Max `ds4-bench` sweep with `--gen-tokens 128`, this auto
+profile (`-mt auto`) sampled prefill at `239/266/258/293/280` tokens/sec for
+`512/2048/4096/8192/16384`-token contexts, versus `235/258/265/292/280` t/s
+for standard Metal (`-mt off`) and `222/294/292/284/258` t/s for `--quality`.
+Prefill is now essentially within noise of `-mt off`: the prior all-layer
+routed-MoE prefill win was the cost of admitting the higher MoE Tensor drift,
+and was retracted along with it. Generation tokens/sec tracks `-mt off`
+across the sweep (`34.2` t/s at 512, `30.1` at 4096, `29.8` at 16384) and
+beats `--quality` on the three longest contexts (`+2.2/+3.4/+3.9` t/s at
+4096/8192/16384). Numbers are from one desktop run on a quiet machine; full
+sweeps still show visible desktop-load variance.
 
 The `DS4_METAL_MPP_FAST=1` profile is the measured high-throughput diagnostic
 profile under the relaxed same-top1/same-greedy gate. In the current prompt
