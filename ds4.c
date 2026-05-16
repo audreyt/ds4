@@ -12338,6 +12338,7 @@ static bool metal_graph_encode_layer_attention_batch(
             if (ok) batch_attention_done = true;
         }
         if (ok && zero_prefix && !topk_prefill_needed && n_comp != 0) {
+            ds4_gpu_set_mpp_compare_context("flash_attn", il, pos0);
             ok = ds4_gpu_attention_prefill_static_mixed_heads_tensor(g->batch_heads,
                                                                        model->map,
                                                                        model->size,
@@ -12351,6 +12352,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                        ratio,
                                                                        DS4_N_HEAD,
                                                                        DS4_N_HEAD_DIM) != 0;
+            ds4_gpu_clear_mpp_compare_context();
             if (ok) batch_attention_done = true;
         }
     }
