@@ -11965,7 +11965,7 @@ static void *client_main(void *arg) {
     if (count_tokens_only) {
         char body[64];
         snprintf(body, sizeof(body), "{\"input_tokens\":%d}", req.prompt.len);
-        http_response(fd, 200, "application/json", body);
+        http_response(fd, s->enable_cors, 200, "application/json", body);
         request_free(&req);
         goto done;
     }

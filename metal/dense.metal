@@ -1259,6 +1259,7 @@ template [[host_name("kernel_mul_mm_q8_0_f32_mpp_direct_rhs")]] kernel mul_mm_mp
 template [[host_name("kernel_mul_mm_q8_0_f32_mpp_direct_rhs_n64")]] kernel mul_mm_mpp_direct_rhs_q8_n64_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, block_q8_0, 2, dequantize_q8_0, float, float4x4, float>;
 #endif
 
+
 // Tiled matrix-matrix kernel used for prompt batches larger than 8. DS4 uses
 // this to turn prefill into large simdgroup matrix operations; each block_q
 // contains 16*nl weights.
