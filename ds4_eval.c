@@ -56,6 +56,8 @@ typedef enum {
     EVAL_PENDING,
     EVAL_PREFILL,
     EVAL_THINKING,
+    EVAL_SKIPPED,
+    EVAL_STOPPED,
     EVAL_PASSED,
     EVAL_FAILED,
 } eval_status;
@@ -64,6 +66,7 @@ typedef enum {
     EVAL_RUN_OK,
     EVAL_RUN_ERROR,
     EVAL_RUN_SWITCH,
+    EVAL_RUN_QUIT,
 } eval_run_result;
 
 typedef enum {
@@ -1104,6 +1107,7 @@ typedef struct {
     int selected_case;
     int requested_case;
     bool paused;
+    bool quit_requested;
     byte_buf stream;
     style_buf styles;
     bool in_think;
@@ -1164,6 +1168,7 @@ typedef struct {
     int move_delta;
     bool enter_pressed;
     bool pause_pressed;
+    bool quit_pressed;
 } eval_input;
 
 static eval_input global_input = {
@@ -1330,7 +1335,7 @@ static void usage(FILE *fp) {
         "The TTY UI keeps the question list on the left and streams sampled\n"
         "tokens live on the right; thinking text is dim grey until </think>.\n"
         "In the TTY UI, Up/Down selects a question, Enter runs it next,\n"
-        "and p pauses or resumes evaluation.\n"
+        "p pauses or resumes evaluation, and q exits with a report.\n"
         "\n"
         "Model and backend:\n"
         "  -m, --model FILE       GGUF model path. Default: ds4flash.gguf\n"
@@ -1491,6 +1496,8 @@ static void term_set_color_for_status(eval_status st) {
     case EVAL_PENDING:  fputs(ANSI_DIM, stdout); break;
     case EVAL_PREFILL:  fputs(ANSI_CYAN, stdout); break;
     case EVAL_THINKING: fputs(ANSI_YELLOW, stdout); break;
+    case EVAL_SKIPPED:  fputs(ANSI_DIM, stdout); break;
+    case EVAL_STOPPED:  fputs(ANSI_YELLOW ANSI_BOLD, stdout); break;
     case EVAL_PASSED:   fputs(ANSI_GREEN ANSI_BOLD, stdout); break;
     case EVAL_FAILED:   fputs(ANSI_RED ANSI_BOLD, stdout); break;
     }
@@ -1501,6 +1508,8 @@ static const char *status_name(eval_status st) {
     case EVAL_PENDING: return "PEND";
     case EVAL_PREFILL: return "FILL";
     case EVAL_THINKING: return "RUN";
+    case EVAL_SKIPPED: return "SKIP";
+    case EVAL_STOPPED: return "STOP";
     case EVAL_PASSED: return "PASS";
     case EVAL_FAILED: return "FAIL";
     }
@@ -1576,6 +1585,8 @@ static void input_queue_key(int key) {
         global_input.enter_pressed = true;
     } else if (key == 'p' || key == 'P') {
         global_input.pause_pressed = true;
+    } else if (key == 'q' || key == 'Q') {
+        global_input.quit_pressed = true;
     }
     pthread_mutex_unlock(&global_input.mu);
 }
@@ -1595,7 +1606,7 @@ static void *input_thread_main(void *arg) {
             unsigned char c = (unsigned char)buf[i];
             if (esc_state == 0) {
                 if (c == 27) esc_state = 1;
-                else if (c == 'p' || c == 'P') input_queue_key(c);
+                else if (c == 'p' || c == 'P' || c == 'q' || c == 'Q') input_queue_key(c);
                 else if (c == '\r' || c == '\n') input_queue_key(c);
             } else if (esc_state == 1) {
                 esc_state = (c == '[' || c == 'O') ? 2 : 0;
@@ -1613,9 +1624,10 @@ static void tui_start_input(void) {
     if (tcgetattr(STDIN_FILENO, &global_input.orig_termios) != 0) return;
 
     /* The input thread is intentionally boring: it never writes to the terminal,
-     * it only queues arrow/Enter state.  Rendering remains owned by the main
-     * thread and follows the same full-frame redraw path as the noninteractive
-     * UI. Keep ISIG set so Ctrl-C still restores the alternate screen. */
+     * it only queues navigation/control state.  Rendering remains owned by the
+     * main thread and follows the same full-frame redraw path as the
+     * noninteractive UI. Keep ISIG set so Ctrl-C still restores the alternate
+     * screen. */
     struct termios raw = global_input.orig_termios;
     raw.c_lflag &= ~(ICANON | ECHO);
     raw.c_cc[VMIN] = 0;
@@ -1626,6 +1638,7 @@ static void tui_start_input(void) {
     global_input.move_delta = 0;
     global_input.enter_pressed = false;
     global_input.pause_pressed = false;
+    global_input.quit_pressed = false;
     pthread_mutex_unlock(&global_input.mu);
 
     global_input.raw_mode = true;
@@ -1661,10 +1674,18 @@ static void tui_consume_input(eval_ui *ui) {
     int move = global_input.move_delta;
     bool enter = global_input.enter_pressed;
     bool pause = global_input.pause_pressed;
+    bool quit = global_input.quit_pressed;
     global_input.move_delta = 0;
     global_input.enter_pressed = false;
     global_input.pause_pressed = false;
+    global_input.quit_pressed = false;
     pthread_mutex_unlock(&global_input.mu);
+
+    if (quit) {
+        ui->quit_requested = true;
+        ui->paused = false;
+        return;
+    }
 
     if (pause) ui->paused = !ui->paused;
 
@@ -1726,7 +1747,7 @@ static void tui_draw_title(eval_ui *ui) {
     tui_clear_left_line(ui, 1);
     char elapsed[32];
     format_run_elapsed(elapsed, sizeof(elapsed), tui_run_clock_visible_sec(ui));
-    fputs(ANSI_BOLD "ds4-eval" ANSI_RESET, stdout);
+    fputs("ds4-eval (" ANSI_BOLD "p" ANSI_RESET ")ause (" ANSI_BOLD "q" ANSI_RESET ")uit", stdout);
     printf(" %s", elapsed);
     if (ui->paused) {
         fputs(" " ANSI_RED ANSI_BOLD "PAUSED" ANSI_RESET, stdout);
@@ -2032,6 +2053,7 @@ static void tui_start(eval_ui *ui, const eval_case *cases, int ncases, int max_t
     ui->max_tokens = max_tokens;
     ui->selected_case = 0;
     ui->requested_case = -1;
+    ui->quit_requested = false;
     ui->status = calloc((size_t)ncases, sizeof(*ui->status));
     ui->guess = calloc((size_t)ncases, sizeof(*ui->guess));
     ui->prompt_tokens = calloc((size_t)ncases, sizeof(*ui->prompt_tokens));
@@ -2403,6 +2425,10 @@ static bool tui_has_switch_request(eval_ui *ui, int running_idx) {
            ui->requested_case != running_idx;
 }
 
+static bool tui_has_quit_request(eval_ui *ui) {
+    return ui->enabled && ui->quit_requested;
+}
+
 static void mark_case_pending(eval_ui *ui, int idx) {
     ui->status[idx] = EVAL_PENDING;
     ui->guess[idx][0] = '\0';
@@ -2461,14 +2487,42 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     ui->generated_tokens[idx] = 0;
 
     if (prompt.len >= cfg->ctx_size) {
-        fprintf(stderr, "ds4-eval: prompt for %s has %d tokens, ctx=%d\n",
-                tc->id, prompt.len, cfg->ctx_size);
-        trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR",
+        ui->active_case = idx;
+        if (!ui->selection_active) ui->selected_case = idx;
+        ui->guess[idx][0] = '\0';
+        ui->status[idx] = EVAL_SKIPPED;
+        tui_refresh(ui, "idle");
+        trace_write_case(trace, cfg, tc, idx, ui->ncases, "SKIPPED",
                          "prompt does not fit context", system, question, "",
                          think_mode, prompt.len, 0, 0.0, "?", NULL);
+        if (!tty) {
+            printf("\n[%d/%d] SKIPPED %s/%s prompt=%d ctx=%d\n",
+                   idx + 1, ui->ncases, tc->source, tc->id, prompt.len, cfg->ctx_size);
+        }
         free(question);
         ds4_tokens_free(&prompt);
-        return EVAL_RUN_ERROR;
+        return EVAL_RUN_OK;
+    }
+
+    int generation_limit = cfg->max_tokens;
+    int ctx_generation_limit = cfg->ctx_size - prompt.len - 2;
+    if (ctx_generation_limit < generation_limit) generation_limit = ctx_generation_limit;
+    if (generation_limit < 1) {
+        ui->active_case = idx;
+        if (!ui->selection_active) ui->selected_case = idx;
+        ui->guess[idx][0] = '\0';
+        ui->status[idx] = EVAL_SKIPPED;
+        tui_refresh(ui, "idle");
+        trace_write_case(trace, cfg, tc, idx, ui->ncases, "SKIPPED",
+                         "prompt leaves no generation room", system, question, "",
+                         think_mode, prompt.len, 0, 0.0, "?", NULL);
+        if (!tty) {
+            printf("\n[%d/%d] SKIPPED %s/%s prompt=%d ctx=%d\n",
+                   idx + 1, ui->ncases, tc->source, tc->id, prompt.len, cfg->ctx_size);
+        }
+        free(question);
+        ds4_tokens_free(&prompt);
+        return EVAL_RUN_OK;
     }
 
     ui->active_case = idx;
@@ -2476,6 +2530,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     ui->requested_case = -1;
     ui->guess[idx][0] = '\0';
     ui->status[idx] = EVAL_PREFILL;
+    ui->max_tokens = generation_limit;
     tui_run_clock_start(ui);
     if (tty) {
         tui_reset_stream(ui, tc, ds4_think_mode_enabled(think_mode));
@@ -2511,6 +2566,16 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
 
     tui_consume_input(ui);
     tui_wait_if_paused(ui, "prefill");
+    if (tui_has_quit_request(ui)) {
+        ui->status[idx] = EVAL_STOPPED;
+        ui->generated_tokens[idx] = 0;
+        tui_run_clock_stop(ui);
+        tui_refresh(ui, "idle");
+        trace_write_case(trace, cfg, tc, idx, ui->ncases, "STOPPED", NULL,
+                         system, question, "", think_mode, prompt_tokens, 0, 0.0, "?", NULL);
+        free(question);
+        return EVAL_RUN_QUIT;
+    }
     if (tui_has_switch_request(ui, idx)) {
         mark_case_pending(ui, idx);
         tui_run_clock_stop(ui);
@@ -2537,9 +2602,23 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     const int eos = ds4_token_eos(engine);
     double t0 = ui->phase_start_sec;
     int forced_close_pos = -1;
-    for (int i = 0; i < cfg->max_tokens; i++) {
+    for (int i = 0; i < generation_limit; i++) {
         if (tty) {
             tui_consume_input(ui);
+            if (tui_has_quit_request(ui)) {
+                ui->status[idx] = EVAL_STOPPED;
+                ui->generated_tokens[idx] = ui->generated;
+                tui_run_clock_stop(ui);
+                tui_refresh(ui, "idle");
+                trace_write_case(trace, cfg, tc, idx, ui->ncases, "STOPPED", NULL,
+                                 system, question, raw.v ? raw.v : "", think_mode,
+                                 prompt_tokens, ui->generated, now_sec() - t0, "?",
+                                 &think_close);
+                free(question);
+                ds4_tokens_free(&think_close_tokens);
+                buf_free(&raw);
+                return EVAL_RUN_QUIT;
+            }
             if (tui_has_switch_request(ui, idx)) {
                 mark_case_pending(ui, idx);
                 ui->generated_tokens[idx] = ui->generated;
@@ -2559,6 +2638,20 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                 ui->phase_start_sec += paused_sec;
                 t0 += paused_sec;
             }
+            if (tui_has_quit_request(ui)) {
+                ui->status[idx] = EVAL_STOPPED;
+                ui->generated_tokens[idx] = ui->generated;
+                tui_run_clock_stop(ui);
+                tui_refresh(ui, "idle");
+                trace_write_case(trace, cfg, tc, idx, ui->ncases, "STOPPED", NULL,
+                                 system, question, raw.v ? raw.v : "", think_mode,
+                                 prompt_tokens, ui->generated, now_sec() - t0, "?",
+                                 &think_close);
+                free(question);
+                ds4_tokens_free(&think_close_tokens);
+                buf_free(&raw);
+                return EVAL_RUN_QUIT;
+            }
             if (tui_has_switch_request(ui, idx)) {
                 mark_case_pending(ui, idx);
                 ui->generated_tokens[idx] = ui->generated;
@@ -2575,7 +2668,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
             }
         }
 
-        int remaining_budget = cfg->max_tokens - ui->generated;
+        int remaining_budget = generation_limit - ui->generated;
         int close_rank = 0;
         int token = -1;
         eval_think_close_kind close_kind = EVAL_THINK_CLOSE_NONE;
@@ -2722,6 +2815,8 @@ static const char *report_status_name(eval_status st) {
     switch (st) {
     case EVAL_PASSED: return "PASSED";
     case EVAL_FAILED: return "FAILED";
+    case EVAL_SKIPPED: return "SKIPPED";
+    case EVAL_STOPPED: return "STOPPED";
     case EVAL_PREFILL: return "PREFILL";
     case EVAL_THINKING: return "RUNNING";
     case EVAL_PENDING:
@@ -2729,20 +2824,7 @@ static const char *report_status_name(eval_status st) {
     }
 }
 
-static const char *report_status_color(eval_status st, bool color) {
-    if (!color) return "";
-    switch (st) {
-    case EVAL_PASSED: return ANSI_GREEN;
-    case EVAL_FAILED: return ANSI_RED;
-    case EVAL_PREFILL:
-    case EVAL_THINKING: return ANSI_YELLOW;
-    case EVAL_PENDING:
-    default: return ANSI_DIM;
-    }
-}
-
 static void print_eval_report(const eval_ui *ui, int ncases, int passed, int failed) {
-    bool color = isatty(STDOUT_FILENO);
     char elapsed[32];
     format_run_elapsed(elapsed, sizeof(elapsed), tui_run_clock_visible_sec(ui));
 
@@ -2756,21 +2838,16 @@ static void print_eval_report(const eval_ui *ui, int ncases, int passed, int fai
         int generated_tokens = ui->generated_tokens ? ui->generated_tokens[i] : 0;
         int total_tokens = prompt_tokens + generated_tokens;
         const char *given = ui->guess && ui->guess[i][0] ? ui->guess[i] : "-";
-        const char *color_start = report_status_color(ui->status[i], color);
-        const char *color_end = color ? ANSI_RESET : "";
-        printf("%3d %s%-8s%s %8d %8d %8d %-8s %-8s %s/%s %s\n",
+        printf("%3d %-8s %8d %8d %8d %-8s %-8s %s/%s\n",
                i + 1,
-               color_start,
                report_status_name(ui->status[i]),
-               color_end,
                prompt_tokens,
                generated_tokens,
                total_tokens,
                given,
                ui->cases[i].answer,
                ui->cases[i].source,
-               ui->cases[i].id,
-               ui->cases[i].title);
+               ui->cases[i].id);
     }
 }
 
@@ -2832,6 +2909,7 @@ int main(int argc, char **argv) {
     while (next >= 0) {
         tui_consume_input(&ui);
         tui_wait_if_paused(&ui, "idle");
+        if (ui.quit_requested) break;
         if (ui.requested_case >= 0) {
             next = ui.requested_case;
             ui.requested_case = -1;
@@ -2844,6 +2922,12 @@ int main(int argc, char **argv) {
             rc = 1;
             break;
         }
+        if (result == EVAL_RUN_QUIT) break;
+        /* A successful case should advance to the next pending benchmark.  If a
+         * stale quit flag ever survives here, clear it; real q handling either
+         * returns EVAL_RUN_QUIT from run_one_case() or is consumed at the top of
+         * the next idle iteration. */
+        ui.quit_requested = false;
         if (ui.requested_case >= 0) {
             next = ui.requested_case;
             ui.requested_case = -1;

@@ -210,9 +210,9 @@ generated tokens, pass/fail state, the model answer, and the correct answer.
 
 The default run uses `--ctx 100000` and `--tokens 16000`, thinking mode enabled,
 and a soft/hard `</think>` budget cutoff so the model has room to produce a
-visible answer. Press `p` to pause, Up/Down to inspect or select another
-question, and Enter to run the selected question next. `--plain` disables the
-TUI.
+visible answer. Press `p` to pause, `q` to exit and print the report, Up/Down
+to inspect or select another question, and Enter to run the selected question
+next. `--plain` disables the TUI.
 
 The 75 embedded questions are interleaved as 25 GPQA Diamond, 25 audited
 SuperGPQA, and 25 AIME 2025 problems. The order is intentionally progressive:
