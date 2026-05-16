@@ -276,23 +276,52 @@ class DocSteeringToolTests(unittest.TestCase):
                 "[1] file: /Users/au/w/transcript/2025-09-05-AI-倫理加速-關懷六力.md "
                 "chunk: 27 date: 2025-09-05 title: 2025-09-05 AI 倫理加速：關懷六力 "
                 "anchor: 唐鳳： score: 5.026\n"
+                "```text\n"
+                "### 唐鳳：\n"
+                "是的，地神在這裡被比喻性地使用，作為一個在地的管理者。\n"
+                "```\n"
                 "[2] file: /Users/au/w/transcript/2026-03-24-為何唐鳳不害怕-AI-智慧體與-OpenClaw.md "
                 "chunk: 11 date: 2026-03-24 title: 2026-03-24 為何唐鳳不害怕 AI 智慧體與 OpenClaw "
-                "anchor: 劉光瑩： score: 4.158\n",
+                "anchor: 劉光瑩： score: 4.158\n"
+                "```text\n"
+                "### 唐鳳：\n"
+                "第六個支柱是共生力，我也把它叫做在地神靈。\n"
+                "```\n",
                 encoding="utf-8",
             )
+            sections = root / "sections-dump.json"
+            sections.write_text(json.dumps({
+                "2025-09-05-ai-倫理加速-關懷六力": [{
+                    "section_id": 635887,
+                    "display_name": "2025-09-05 AI 倫理加速：關懷六力",
+                    "name": "唐鳳",
+                    "section_content": "<p>是的，地神在這裡被比喻性地使用，作為一個在地的管理者。</p>",
+                }],
+                "2026-03-24-為何唐鳳不害怕-ai-智慧體與-openclaw": [{
+                    "section_id": 638568,
+                    "display_name": "2026-03-24 為何唐鳳不害怕 AI 智慧體與 OpenClaw",
+                    "name": "唐鳳",
+                    "section_content": "<p>第六個支柱是共生力，我也把它叫做在地神靈。</p>",
+                }],
+            }, ensure_ascii=False), encoding="utf-8")
+            section_index = root / "sections.sqlite"
 
             proc = subprocess.run([
                 sys.executable,
                 str(LORE_CAG),
                 "footnotes",
                 "--prompt", str(prompt),
+                "--sections-dump", str(sections),
+                "--section-index", str(section_index),
             ], cwd=ROOT, check=True, input="地神是地方性的照護 AI [1]，也可在地修正 [2]。",
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
             self.assertIn("照護 AI [^1]，也可在地修正 [^2]。", proc.stdout)
-            self.assertIn("[^1]: [2025-09-05 AI 倫理加速：關懷六力, chunk 27](https://archive.tw/2025-09-05-AI-", proc.stdout)
-            self.assertIn("[^2]: [2026-03-24 為何唐鳳不害怕 AI 智慧體與 OpenClaw, chunk 11](https://archive.tw/2026-03-24-", proc.stdout)
+            self.assertIn("[^1]: [2025-09-05 AI 倫理加速：關懷六力 — 唐鳳](https://archive.tw/2025-09-05-ai-", proc.stdout)
+            self.assertIn("#s635887)", proc.stdout)
+            self.assertIn("[^2]: [2026-03-24 為何唐鳳不害怕 AI 智慧體與 OpenClaw — 唐鳳]", proc.stdout)
+            self.assertIn("#s638568)", proc.stdout)
+            self.assertNotIn("chunk 27", proc.stdout)
 
     def test_lore_testset_builds_honest_compose_only_cases(self) -> None:
         with tempfile.TemporaryDirectory() as td:

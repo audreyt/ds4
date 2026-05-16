@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import html
 import json
 import math
 import re
@@ -81,6 +82,7 @@ SQLITE_INDEX_FORMAT = "ds4-lore-sqlite-index-v1"
 SQLITE_INDEX_AUTOBUILD_BYTES = 32 * 1024 * 1024
 SQLITE_INDEX_TOKEN_LIMIT = 192
 SQLITE_MAX_VARS = 900
+SECTION_INDEX_FORMAT = "ds4-archive-section-index-v1"
 PROMPT_SOURCE_RE = re.compile(
     r"^\[(\d+)\]\s+file:\s+(.*?)\s+chunk:\s+(\d+)"
     r"(?:\s+date:\s+(.*?))?"
@@ -88,6 +90,8 @@ PROMPT_SOURCE_RE = re.compile(
     r"\s+anchor:\s+(.*?)\s+score:\s+([0-9.]+)",
     re.MULTILINE,
 )
+HTML_BLOCK_RE = re.compile(r"<(script|style)\b[\s\S]*?</\1>", re.IGNORECASE)
+HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
 @dataclass
@@ -101,6 +105,17 @@ class LoreRecord:
     source_date: str = ""
     title: str = ""
     score: float = 0.0
+
+
+@dataclass
+class PromptSource:
+    index: int
+    path: str
+    chunk: int
+    title: str
+    text: str = ""
+    section_id: int | None = None
+    section_speaker: str = ""
 
 
 def repo_root() -> Path:
@@ -1182,24 +1197,256 @@ def prompt_cmd(args: argparse.Namespace) -> None:
 
 
 def archive_url_for_path(path: str, archive_base: str) -> str:
-    stem = Path(path).stem
-    return f"{archive_base.rstrip('/')}/{urllib.parse.quote(stem)}"
+    filename = archive_filename_for_path(path)
+    return f"{archive_base.rstrip('/')}/{urllib.parse.quote(filename)}"
 
 
-def parse_prompt_sources(prompt: str, archive_base: str) -> dict[int, str]:
-    sources: dict[int, str] = {}
+def archive_filename_for_path(path: str) -> str:
+    return Path(path).stem.lower().replace("：", "-")[:50]
+
+
+def strip_html_text(value: str) -> str:
+    value = HTML_BLOCK_RE.sub(" ", value)
+    value = re.sub(r"<br\s*/?>", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"</(p|div|section|article|li|blockquote|h[1-6]|tr|td|th)>", " ", value, flags=re.IGNORECASE)
+    value = HTML_TAG_RE.sub(" ", value)
+    return re.sub(r"\s+", " ", html.unescape(value)).strip()
+
+
+def strip_prompt_source_text(value: str) -> str:
+    value = re.sub(r"^\s{0,3}#{1,6}\s+.+?[:：]\s*$", " ", value, flags=re.MULTILINE)
+    value = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", value)
+    value = re.sub(r"`([^`]+)`", r"\1", value)
+    value = re.sub(r"[*_]{1,3}([^*_]+)[*_]{1,3}", r"\1", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def parse_prompt_source_blocks(prompt: str) -> list[PromptSource]:
+    sources: list[PromptSource] = []
     for match in PROMPT_SOURCE_RE.finditer(prompt):
         index = int(match.group(1))
         path = match.group(2).strip()
         chunk = int(match.group(3))
         title = (match.group(5) or Path(path).stem).strip()
-        url = archive_url_for_path(path, archive_base)
-        sources[index] = f"[{title}, chunk {chunk}]({url})"
+        text = ""
+        fenced = re.match(r"\n```text\n(.*?)\n```", prompt[match.end():], re.DOTALL)
+        if fenced:
+            text = fenced.group(1).strip()
+        sources.append(PromptSource(index=index, path=path, chunk=chunk, title=title, text=text))
     return sources
 
 
-def stream_markdown_footnotes(sources: dict[int, str], all_sources: bool) -> None:
+def default_sections_dump_path() -> Path | None:
+    candidates = [
+        Path.home() / "w" / "sayit-hono" / "scripts" / "sections-dump.json",
+        Path.home() / "w" / "transcript" / "sections-dump.json",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def default_section_index_path() -> Path:
+    return repo_root() / "dir-steering" / "out" / "archive-sections.sqlite"
+
+
+def section_index_meta(sections_dump: Path) -> dict[str, str]:
+    stat = sections_dump.stat()
+    return {
+        "format": SECTION_INDEX_FORMAT,
+        "sections_dump": str(sections_dump.resolve()),
+        "sections_dump_size": str(stat.st_size),
+        "sections_dump_mtime_ns": str(stat.st_mtime_ns),
+    }
+
+
+def section_index_is_fresh(index_path: Path, sections_dump: Path) -> bool:
+    if not index_path.exists():
+        return False
+    expected = section_index_meta(sections_dump)
+    try:
+        conn = sqlite3.connect(index_path)
+        rows = dict(conn.execute("SELECT key, value FROM meta"))
+        conn.close()
+    except sqlite3.Error:
+        return False
+    return all(rows.get(key) == value for key, value in expected.items())
+
+
+def build_section_index(sections_dump: Path, index_path: Path, rebuild: bool = False) -> None:
+    if not rebuild and section_index_is_fresh(index_path, sections_dump):
+        return
+
+    print(f"building archive section index {index_path} from {sections_dump}", file=sys.stderr)
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = index_path.with_name(f"{index_path.name}.tmp")
+    if tmp.exists():
+        tmp.unlink()
+
+    conn: sqlite3.Connection | None = None
+    count = 0
+    try:
+        dump = json.loads(sections_dump.read_text(encoding="utf-8"))
+        conn = sqlite3.connect(tmp)
+        conn.execute("PRAGMA journal_mode=OFF")
+        conn.execute("PRAGMA synchronous=OFF")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.executescript("""
+            CREATE TABLE meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE sections (
+                filename TEXT NOT NULL,
+                section_id INTEGER NOT NULL,
+                display_name TEXT NOT NULL,
+                speaker TEXT NOT NULL,
+                content TEXT NOT NULL
+            );
+        """)
+        conn.executemany(
+            "INSERT INTO meta(key, value) VALUES (?, ?)",
+            sorted(section_index_meta(sections_dump).items()),
+        )
+        rows: list[tuple[str, int, str, str, str]] = []
+        for filename, sections in dump.items():
+            for section in sections:
+                rows.append((
+                    str(filename),
+                    int(section["section_id"]),
+                    str(section.get("display_name") or ""),
+                    str(section.get("name") or ""),
+                    strip_html_text(str(section.get("section_content") or "")),
+                ))
+                count += 1
+                if len(rows) >= 1000:
+                    conn.executemany(
+                        "INSERT INTO sections(filename, section_id, display_name, speaker, content) VALUES (?, ?, ?, ?, ?)",
+                        rows,
+                    )
+                    rows = []
+        if rows:
+            conn.executemany(
+                "INSERT INTO sections(filename, section_id, display_name, speaker, content) VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
+        conn.execute("CREATE INDEX sections_filename_idx ON sections(filename)")
+        conn.commit()
+        conn.close()
+        conn = None
+        tmp.replace(index_path)
+        print(f"wrote archive section index {index_path} ({count} sections)", file=sys.stderr)
+    except Exception:
+        if conn is not None:
+            conn.close()
+        if tmp.exists():
+            tmp.unlink()
+        raise
+
+
+def resolve_section_index(args: argparse.Namespace) -> Path | None:
+    if args.no_section_anchors:
+        return None
+    index_path = resolve_cli_path(args.section_index) if args.section_index else default_section_index_path()
+    dump_path: Path | None = resolve_cli_path(args.sections_dump) if args.sections_dump else default_sections_dump_path()
+    if dump_path:
+        if args.rebuild_section_index or not section_index_is_fresh(index_path, dump_path):
+            build_section_index(dump_path, index_path, args.rebuild_section_index)
+    return index_path if index_path.exists() else None
+
+
+def score_section_match(source_text: str, section_text: str) -> float:
+    source_plain = strip_prompt_source_text(source_text)
+    section_plain = strip_html_text(section_text)
+    if not source_plain or not section_plain:
+        return 0.0
+    if section_plain in source_plain:
+        return 10000.0 + min(len(section_plain), 1000)
+    probe = section_plain[: min(len(section_plain), 90)]
+    if len(probe) >= 30 and probe in source_plain:
+        return 5000.0 + len(probe)
+    source_tokens = collections.Counter(tokenize(source_plain))
+    section_tokens = collections.Counter(tokenize(section_plain))
+    if not source_tokens or not section_tokens:
+        return 0.0
+    overlap = 0.0
+    for token, count in section_tokens.items():
+        if token in source_tokens:
+            overlap += min(count, source_tokens[token])
+    return overlap / math.sqrt(sum(section_tokens.values()) * sum(source_tokens.values()))
+
+
+def find_best_section(index_path: Path, source: PromptSource, context: str = "") -> tuple[int, str] | None:
+    filename = archive_filename_for_path(source.path)
+    conn = sqlite3.connect(index_path)
+    try:
+        rows = conn.execute(
+            "SELECT section_id, speaker, content FROM sections WHERE filename = ? ORDER BY section_id ASC",
+            (filename,),
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return None
+    best: tuple[float, int, str] | None = None
+    for section_id, speaker, content in rows:
+        score = score_section_match(source.text, str(content))
+        context_score = score_section_match(context, str(content)) if context else 0.0
+        if context_score > 0:
+            score = 100000.0 + context_score * 1000.0 + min(score, 5.0)
+        if best is None or score > best[0]:
+            best = (score, int(section_id), str(speaker or ""))
+    if not best or best[0] <= 0:
+        return None
+    return best[1], best[2]
+
+
+def resolve_prompt_source_sections(sources: list[PromptSource], index_path: Path | None) -> None:
+    if index_path is None:
+        return
+    for source in sources:
+        match = find_best_section(index_path, source)
+        if match:
+            source.section_id, source.section_speaker = match
+
+
+def prompt_source_footnote(
+    source: PromptSource,
+    archive_base: str,
+    section_index: Path | None = None,
+    context: str = "",
+) -> str:
+    section_id = source.section_id
+    section_speaker = source.section_speaker
+    if section_index is not None:
+        match = find_best_section(section_index, source, context)
+        if match:
+            section_id, section_speaker = match
+    url = archive_url_for_path(source.path, archive_base)
+    if section_id is not None:
+        url = f"{url}#s{section_id}"
+    label = source.title
+    if section_speaker:
+        label = f"{label} — {section_speaker}"
+    return f"[{label}]({url})"
+
+
+def parse_prompt_sources(prompt: str, archive_base: str, section_index: Path | None = None) -> dict[int, str]:
+    sources = parse_prompt_source_blocks(prompt)
+    resolve_prompt_source_sections(sources, section_index)
+    return {source.index: prompt_source_footnote(source, archive_base) for source in sources}
+
+
+def stream_markdown_footnotes(
+    sources: dict[int, PromptSource],
+    archive_base: str,
+    all_sources: bool,
+    section_index: Path | None = None,
+) -> None:
     used: set[int] = set()
+    contexts: dict[int, list[str]] = collections.defaultdict(list)
+    history: collections.deque[str] = collections.deque(maxlen=360)
     state = "text"
     digits = ""
 
@@ -1217,6 +1464,7 @@ def stream_markdown_footnotes(sources: dict[int, str], all_sources: bool) -> Non
                 digits = ""
             else:
                 write(char)
+                history.append(char)
             continue
 
         if state == "citation":
@@ -1226,29 +1474,38 @@ def stream_markdown_footnotes(sources: dict[int, str], all_sources: bool) -> Non
             if char == "]" and digits:
                 index = int(digits)
                 used.add(index)
+                contexts[index].append("".join(history))
                 write(f"[^{index}]")
+                for item in f"[^{index}]":
+                    history.append(item)
                 state = "text"
                 digits = ""
                 continue
             write("[" + digits + char)
+            for item in "[" + digits + char:
+                history.append(item)
             state = "text"
             digits = ""
 
     if state == "citation":
         write("[" + digits)
+        for item in "[" + digits:
+            history.append(item)
 
     footnote_indexes = sorted(sources) if all_sources else sorted(index for index in used if index in sources)
     if footnote_indexes:
         write("\n\n")
         for index in footnote_indexes:
-            write(f"[^{index}]: {sources[index]}\n")
+            context = "\n".join(contexts.get(index, []))
+            write(f"[^{index}]: {prompt_source_footnote(sources[index], archive_base, section_index, context)}\n")
 
 
 def footnotes_cmd(args: argparse.Namespace) -> None:
     prompt_path = resolve_cli_path(args.prompt)
     prompt = prompt_path.read_text(encoding="utf-8")
-    sources = parse_prompt_sources(prompt, args.archive_base)
-    stream_markdown_footnotes(sources, args.all)
+    section_index = resolve_section_index(args)
+    sources = {source.index: source for source in parse_prompt_source_blocks(prompt)}
+    stream_markdown_footnotes(sources, args.archive_base, args.all, section_index)
 
 
 def predict_steering(args: argparse.Namespace, records: list[LoreRecord], temp_dir: Path) -> Path:
@@ -1382,6 +1639,13 @@ def build_parser() -> argparse.ArgumentParser:
     footnotes_ap.add_argument("--prompt", required=True,
                               help="prompt file produced by the prompt subcommand")
     footnotes_ap.add_argument("--archive-base", default="https://archive.tw")
+    footnotes_ap.add_argument("--sections-dump", default="",
+                              help="sections-dump.json from sayit-hono; auto-detected from ~/w/sayit-hono")
+    footnotes_ap.add_argument("--section-index", default="",
+                              help="SQLite cache for resolving archive #s anchors")
+    footnotes_ap.add_argument("--rebuild-section-index", action="store_true")
+    footnotes_ap.add_argument("--no-section-anchors", action="store_true",
+                              help="link to transcript pages without resolving section anchors")
     footnotes_ap.add_argument("--all", action="store_true",
                               help="append footnotes for every prompt source, not just cited sources")
     footnotes_ap.set_defaults(func=footnotes_cmd)

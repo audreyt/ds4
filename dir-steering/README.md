@@ -436,7 +436,8 @@ python3 dir-steering/tools/lore_cag.py prompt \
 ```
 
 Stream a cited prompt through an Ollama-compatible API and convert `[1]`
-citations in the answer into Markdown footnotes linked to `archive.tw`:
+citations in the answer into Markdown footnotes linked to the matching
+`archive.tw` transcript section:
 
 ```sh
 python3 dir-steering/tools/lore_cag.py prompt \
@@ -459,6 +460,11 @@ python3 dir-steering/tools/lore_cag.py prompt \
     --prompt /tmp/cag-prompt.txt
 ); echo
 ```
+
+The `footnotes` subcommand auto-detects `~/w/sayit-hono/scripts/sections-dump.json`
+when present and caches section ids in `dir-steering/out/archive-sections.sqlite`.
+If that dump is unavailable, it still links to the transcript page, just without
+the `#s...` section anchor.
 
 Run CAG through DS4:
 
