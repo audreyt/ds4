@@ -568,6 +568,11 @@ including `response.output_text.delta`, function-call argument events, and
 terminal `response.completed` / `response.incomplete` / `response.failed`
 events.
 
+For browser JavaScript clients served from another origin, start the server with
+`--cors` to emit `Access-Control-Allow-*` headers. This only changes HTTP
+headers; it does not expose the server on the LAN. Use `--host 0.0.0.0`
+explicitly when remote machines should be able to connect.
+
 ### Tool call handling and canonicalization
 
 DeepSeek V4 Flash emits tool calls as [DSML text](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/encoding/README.md). Agent clients do not send that

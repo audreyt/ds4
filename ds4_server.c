@@ -17,6 +17,7 @@
 #include <float.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -607,6 +608,8 @@ typedef struct {
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
+    int cache_read_tokens;
+    int cache_write_tokens;
     ds4_think_mode think_mode;
     bool has_tools;
     bool prompt_preserves_reasoning;
@@ -2331,6 +2334,12 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
     int last_user_idx = -1;
     buf system = {0};
+    /* Render tool schemas before the client system content so
+     * --kv-cache-boundary-trim-tokens chops a dynamic tail from the client
+     * message instead of the much larger tool-schema region. */
+    if (tool_schemas && tool_schemas[0]) {
+        append_tools_prompt_text(&system, tool_schemas);
+    }
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (!role_is_system(m->role)) continue;
@@ -2340,11 +2349,6 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_user_like(m->role)) last_user_idx = i;
-    }
-
-    if (tool_schemas && tool_schemas[0]) {
-        if (system.len) buf_puts(&system, "\n\n");
-        append_tools_prompt_text(&system, tool_schemas);
     }
 
     buf out = {0};
@@ -4720,30 +4724,45 @@ static void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const 
     buf_putc(b, ']');
 }
 
-static bool http_response(int fd, int code, const char *type, const char *body) {
+static void append_cors_headers(buf *h) {
+    buf_puts(h,
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: *\r\n");
+}
+
+static bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body) {
     const char *reason = code == 200 ? "OK" :
+                         code == 204 ? "No Content" :
                          code == 400 ? "Bad Request" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
                          code == 500 ? "Internal Server Error" : "Error";
+    const size_t body_len = body ? strlen(body) : 0;
     buf h = {0};
     buf_printf(&h,
         "HTTP/1.1 %d %s\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n\r\n",
-        code, reason, type, strlen(body));
-    bool ok = send_all(fd, h.ptr, h.len) && send_all(fd, body, strlen(body));
+        "Content-Length: %zu\r\n",
+        code, reason, body_len);
+    if (type && type[0]) {
+        buf_puts(&h, "Content-Type: ");
+        buf_puts(&h, type);
+        buf_puts(&h, "\r\n");
+    }
+    if (enable_cors) append_cors_headers(&h);
+    buf_puts(&h, "Connection: close\r\n\r\n");
+    bool ok = send_all(fd, h.ptr, h.len);
+    if (ok && body_len) ok = send_all(fd, body, body_len);
     buf_free(&h);
     return ok;
 }
 
-static bool http_error(int fd, int code, const char *msg) {
+static bool http_error(int fd, bool enable_cors, int code, const char *msg) {
     buf b = {0};
     buf_puts(&b, "{\"error\":{\"message\":");
     json_escape(&b, msg);
     buf_puts(&b, ",\"type\":\"invalid_request_error\"}}\n");
-    bool ok = http_response(fd, code, "application/json", b.ptr);
+    bool ok = http_response(fd, enable_cors, code, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
@@ -4761,7 +4780,8 @@ static bool request_exceeds_context(const request *r, int ctx_size) {
     return r && r->prompt.len >= ctx_size;
 }
 
-static bool http_error_context_length_exceeded(int fd, const request *r,
+static bool http_error_context_length_exceeded(int fd, bool enable_cors,
+                                               const request *r,
                                                int n_prompt_tokens,
                                                int ctx_size) {
     buf b = {0};
@@ -4789,7 +4809,7 @@ static bool http_error_context_length_exceeded(int fd, const request *r,
         buf_printf(&b, "%d", ctx_size);
         buf_puts(&b, "}}\n");
     }
-    bool ok = http_response(fd, 400, "application/json", b.ptr);
+    bool ok = http_response(fd, enable_cors, 400, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
@@ -4797,13 +4817,17 @@ static bool http_error_context_length_exceeded(int fd, const request *r,
 /* Streaming is a translation state machine over the raw DS4 text.  The model
  * may produce <think> and DSML tool blocks; clients should receive those as
  * protocol-native reasoning/tool deltas, never as visible assistant text. */
-static bool sse_headers(int fd) {
-    const char *h =
+static bool sse_headers(int fd, bool enable_cors) {
+    buf h = {0};
+    buf_puts(&h,
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
-        "Cache-Control: no-cache\r\n"
-        "Connection: close\r\n\r\n";
-    return send_all(fd, h, strlen(h));
+        "Cache-Control: no-cache\r\n");
+    if (enable_cors) append_cors_headers(&h);
+    buf_puts(&h, "Connection: close\r\n\r\n");
+    bool ok = send_all(fd, h.ptr, h.len);
+    buf_free(&h);
+    return ok;
 }
 
 static bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish) {
@@ -4837,6 +4861,29 @@ static bool sse_chunk(int fd, const request *r, const char *id, const char *text
     return ok;
 }
 
+static int clamp_usage_tokens(int value, int max) {
+    if (value < 0) return 0;
+    if (max >= 0 && value > max) return max;
+    return value;
+}
+
+static void append_openai_usage_json(buf *b, const request *r,
+                                     int prompt_tokens, int completion_tokens) {
+    int cached_tokens = r ? r->cache_read_tokens : 0;
+    int cache_write_tokens = r ? r->cache_write_tokens : 0;
+    cached_tokens = clamp_usage_tokens(cached_tokens, prompt_tokens);
+    cache_write_tokens = clamp_usage_tokens(cache_write_tokens, prompt_tokens - cached_tokens);
+    /* OpenAI defines cached_tokens as prompt tokens retrieved from cache.
+     * Newly-prefilled tokens are useful to expose, but they are a DS4 extension
+     * and must stay separate so OpenAI-compatible clients do not over-count
+     * cache hits. */
+    buf_printf(b,
+               "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d,"
+               "\"prompt_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d}}",
+               prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
+               cached_tokens, cache_write_tokens);
+}
+
 static bool sse_usage_chunk(int fd, const request *r, const char *id,
                             int prompt_tokens, int completion_tokens) {
     if (!r->stream_include_usage) return true;
@@ -4852,9 +4899,8 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
         json_escape(&b, r->model);
         buf_puts(&b, ",\"choices\":[],\"usage\":");
     }
-    buf_printf(&b,
-               "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}\n\n",
-               prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
+    append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    buf_puts(&b, "}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len);
     buf_free(&b);
@@ -6342,6 +6388,20 @@ static const char *responses_status_for_finish(const char *finish) {
     return "completed";
 }
 
+static void append_responses_usage_json(buf *b, const request *r,
+                                        int input_tokens, int output_tokens) {
+    int cached_tokens = r ? r->cache_read_tokens : 0;
+    int cache_write_tokens = r ? r->cache_write_tokens : 0;
+    cached_tokens = clamp_usage_tokens(cached_tokens, input_tokens);
+    cache_write_tokens = clamp_usage_tokens(cache_write_tokens, input_tokens - cached_tokens);
+    buf_printf(b,
+        "{\"input_tokens\":%d,\"input_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d},"
+        "\"output_tokens\":%d,\"output_tokens_details\":{\"reasoning_tokens\":0},"
+        "\"total_tokens\":%d}",
+        input_tokens, cached_tokens, cache_write_tokens,
+        output_tokens, input_tokens + output_tokens);
+}
+
 static bool responses_sse_completed(int fd, const request *r,
                                     responses_stream *st,
                                     const tool_calls *calls,
@@ -6410,11 +6470,9 @@ static bool responses_sse_completed(int fd, const request *r,
         }
     }
     buf_putc(&b, ']');
-    buf_printf(&b,
-        ",\"usage\":{\"input_tokens\":%d,\"input_tokens_details\":{\"cached_tokens\":0},"
-        "\"output_tokens\":%d,\"output_tokens_details\":{\"reasoning_tokens\":0},"
-        "\"total_tokens\":%d}}}",
-        prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
+    buf_puts(&b, ",\"usage\":");
+    append_responses_usage_json(&b, r, prompt_tokens, completion_tokens);
+    buf_puts(&b, "}}");
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
     buf_free(&b);
     return ok;
@@ -6600,7 +6658,8 @@ static bool responses_sse_finish_live(int fd, const request *r,
     return ok;
 }
 
-static bool responses_final_response(int fd, const request *r, const char *id,
+static bool responses_final_response(int fd, bool enable_cors,
+                                     const request *r, const char *id,
                                      const char *text, const char *reasoning,
                                      const tool_calls *calls, const char *finish,
                                      int prompt_tokens, int completion_tokens) {
@@ -6664,18 +6723,17 @@ static bool responses_final_response(int fd, const request *r, const char *id,
         }
     }
     buf_putc(&b, ']');
-    buf_printf(&b,
-        ",\"usage\":{\"input_tokens\":%d,\"input_tokens_details\":{\"cached_tokens\":0},"
-        "\"output_tokens\":%d,\"output_tokens_details\":{\"reasoning_tokens\":0},"
-        "\"total_tokens\":%d}}",
-        prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
-    bool ok = http_response(fd, 200, "application/json", b.ptr);
+    buf_puts(&b, ",\"usage\":");
+    append_responses_usage_json(&b, r, prompt_tokens, completion_tokens);
+    buf_putc(&b, '}');
+    bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     free(items);
     return ok;
 }
 
-static bool final_response(int fd, const request *r, const char *id, const char *text,
+static bool final_response(int fd, bool enable_cors,
+                           const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
                            int prompt_tokens, int completion_tokens) {
     buf b = {0};
@@ -6705,9 +6763,9 @@ static bool final_response(int fd, const request *r, const char *id, const char 
         json_escape(&b, finish);
         buf_puts(&b, "}],\"usage\":");
     }
-    buf_printf(&b, "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}\n",
-               prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
-    bool ok = http_response(fd, 200, "application/json", b.ptr);
+    append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    buf_puts(&b, "}\n");
+    bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
@@ -6773,7 +6831,22 @@ static void append_anthropic_content(buf *b, const char *text, const char *reaso
     buf_putc(b, ']');
 }
 
-static bool anthropic_final_response(int fd, const request *r, const char *id, const char *text,
+static void append_anthropic_usage_json(buf *b, const request *r,
+                                        int prompt_tokens, int completion_tokens) {
+    int cache_read_tokens = r ? r->cache_read_tokens : 0;
+    int cache_write_tokens = r ? r->cache_write_tokens : 0;
+    cache_read_tokens = clamp_usage_tokens(cache_read_tokens, prompt_tokens);
+    cache_write_tokens = clamp_usage_tokens(cache_write_tokens, prompt_tokens - cache_read_tokens);
+    int input_tokens = prompt_tokens - cache_read_tokens - cache_write_tokens;
+    if (input_tokens < 0) input_tokens = 0;
+    buf_printf(b,
+               "{\"input_tokens\":%d,\"output_tokens\":%d,"
+               "\"cache_read_input_tokens\":%d,\"cache_creation_input_tokens\":%d}",
+               input_tokens, completion_tokens, cache_read_tokens, cache_write_tokens);
+}
+
+static bool anthropic_final_response(int fd, bool enable_cors,
+                                     const request *r, const char *id, const char *text,
                                      const char *reasoning, const tool_calls *calls, const char *finish,
                                      int prompt_tokens, int completion_tokens) {
     buf b = {0};
@@ -6784,9 +6857,9 @@ static bool anthropic_final_response(int fd, const request *r, const char *id, c
     buf_puts(&b, ",\"stop_reason\":");
     json_escape(&b, anthropic_stop_reason(finish));
     buf_puts(&b, ",\"stop_sequence\":null,\"usage\":");
-    buf_printf(&b, "{\"input_tokens\":%d,\"output_tokens\":%d}}\n",
-               prompt_tokens, completion_tokens);
-    bool ok = http_response(fd, 200, "application/json", b.ptr);
+    append_anthropic_usage_json(&b, r, prompt_tokens, completion_tokens);
+    buf_puts(&b, "}\n");
+    bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
@@ -6856,8 +6929,10 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
     buf_printf(&b,
         "{\"type\":\"message_start\",\"message\":{\"id\":\"%s\",\"type\":\"message\","
         "\"role\":\"assistant\",\"model\":%s,\"content\":[],\"stop_reason\":null,"
-        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":%d,\"output_tokens\":0}}}",
-        id, model_json, prompt_tokens);
+        "\"stop_sequence\":null,\"usage\":",
+        id, model_json);
+    append_anthropic_usage_json(&b, r, prompt_tokens, 0);
+    buf_puts(&b, "}}");
     bool ok = sse_event(fd, "message_start", b.ptr);
     buf_free(&b);
     free(model_json);
@@ -7625,6 +7700,7 @@ struct server {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     bool disable_exact_dsml_tool_replay;
+    bool enable_cors;
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -8197,6 +8273,14 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
 #define KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS 2048
 #define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 10000
 #define KV_CACHE_DEFAULT_MB 4096
+/* Disk-hit counts are evidence that a checkpoint was useful, but only while
+ * the workload still resembles the one that produced those hits.  Prompt or
+ * tool-schema changes can make a once-hot checkpoint impossible to match, so
+ * eviction decays only the hit bonus with inactivity.  The baseline token/byte
+ * value remains intact: old files are not punished for age, they just stop
+ * carrying stale popularity forever. */
+#define KV_CACHE_HIT_HALF_LIFE_SECONDS (6ull * 60ull * 60ull)
+#define KV_CACHE_MIN_EFFECTIVE_HITS 0.01
 #define KV_EXT_TOOL_MAP (1u << 0)
 #define KV_EXT_RESPONSES_VISIBLE (1u << 1)
 #define KV_EXT_THINKING_VISIBLE (1u << 2)
@@ -8788,7 +8872,8 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
 }
 
 static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live,
-                                      const char *protected_sha) {
+                                      const char *protected_sha,
+                                      uint64_t now) {
     if (!e || e->file_size == 0) return 0.0;
     (void)live;
     if (protected_sha && !strcmp(e->sha, protected_sha)) {
@@ -8807,14 +8892,32 @@ static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live,
      * so do not demote them just because they are a prefix of the live session.
      * Use hits+1 for eviction value so a just-written checkpoint does not get
      * deleted immediately just because its persisted hit counter is still 0.
+     *
+     * Fold time-since-last_used into the hit bonus so a workload change does
+     * not let once-popular files outrank live prefixes forever.  Effective
+     * hits halve every KV_CACHE_HIT_HALF_LIFE_SECONDS of inactivity.  A fresh
+     * hit rewrites last_used, so matching prompts re-boost the entry.  Once
+     * the bonus is below one hundredth of a hit, treat it as zero; this lets
+     * the last_used tie-breaker evict stale files against equally dense fresh
+     * checkpoints instead of preserving a microscopic floating-point bonus.
      */
-    return ((double)e->hits + 1.0) * (double)e->tokens / (double)e->file_size;
+    double effective_hits = (double)e->hits;
+    uint64_t used_at = e->last_used ? e->last_used : e->created_at;
+    if (used_at == 0) {
+        effective_hits = 0.0;
+    } else if (now > used_at) {
+        double elapsed = (double)(now - used_at);
+        effective_hits *= exp2(-elapsed / (double)KV_CACHE_HIT_HALF_LIFE_SECONDS);
+        if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
+    }
+    return (effective_hits + 1.0) * (double)e->tokens / (double)e->file_size;
 }
 
 static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live,
                            const char *protected_sha) {
     if (!kc->enabled || kc->budget_bytes == 0) return;
     kv_cache_refresh(kc);
+    const uint64_t now = (uint64_t)time(NULL);
     uint64_t total = 0;
     for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
     if (protected_sha) {
@@ -8832,9 +8935,9 @@ static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live,
     }
     while (total > kc->budget_bytes && kc->len > 0) {
         int victim = 0;
-        double victim_score = kv_entry_eviction_score(&kc->entry[0], live, protected_sha);
+        double victim_score = kv_entry_eviction_score(&kc->entry[0], live, protected_sha, now);
         for (int i = 1; i < kc->len; i++) {
-            double score = kv_entry_eviction_score(&kc->entry[i], live, protected_sha);
+            double score = kv_entry_eviction_score(&kc->entry[i], live, protected_sha, now);
             if (score < victim_score ||
                 (score == victim_score && kc->entry[i].last_used < kc->entry[victim].last_used))
             {
@@ -8878,7 +8981,7 @@ static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb
     kc->opt = opt;
     kv_cache_evict(kc, NULL, NULL);
     server_log(DS4_LOG_KVCACHE,
-               "ds4-server: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d)",
+               "ds4-server: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
                kc->dir,
                (unsigned long long)(kc->budget_bytes / (1024ull * 1024ull)),
                reject_different_quant ? "reject" : "accept",
@@ -8886,7 +8989,8 @@ static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb
                kc->opt.cold_max_tokens,
                kc->opt.continued_interval_tokens,
                kc->opt.boundary_trim_tokens,
-               kc->opt.boundary_align_tokens);
+               kc->opt.boundary_align_tokens,
+               (unsigned long long)KV_CACHE_HIT_HALF_LIFE_SECONDS);
     return true;
 }
 
@@ -8956,6 +9060,36 @@ static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
         if (stable >= kc->opt.min_tokens) return stable;
     }
     return tokens;
+}
+
+static int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
+                                    const ds4_tokens *prompt,
+                                    int user_token_id,
+                                    int assistant_token_id) {
+    if (!prompt || user_token_id < 0 || assistant_token_id < 0) return -1;
+
+    /* Cold checkpoints are meant to maximize reuse across independent agent
+     * sessions.  The stable part of a rendered chat is everything before the
+     * user message that asks the model to do this specific task.  Some clients
+     * put stable user-role scaffolding first, for example Codex renders:
+     *
+     *   <｜User｜><environment_context>...</environment_context><｜User｜>task
+     *
+     * So use the last user marker before the first assistant marker, not the
+     * first one.  Stop at the first assistant marker so multi-turn histories do
+     * not turn old conversation content into low-value cold cache files; live
+     * and continued checkpoints cover same-session continuation instead.
+     *
+     * The returned value is a token prefix length and deliberately excludes the
+     * selected <｜User｜> token.  This is an exact special-token boundary, so the
+     * generic trim/align heuristic is not needed to avoid tokenizer merges. */
+    int last_user = -1;
+    for (int i = 0; i < prompt->len; i++) {
+        const int token = prompt->v[i];
+        if (token == assistant_token_id) break;
+        if (token == user_token_id) last_user = i;
+    }
+    return last_user >= kc->opt.min_tokens ? last_user : -1;
 }
 
 static int kv_cache_continued_step(const kv_disk_cache *kc) {
@@ -10693,14 +10827,14 @@ static void generate_job(server *s, job *j) {
          * the prior assistant call, there is no stateless prefix to match and
          * no disk key to search by. */
         ds4_tokens_free(&effective_prompt);
-        http_error(j->fd, 409,
+        http_error(j->fd, s->enable_cors, 409,
                    "Responses continuation state is not available; retry by replaying the full input history");
         return;
     } else if (cached == 0 && j->req.api == API_ANTHROPIC &&
                j->req.anthropic_requires_live_tool_state)
     {
         ds4_tokens_free(&effective_prompt);
-        http_error(j->fd, 409,
+        http_error(j->fd, s->enable_cors, 409,
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
         return;
     } else if (cached == 0) {
@@ -10764,6 +10898,12 @@ static void generate_job(server *s, job *j) {
         j->req.responses_requires_live_reasoning &&
         !responses_reasoning_state_preserved;
     const int prompt_tokens = prompt_for_sync->len;
+    /* OpenAI usage details: the reusable prefix is a cache read, while the
+     * effective prompt suffix evaluated by ds4_session_sync() is written into
+     * the live KV cache and can be reused by the next request. */
+    j->req.cache_read_tokens = cached;
+    j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
+
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
@@ -10835,7 +10975,11 @@ static void generate_job(server *s, job *j) {
         s->kv.opt.cold_max_tokens > 0 &&
         prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
     {
-        cold_store_len = kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
+                                                    ds4_token_user(s->engine),
+                                                    ds4_token_assistant(s->engine));
+        cold_store_len = anchor >= s->kv.opt.min_tokens ?
+                         anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -10862,7 +11006,7 @@ static void generate_job(server *s, job *j) {
             kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                                   cold_store_len);
             trace_event(s, trace_id, "prefill failed: %s", err);
-            http_error(j->fd, 500, err);
+            http_error(j->fd, s->enable_cors, 500, err);
             return;
         }
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
@@ -10882,7 +11026,7 @@ static void generate_job(server *s, job *j) {
         kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                               cold_store_len);
         trace_event(s, trace_id, "prefill failed: %s", err);
-        http_error(j->fd, 500, err);
+        http_error(j->fd, s->enable_cors, 500, err);
         return;
     }
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
@@ -10921,7 +11065,7 @@ static void generate_job(server *s, job *j) {
     const bool responses_live_chat = request_uses_responses_live_stream(&j->req);
     long responses_created_at = (long)time(NULL);
     if (j->req.stream) {
-        if (!sse_headers(j->fd)) {
+        if (!sse_headers(j->fd, s->enable_cors)) {
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s%s%s sse headers failed",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -11461,19 +11605,19 @@ static void generate_job(server *s, job *j) {
                        req_flags);
         }
     } else if (j->req.api == API_ANTHROPIC) {
-        anthropic_final_response(j->fd, &j->req, id,
+        anthropic_final_response(j->fd, s->enable_cors, &j->req, id,
                                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
                                  prompt_tokens, completion);
     } else if (j->req.api == API_RESPONSES) {
-        responses_final_response(j->fd, &j->req, id,
+        responses_final_response(j->fd, s->enable_cors, &j->req, id,
                                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
                                  prompt_tokens, completion);
     } else {
-        final_response(j->fd, &j->req, id,
+        final_response(j->fd, s->enable_cors, &j->req, id,
                        parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                        parsed_reasoning,
                        &parsed_calls, final_finish,
@@ -11721,7 +11865,7 @@ static bool send_model(server *s, int fd) {
     buf b = {0};
     append_model_json(&b, s);
     buf_putc(&b, '\n');
-    bool ok = http_response(fd, 200, "application/json", b.ptr);
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
@@ -11731,7 +11875,7 @@ static bool send_models(server *s, int fd) {
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
     append_model_json(&b, s);
     buf_puts(&b, "]}\n");
-    bool ok = http_response(fd, 200, "application/json", b.ptr);
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
@@ -11753,7 +11897,13 @@ static void *client_main(void *arg) {
 
     http_request hr = {0};
     if (!read_http_request(fd, &hr)) {
-        http_error(fd, 400, "bad HTTP request");
+        http_error(fd, s->enable_cors, 400, "bad HTTP request");
+        goto done;
+    }
+
+    if (!strcmp(hr.method, "OPTIONS")) {
+        http_response(fd, s->enable_cors, 204, NULL, "");
+        http_request_free(&hr);
         goto done;
     }
 
@@ -11796,18 +11946,18 @@ static void *client_main(void *arg) {
         ok = parse_completion_request(s->engine, hr.body, s->default_tokens,
                                       ctx_size, &req, err, sizeof(err));
     } else {
-        http_error(fd, 404, "unknown endpoint");
+        http_error(fd, s->enable_cors, 404, "unknown endpoint");
         http_request_free(&hr);
         goto done;
     }
     if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
     http_request_free(&hr);
     if (!ok) {
-        http_error(fd, 400, err);
+        http_error(fd, s->enable_cors, 400, err);
         goto done;
     }
     if (request_exceeds_context(&req, ctx_size)) {
-        http_error_context_length_exceeded(fd, &req, req.prompt.len, ctx_size);
+        http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);
         request_free(&req);
         goto done;
     }
@@ -11831,7 +11981,7 @@ static void *client_main(void *arg) {
     pthread_mutex_lock(&j.mu);
     if (!enqueue(s, &j)) {
         pthread_mutex_unlock(&j.mu);
-        http_error(fd, 503, "server shutting down");
+        http_error(fd, s->enable_cors, 503, "server shutting down");
         pthread_cond_destroy(&j.cv);
         pthread_mutex_destroy(&j.mu);
         request_free(&j.req);
@@ -11906,6 +12056,7 @@ typedef struct {
     bool kv_cache_reject_different_quant;
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
+    bool enable_cors;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -12029,6 +12180,8 @@ static void usage(FILE *fp) {
         "      Bind address. Default: 127.0.0.1\n"
         "  --port N\n"
         "      Bind port. Default: 8000\n"
+        "  --cors\n"
+        "      Add Access-Control-Allow-* headers for browser JS clients. Does not change --host.\n"
         "  --trace FILE\n"
         "      Write a human-readable session trace: prompts, cache decisions, output, tool calls.\n"
         "\n"
@@ -12164,6 +12317,8 @@ static server_config parse_options(int argc, char **argv) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--cors")) {
+            c.enable_cors = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
@@ -12261,6 +12416,7 @@ int main(int argc, char **argv) {
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
+    s.enable_cors = cfg.enable_cors;
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
@@ -12683,7 +12839,7 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] >= 0 && sv[1] >= 0) {
-        TEST_ASSERT(http_error_context_length_exceeded(sv[0], &r, 16, 16));
+        TEST_ASSERT(http_error_context_length_exceeded(sv[0], false, &r, 16, 16));
         shutdown(sv[0], SHUT_WR);
         char *out = read_socket_text(sv[1]);
         TEST_ASSERT(strstr(out, "HTTP/1.1 400") != NULL);
@@ -12704,7 +12860,7 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
 
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] >= 0 && sv[1] >= 0) {
-        TEST_ASSERT(http_error_context_length_exceeded(sv[0], &a, 20, 20));
+        TEST_ASSERT(http_error_context_length_exceeded(sv[0], false, &a, 20, 20));
         shutdown(sv[0], SHUT_WR);
         char *out = read_socket_text(sv[1]);
         TEST_ASSERT(strstr(out, "{\"type\":\"error\",\"error\"") != NULL);
@@ -12715,6 +12871,70 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
         close(sv[1]);
     }
     request_free(&a);
+}
+
+static void test_cors_headers_are_opt_in(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(http_response(sv[0], false, 200, "application/json", "{}"));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+        TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin") == NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(http_response(sv[0], true, 200, "application/json", "{}"));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+        TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin: *") != NULL);
+        TEST_ASSERT(strstr(out, "Access-Control-Allow-Methods: GET, POST, OPTIONS") != NULL);
+        TEST_ASSERT(strstr(out, "Access-Control-Allow-Headers: *") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
+static void test_cors_preflight_response_is_no_content(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    TEST_ASSERT(http_response(sv[0], true, 204, NULL, ""));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 204 No Content") != NULL);
+    TEST_ASSERT(strstr(out, "Content-Length: 0") != NULL);
+    TEST_ASSERT(strstr(out, "Content-Type:") == NULL);
+    TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin: *") != NULL);
+
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_cors_sse_headers(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    TEST_ASSERT(sse_headers(sv[0], true));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(strstr(out, "Content-Type: text/event-stream") != NULL);
+    TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin: *") != NULL);
+
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
 }
 
 static void test_anthropic_live_stream_sends_incremental_blocks(void) {
@@ -12861,6 +13081,56 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     close(sv[1]);
 }
 
+static void test_anthropic_usage_reports_cache_details(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.cache_read_tokens = 7;
+    r.cache_write_tokens = 3;
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+
+    TEST_ASSERT(anthropic_final_response(sv[0], false, &r, "msg_usage", "OK", NULL, NULL, "stop", 10, 2));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"usage\":{\"input_tokens\":0") != NULL);
+    TEST_ASSERT(strstr(out, "\"output_tokens\":2") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_read_input_tokens\":7") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_creation_input_tokens\":3") != NULL);
+
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_usage_stream", 10, &st));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "event: message_start") != NULL);
+    TEST_ASSERT(strstr(out, "\"usage\":{\"input_tokens\":0") != NULL);
+    TEST_ASSERT(strstr(out, "\"output_tokens\":0") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_read_input_tokens\":7") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_creation_input_tokens\":3") != NULL);
+
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+    request_free(&r);
+}
+
 static void test_openai_tool_stream_sends_incremental_text(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -12917,6 +13187,95 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
+}
+
+static void test_openai_stream_usage_reports_cache_details(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.stream_include_usage = true;
+    r.cache_read_tokens = 7;
+    r.cache_write_tokens = 3;
+
+    TEST_ASSERT(sse_done(sv[0], &r, "chatcmpl_usage", 10, 2));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"usage\":{\"prompt_tokens\":10") != NULL);
+    TEST_ASSERT(strstr(out, "\"completion_tokens\":2") != NULL);
+    TEST_ASSERT(strstr(out, "\"total_tokens\":12") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_tokens_details\":{") != NULL);
+    TEST_ASSERT(strstr(out, "\"cached_tokens\":7") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_write_tokens\":3") != NULL);
+    TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_responses_usage_reports_cache_details(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.cache_read_tokens = 7;
+    r.cache_write_tokens = 3;
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+
+    TEST_ASSERT(responses_final_response(sv[0], false, &r, "resp_usage", "OK", NULL, NULL,
+                                         "stop", 10, 2));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"usage\":{\"input_tokens\":10") != NULL);
+    TEST_ASSERT(strstr(out, "\"input_tokens_details\":{") != NULL);
+    TEST_ASSERT(strstr(out, "\"cached_tokens\":7") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_write_tokens\":3") != NULL);
+    TEST_ASSERT(strstr(out, "\"output_tokens\":2") != NULL);
+    TEST_ASSERT(strstr(out, "\"total_tokens\":12") != NULL);
+
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+
+    responses_stream st;
+    responses_stream_init(&r, &st);
+    TEST_ASSERT(responses_sse_completed(sv[0], &r, &st, NULL, NULL,
+                                        "stop", 10, 2, 1234));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"type\":\"response.completed\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"usage\":{\"input_tokens\":10") != NULL);
+    TEST_ASSERT(strstr(out, "\"input_tokens_details\":{") != NULL);
+    TEST_ASSERT(strstr(out, "\"cached_tokens\":7") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_write_tokens\":3") != NULL);
+    TEST_ASSERT(strstr(out, "\"output_tokens\":2") != NULL);
+    TEST_ASSERT(strstr(out, "\"total_tokens\":12") != NULL);
+
+    free(out);
+    responses_stream_free(&st);
+    close(sv[0]);
+    close(sv[1]);
+    request_free(&r);
 }
 
 static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
@@ -13452,6 +13811,34 @@ static void test_render_preserves_reasoning_with_tools(void) {
     TEST_ASSERT(strstr(prompt, "<think>tool reasoning</think>") != NULL);
     TEST_ASSERT(strstr(prompt, "<tool_result>/tmp</tool_result>") != NULL);
 
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_render_chat_prompt_text_renders_tools_before_system(void) {
+    /* The tool-schema block must sit at the head of the system region so the
+     * client's system content stays at the tail, right before <｜User｜>.
+     * That keeps a per-request dynamic tail (e.g. a timestamp) out of the
+     * cached prefix without losing the tool schemas to the trim. */
+    chat_msgs msgs = {0};
+    chat_msg sys = {0};
+    sys.role = xstrdup("system");
+    sys.content = xstrdup("CLIENT_SYSTEM_MARKER");
+    chat_msgs_push(&msgs, sys);
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("hello");
+    chat_msgs_push(&msgs, user);
+
+    char *prompt = render_chat_prompt_text(&msgs, "TOOL_SCHEMA_MARKER", NULL,
+                                           DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    const char *tools  = strstr(prompt, "## Tools");
+    const char *client = strstr(prompt, "CLIENT_SYSTEM_MARKER");
+    const char *user_m = strstr(prompt, "<｜User｜>");
+    TEST_ASSERT(tools && client && user_m);
+    TEST_ASSERT(tools  < client);
+    TEST_ASSERT(client < user_m);
     free(prompt);
     chat_msgs_free(&msgs);
 }
@@ -14937,6 +15324,65 @@ static void test_kv_cache_store_len_uses_configured_boundary(void) {
     TEST_ASSERT(kv_cache_store_len(&kc, 3500) == 3500);
 }
 
+static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
+    const int user = 9001;
+    const int assistant = 9002;
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    kc.opt.min_tokens = 4;
+
+    ds4_tokens codex = {0};
+    ds4_tokens_push(&codex, 1);     /* BOS / system */
+    ds4_tokens_push(&codex, 2);
+    ds4_tokens_push(&codex, user);  /* environment_context item */
+    ds4_tokens_push(&codex, 3);
+    ds4_tokens_push(&codex, 4);
+    ds4_tokens_push(&codex, user);  /* actual task starts here */
+    ds4_tokens_push(&codex, 5);
+    ds4_tokens_push(&codex, assistant);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &codex, user, assistant) == 5);
+
+    ds4_tokens claude = {0};
+    ds4_tokens_push(&claude, 1);
+    ds4_tokens_push(&claude, 2);
+    ds4_tokens_push(&claude, 3);
+    ds4_tokens_push(&claude, 4);
+    ds4_tokens_push(&claude, user); /* system reminder and task share a turn */
+    ds4_tokens_push(&claude, 5);
+    ds4_tokens_push(&claude, assistant);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &claude, user, assistant) == 4);
+
+    ds4_tokens_free(&codex);
+    ds4_tokens_free(&claude);
+}
+
+static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
+    const int user = 9001;
+    const int assistant = 9002;
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    kc.opt.min_tokens = 2;
+
+    ds4_tokens prompt = {0};
+    ds4_tokens_push(&prompt, 1);
+    ds4_tokens_push(&prompt, 2);
+    ds4_tokens_push(&prompt, user);      /* first task */
+    ds4_tokens_push(&prompt, 3);
+    ds4_tokens_push(&prompt, assistant); /* stop scanning here */
+    ds4_tokens_push(&prompt, 4);
+    ds4_tokens_push(&prompt, user);      /* later turn: not a cold anchor */
+    ds4_tokens_push(&prompt, 5);
+    ds4_tokens_push(&prompt, assistant);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == 2);
+
+    kc.opt.min_tokens = 3;
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == -1);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, -1, assistant) == -1);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, -1) == -1);
+
+    ds4_tokens_free(&prompt);
+}
+
 static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -15232,8 +15678,9 @@ static void test_kv_cache_eviction_values_fresh_snapshots(void) {
 
     const char *old_sha = "1111111111111111111111111111111111111111";
     const char *new_sha = "2222222222222222222222222222222222222222";
-    test_kv_stub_file(dir, old_sha, KV_REASON_UNKNOWN, 512, 0, 100, 4096);
-    test_kv_stub_file(dir, new_sha, KV_REASON_UNKNOWN, 2048, 0, 200, 2048);
+    uint64_t now = (uint64_t)time(NULL);
+    test_kv_stub_file(dir, old_sha, KV_REASON_UNKNOWN, 512, 0, now, 4096);
+    test_kv_stub_file(dir, new_sha, KV_REASON_UNKNOWN, 2048, 0, now, 2048);
 
     char old_name[44], new_name[44];
     snprintf(old_name, sizeof(old_name), "%.40s.kv", old_sha);
@@ -15267,8 +15714,9 @@ static void test_kv_cache_eviction_protects_current_store(void) {
 
     const char *old_sha = "1111111111111111111111111111111111111111";
     const char *new_sha = "2222222222222222222222222222222222222222";
-    test_kv_stub_file(dir, old_sha, KV_REASON_COLD, 4096, 0, 100, 2048);
-    test_kv_stub_file(dir, new_sha, KV_REASON_CONTINUED, 2048, 0, 200, 4096);
+    uint64_t now = (uint64_t)time(NULL);
+    test_kv_stub_file(dir, old_sha, KV_REASON_COLD, 4096, 0, now, 2048);
+    test_kv_stub_file(dir, new_sha, KV_REASON_CONTINUED, 2048, 0, now, 4096);
 
     char old_name[44], new_name[44];
     snprintf(old_name, sizeof(old_name), "%.40s.kv", old_sha);
@@ -15302,8 +15750,9 @@ static void test_kv_cache_eviction_does_not_protect_oversize_current_store(void)
 
     const char *old_sha = "1111111111111111111111111111111111111111";
     const char *new_sha = "2222222222222222222222222222222222222222";
-    test_kv_stub_file(dir, old_sha, KV_REASON_COLD, 4096, 0, 100, 1024);
-    test_kv_stub_file(dir, new_sha, KV_REASON_CONTINUED, 4096, 0, 200, 4096);
+    uint64_t now = (uint64_t)time(NULL);
+    test_kv_stub_file(dir, old_sha, KV_REASON_COLD, 4096, 0, now, 1024);
+    test_kv_stub_file(dir, new_sha, KV_REASON_CONTINUED, 4096, 0, now, 4096);
 
     char old_name[44], new_name[44];
     snprintf(old_name, sizeof(old_name), "%.40s.kv", old_sha);
@@ -15329,6 +15778,63 @@ static void test_kv_cache_eviction_does_not_protect_oversize_current_store(void)
     rmdir(dir);
 }
 
+static void test_kv_cache_eviction_score_decays_stale_hits(void) {
+    /* stale: lower tokens-per-byte (e.g. tool-heavy prompt) but boosted by
+     * 10 hits well in the past.  fresh: higher tokens-per-byte and zero hits,
+     * just stored.  The stale hit bonus decays by inactivity, so fresh wins on
+     * its better baseline even though stale once had more successful hits. */
+    const uint64_t now = 1000u + 14u * KV_CACHE_HIT_HALF_LIFE_SECONDS;
+    kv_entry stale = {.tokens = 1024, .hits = 10, .file_size = 4096, .last_used = 1000};
+    kv_entry fresh = {.tokens = 2048, .hits = 0,  .file_size = 4096, .last_used = now};
+
+    double s_on = kv_entry_eviction_score(&stale, NULL, NULL, now);
+    double f_on = kv_entry_eviction_score(&fresh, NULL, NULL, now);
+    TEST_ASSERT(s_on < f_on);
+
+    /* A fresh entry's score never decays below its (0+1) * tokens/size floor,
+     * regardless of how old another entry's hit history is. */
+    TEST_ASSERT(f_on == 1.0 * (double)fresh.tokens / (double)fresh.file_size);
+}
+
+static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
+    char tmpl[] = "/tmp/ds4-kv-stale-hit-evict-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *old_sha = "1111111111111111111111111111111111111111";
+    const char *new_sha = "2222222222222222222222222222222222222222";
+    uint64_t now = (uint64_t)time(NULL);
+    uint64_t stale = now > KV_CACHE_HIT_HALF_LIFE_SECONDS * 14ull
+        ? now - KV_CACHE_HIT_HALF_LIFE_SECONDS * 14ull
+        : 1;
+    test_kv_stub_file(dir, old_sha, KV_REASON_COLD, 2048, 15, stale, 2048);
+    test_kv_stub_file(dir, new_sha, KV_REASON_COLD, 2048, 0, now, 2048);
+
+    char old_name[44], new_name[44];
+    snprintf(old_name, sizeof(old_name), "%.40s.kv", old_sha);
+    snprintf(new_name, sizeof(new_name), "%.40s.kv", new_sha);
+    char *old_path = path_join(dir, old_name);
+    char *new_path = path_join(dir, new_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
+    kv_cache_evict(&kc, NULL, NULL);
+
+    TEST_ASSERT(access(old_path, F_OK) != 0);
+    TEST_ASSERT(access(new_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(old_path);
+    unlink(new_path);
+    free(old_path);
+    free(new_path);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     char tmpl[] = "/tmp/ds4-kv-live-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -15337,8 +15843,9 @@ static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
 
     const char *cold_sha = "1111111111111111111111111111111111111111";
     const char *continued_sha = "2222222222222222222222222222222222222222";
-    test_kv_stub_file(dir, cold_sha, KV_REASON_COLD, 512, 0, 200, 2048);
-    test_kv_stub_file(dir, continued_sha, KV_REASON_CONTINUED, 2048, 0, 300, 2048);
+    uint64_t now = (uint64_t)time(NULL);
+    test_kv_stub_file(dir, cold_sha, KV_REASON_COLD, 512, 0, now, 2048);
+    test_kv_stub_file(dir, continued_sha, KV_REASON_CONTINUED, 2048, 0, now, 2048);
 
     char cold_name[44], continued_name[44];
     snprintf(cold_name, sizeof(cold_name), "%.40s.kv", cold_sha);
@@ -15634,6 +16141,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
+    test_render_chat_prompt_text_renders_tools_before_system();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
     test_tool_schema_order_from_responses_tool_search();
@@ -15647,9 +16155,15 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
     test_context_length_error_uses_protocol_standard_shape();
+    test_cors_headers_are_opt_in();
+    test_cors_preflight_response_is_no_content();
+    test_cors_sse_headers();
     test_anthropic_live_stream_sends_incremental_blocks();
+    test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
+    test_openai_stream_usage_reports_cache_details();
+    test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
@@ -15701,6 +16215,8 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
     test_kv_cache_store_len_uses_configured_boundary();
+    test_kv_cache_chat_anchor_uses_last_user_before_assistant();
+    test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
@@ -15709,6 +16225,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_protects_current_store();
     test_kv_cache_eviction_does_not_protect_oversize_current_store();
+    test_kv_cache_eviction_score_decays_stale_hits();
+    test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
 }
 
