@@ -1,19 +1,28 @@
 # DwarfStar 4 with M5 optimizations
 
 **Apple M5 performance note:** on an Apple M5 Max with 128 GB RAM, this fork's
-`main` branch is substantially faster than `antirez/main` in a single-run Metal
-`ds4-bench` sweep using `ds4flash.gguf`, `speed-bench/promessi_sposi.txt`,
-contexts 2048-8192, 2048-token steps, and 64 generated tokens.
+`main` branch is roughly even with `antirez/main` on prefill and faster on
+generation in a single-run Metal `ds4-bench` sweep using `ds4flash.gguf`,
+`speed-bench/promessi_sposi.txt`, contexts 2048-8192, 2048-token steps, and 64
+generated tokens (today, 2026-05-16, post-PR-#15 layer-40..42 routed-MoE
+Tensor default).
 
-Geometric-mean speedup across the measured frontiers is **2.09x prefill**
-and **1.54x generation**.
+Geometric-mean speedup across the measured frontiers is **1.00x prefill**
+and **1.12x generation**.
 
-| Context | main prefill | m5+Tensor prefill | Prefill uplift | main gen | m5 gen | Gen uplift |
+| Context | antirez/main prefill | m5+Tensor prefill | Prefill uplift | antirez/main gen | m5 gen | Gen uplift |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2048 | 188.46 t/s | 412.34 t/s | +118.8% | 20.43 t/s | 35.72 t/s | +74.8% |
-| 4096 | 168.54 t/s | 370.04 t/s | +119.6% | 20.89 t/s | 32.25 t/s | +54.4% |
-| 6144 | 175.20 t/s | 365.62 t/s | +108.7% | 21.73 t/s | 31.42 t/s | +44.6% |
-| 8192 | 182.32 t/s | 348.01 t/s | +90.9% | 22.12 t/s | 31.94 t/s | +44.4% |
+| 2048 | 349.51 t/s | 353.27 t/s | +1.1% | 30.13 t/s | 35.45 t/s | +17.7% |
+| 4096 | 314.16 t/s | 323.13 t/s | +2.9% | 29.61 t/s | 32.05 t/s | +8.2% |
+| 6144 | 303.98 t/s | 305.40 t/s | +0.5% | 28.80 t/s | 31.42 t/s | +9.1% |
+| 8192 | 301.01 t/s | 293.67 t/s | -2.4% | 28.90 t/s | 32.19 t/s | +11.4% |
+
+Earlier revisions of this table (with ~2x prefill uplift) reflected a prior
+all-layer routed-MoE Tensor window. That window was narrowed to layer 40..42
+in PR #15 follow-up after deterministic `ds4-eval` drift was traced to wider
+windows; the wide profile remains reachable via `DS4_METAL_MPP_FAST=1`,
+`-mt on`, or per-route `DS4_METAL_MPP_MOE_*_ENABLE`. See the Metal 4 section
+below for the drift gate and the broader 512..16384 context sweep.
 
 This fork includes M5-specific `metal_simdgroup_matrix` optimization for
 dense prefill/routed-MoE matmul kernels and GPU-private scratch buffers for hot
