@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
+#include "ds4.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1578,6 +1579,10 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
         (void)cublasSetMathMode(g_cublas, math_mode);
     }
 }
+
+extern "C" void ds4_gpu_set_mpp_mode(ds4_mpp_mode mode) { (void)mode; }
+extern "C" void ds4_gpu_set_mpp_compare_context(const char *module, uint32_t layer_index, uint32_t pos0) { (void)module; (void)layer_index; (void)pos0; }
+extern "C" void ds4_gpu_clear_mpp_compare_context(void) { }
 
 __global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -5880,6 +5885,9 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
 extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size, weight_offset,
                                            in_dim, out_dim, x, n_tok, "q8_0");
+}
+extern "C" int ds4_gpu_matmul_q8_0_mpp_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    return ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok);
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
