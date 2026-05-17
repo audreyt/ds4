@@ -10,15 +10,15 @@ IQ2XXS quant: `antirez/main` against
 and this fork against the abliterated, ds4-aligned IQ2XXS variant
 `cyberneurova-DeepSeek-V4-Flash-abliterated-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-aligned.gguf`.
 
-Geometric-mean speedup across the measured frontiers is **1.11x prefill**
-and **1.13x generation**.
+Geometric-mean speedup across the measured frontiers is **1.16x prefill**
+and **1.15x generation**.
 
 | Context | antirez/main prefill | m5+Tensor prefill | Prefill uplift | antirez/main gen | m5 gen | Gen uplift |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2048 | 328.76 t/s | 370.67 t/s | +12.7% | 30.23 t/s | 36.02 t/s | +19.2% |
-| 4096 | 306.58 t/s | 339.62 t/s | +10.8% | 29.30 t/s | 32.47 t/s | +10.8% |
-| 6144 | 302.07 t/s | 328.80 t/s |  +8.9% | 29.29 t/s | 32.65 t/s | +11.5% |
-| 8192 | 302.44 t/s | 333.67 t/s | +10.3% | 29.20 t/s | 31.76 t/s |  +8.8% |
+| 2048 | 328.76 t/s | 392.45 t/s | +19.4% | 30.23 t/s | 37.33 t/s | +23.5% |
+| 4096 | 306.58 t/s | 357.27 t/s | +16.5% | 29.30 t/s | 33.97 t/s | +15.9% |
+| 6144 | 302.07 t/s | 351.67 t/s | +16.4% | 29.29 t/s | 32.97 t/s | +12.6% |
+| 8192 | 302.44 t/s | 336.36 t/s | +11.2% | 29.20 t/s | 32.10 t/s |  +9.9% |
 
 This fork includes M5-specific `metal_simdgroup_matrix` optimization for
 dense prefill/routed-MoE matmul kernels and GPU-private scratch buffers for hot
@@ -183,8 +183,8 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | MacBook Pro M3 Max, 128 GB | q2 | 11709 tokens | 250.11 t/s | 21.47 t/s |
 | MacBook Pro M3 Max, 128 GB | q4 | short | N/A | N/A |
 | MacBook Pro M3 Max, 128 GB | q4 | long | N/A | N/A |
-| MacBook Pro M5 Max, 128 GB | q2 | short | 87.25 t/s | 34.27 t/s |
-| MacBook Pro M5 Max, 128 GB | q2 | 11707 tokens | 463.44 t/s | 25.90 t/s |
+| MacBook Pro M5 Max, 128 GB | q2 | short | 86.02 t/s | 37.98 t/s |
+| MacBook Pro M5 Max, 128 GB | q2 | 11707 tokens | 348.22 t/s | 32.01 t/s |
 | Mac Studio M3 Ultra, 512 GB | q2 | short | 84.43 t/s | 36.86 t/s |
 | Mac Studio M3 Ultra, 512 GB | q2 | 11709 tokens | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
