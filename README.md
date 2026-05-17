@@ -1,28 +1,34 @@
 # DwarfStar 4 with M5 optimizations
 
 **Apple M5 performance note:** on an Apple M5 Max with 128 GB RAM, this fork's
-`main` branch is roughly even with `antirez/main` on prefill and faster on
-generation in a single-run Metal `ds4-bench` sweep using `ds4flash.gguf`,
-`speed-bench/promessi_sposi.txt`, contexts 2048-8192, 2048-token steps, and 64
-generated tokens (today, 2026-05-16, post-PR-#15 layer-40..42 routed-MoE
-Tensor default).
+`main` branch is roughly even with `antirez/main` on prefill at short
+contexts (with a small win at ctx 2048-4096 and a small loss at ctx
+6144-8192), and consistently faster on generation. Measured with a
+single-run Metal `ds4-bench` sweep using `speed-bench/promessi_sposi.txt`,
+contexts 2048-8192, 2048-token steps, and 64 generated tokens (today,
+2026-05-16, post-PR-#15 layer-40..42 routed-MoE Tensor default). Each fork
+is benched against its own preferred IQ2XXS quant: `antirez/main` against
+`DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`
+and this fork against the abliterated, ds4-aligned IQ2XXS variant
+`cyberneurova-DeepSeek-V4-Flash-abliterated-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-aligned.gguf`.
 
 Geometric-mean speedup across the measured frontiers is **1.00x prefill**
-and **1.12x generation**.
+and **1.10x generation**.
 
 | Context | antirez/main prefill | m5+Tensor prefill | Prefill uplift | antirez/main gen | m5 gen | Gen uplift |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2048 | 349.51 t/s | 353.27 t/s | +1.1% | 30.13 t/s | 35.45 t/s | +17.7% |
-| 4096 | 314.16 t/s | 323.13 t/s | +2.9% | 29.61 t/s | 32.05 t/s | +8.2% |
-| 6144 | 303.98 t/s | 305.40 t/s | +0.5% | 28.80 t/s | 31.42 t/s | +9.1% |
-| 8192 | 301.01 t/s | 293.67 t/s | -2.4% | 28.90 t/s | 32.19 t/s | +11.4% |
+| 2048 | 334.99 t/s | 356.67 t/s | +6.5% | 30.01 t/s | 36.38 t/s | +21.2% |
+| 4096 | 315.37 t/s | 335.25 t/s | +6.3% | 29.67 t/s | 33.02 t/s | +11.3% |
+| 6144 | 313.34 t/s | 304.90 t/s | -2.7% | 30.11 t/s | 31.36 t/s | +4.2% |
+| 8192 | 318.39 t/s | 288.51 t/s | -9.4% | 29.97 t/s | 30.88 t/s | +3.0% |
 
 Earlier revisions of this table (with ~2x prefill uplift) reflected a prior
-all-layer routed-MoE Tensor window. That window was narrowed to layer 40..42
-in PR #15 follow-up after deterministic `ds4-eval` drift was traced to wider
-windows; the wide profile remains reachable via `DS4_METAL_MPP_FAST=1`,
-`-mt on`, or per-route `DS4_METAL_MPP_MOE_*_ENABLE`. See the Metal 4 section
-below for the drift gate and the broader 512..16384 context sweep.
+all-layer routed-MoE Tensor window benchmarked against an older model
+file. The window was narrowed to layer 40..42 in PR #15 follow-up after
+deterministic `ds4-eval` drift was traced to wider windows; the wide
+profile remains reachable via `DS4_METAL_MPP_FAST=1`, `-mt on`, or
+per-route `DS4_METAL_MPP_MOE_*_ENABLE`. See the Metal 4 section below for
+the drift gate and the broader 512..16384 context sweep.
 
 This fork includes M5-specific `metal_simdgroup_matrix` optimization for
 dense prefill/routed-MoE matmul kernels and GPU-private scratch buffers for hot
