@@ -1,34 +1,24 @@
 # DwarfStar 4 with M5 optimizations
 
 **Apple M5 performance note:** on an Apple M5 Max with 128 GB RAM, this fork's
-`main` branch is roughly even with `antirez/main` on prefill at short
-contexts (with a small win at ctx 2048-4096 and a small loss at ctx
-6144-8192), and consistently faster on generation. Measured with a
-single-run Metal `ds4-bench` sweep using `speed-bench/promessi_sposi.txt`,
-contexts 2048-8192, 2048-token steps, and 64 generated tokens (today,
-2026-05-16, post-PR-#15 layer-40..42 routed-MoE Tensor default). Each fork
-is benched against its own preferred IQ2XXS quant: `antirez/main` against
+`main` branch is faster than `antirez/main` on both prefill and generation
+in a single-run Metal `ds4-bench` sweep using
+`speed-bench/promessi_sposi.txt`, contexts 2048-8192, 2048-token steps,
+and 64 generated tokens. Each fork is benched against its own preferred
+IQ2XXS quant: `antirez/main` against
 `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`
 and this fork against the abliterated, ds4-aligned IQ2XXS variant
 `cyberneurova-DeepSeek-V4-Flash-abliterated-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-aligned.gguf`.
 
-Geometric-mean speedup across the measured frontiers is **1.00x prefill**
-and **1.10x generation**.
+Geometric-mean speedup across the measured frontiers is **1.11x prefill**
+and **1.13x generation**.
 
 | Context | antirez/main prefill | m5+Tensor prefill | Prefill uplift | antirez/main gen | m5 gen | Gen uplift |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2048 | 334.99 t/s | 356.67 t/s | +6.5% | 30.01 t/s | 36.38 t/s | +21.2% |
-| 4096 | 315.37 t/s | 335.25 t/s | +6.3% | 29.67 t/s | 33.02 t/s | +11.3% |
-| 6144 | 313.34 t/s | 304.90 t/s | -2.7% | 30.11 t/s | 31.36 t/s | +4.2% |
-| 8192 | 318.39 t/s | 288.51 t/s | -9.4% | 29.97 t/s | 30.88 t/s | +3.0% |
-
-Earlier revisions of this table (with ~2x prefill uplift) reflected a prior
-all-layer routed-MoE Tensor window benchmarked against an older model
-file. The window was narrowed to layer 40..42 in PR #15 follow-up after
-deterministic `ds4-eval` drift was traced to wider windows; the wide
-profile remains reachable via `DS4_METAL_MPP_FAST=1`, `-mt on`, or
-per-route `DS4_METAL_MPP_MOE_*_ENABLE`. See the Metal 4 section below for
-the drift gate and the broader 512..16384 context sweep.
+| 2048 | 328.76 t/s | 370.67 t/s | +12.7% | 30.23 t/s | 36.02 t/s | +19.2% |
+| 4096 | 306.58 t/s | 339.62 t/s | +10.8% | 29.30 t/s | 32.47 t/s | +10.8% |
+| 6144 | 302.07 t/s | 328.80 t/s |  +8.9% | 29.29 t/s | 32.65 t/s | +11.5% |
+| 8192 | 302.44 t/s | 333.67 t/s | +10.3% | 29.20 t/s | 31.76 t/s |  +8.8% |
 
 This fork includes M5-specific `metal_simdgroup_matrix` optimization for
 dense prefill/routed-MoE matmul kernels and GPU-private scratch buffers for hot
@@ -338,13 +328,13 @@ path is available, and `-mt off` for the legacy Metal reference path. The old
 `--mpp` spelling remains accepted as a compatibility alias. Auto currently
 enables the F16 compressor Tensor path, enables attention-output low Tensor in
 all layers, and runs routed-MoE Tensor only in the q1..q4-token-count-safe late
-window from layer 40 through layer 42 while preserving same-top1/same-greedy
-agreement. Wider routed-MoE windows caused deterministic `ds4-eval` generation
-drift, so the earlier conservative 12/15 layer window is now reachable only via
-explicit route enables (`DS4_METAL_MPP_MOE_*_ENABLE`), `DS4_METAL_MPP_FAST=1`,
-or `-mt on`. The dense Q8_0 prefill Tensor route is **default-off on M5**
-because bisection traced the entire `-mt auto` vs `-mt off` drift on M5 Max to
-that single route; it stays default-on for pre-M5 devices, where it uses the
+windows — gate/down from layer 35 and up from layer 36 — while preserving
+same-top1/same-greedy agreement. Wider routed-MoE windows caused deterministic
+`ds4-eval` generation drift, so earlier MoE Tensor layers stay behind explicit
+route enables (`DS4_METAL_MPP_MOE_*_ENABLE`), `DS4_METAL_MPP_FAST=1`, or
+`-mt on`. The dense Q8_0 prefill Tensor route is **default-off on M5** because
+bisection traced the entire `-mt auto` vs `-mt off` drift on M5 Max to that
+single route; it stays default-on for pre-M5 devices, where it uses the
 late-safe `attn_q_b` 32..37 plus all-Q8 38..42 window. Opt back in on M5 with
 `DS4_METAL_MPP_Q8_0_ENABLE=1`.
 
@@ -447,42 +437,31 @@ route disables, comparator, and stage profiler still apply.
 
 Current Tensor route status balances drift with prefill throughput: `auto`
 enables F16 compressor, attention-output low projection, and routed-MoE Tensor
-in the late layer 40..42 window. Attention-output low projection is enabled for
-all layers by default. The previous routed-MoE conservative window, down from
-layer 12 and gate/up from layer 15, remains available only through explicit MoE
-route enables or forced Tensor mode because it changes deterministic
-`ds4-eval` q1..q4 generation lengths. The late default window recovers part of
-the routed-MoE prefill speedup while keeping the normal decode path aligned with
-the q1..q4 token-count baseline. The attention-output low Tensor kernels stage
-activation tiles through half to match the legacy Metal matmul input path, which
-removes the first attention-output comparator breach. The current auto policy
-uses direct-RHS Tensor inputs and 64-token tiles for attention-output low
-projections. The F16 compressor route did not introduce measurable drift in the
-current prompt set. The dense Q8_0 prefill route stays default-off on M5; this
-keeps the M5 auto profile aligned with `-mt off` decode while the narrower MoE
-window is being benchmarked.
+in late route-specific windows: gate/down from layer 35 and up from layer 36.
+Attention-output low projection is enabled for all layers by default. The
+previous routed-MoE conservative window, down from layer 12 and gate/up from
+layer 15, remains available only through explicit MoE route enables or forced
+Tensor mode because it changes deterministic `ds4-eval` q1..q4 generation
+lengths. The attention-output low Tensor kernels stage activation tiles through
+half to match the legacy Metal matmul input path, which removes the first
+attention-output comparator breach. The current auto policy uses direct-RHS
+Tensor inputs and 64-token tiles for attention-output low projections. The F16
+compressor route did not introduce measurable drift in the current prompt set.
+The dense Q8_0 prefill route stays default-off on M5.
 
-Under the layer-40..42 routed-MoE default, the local M5 Max
-`--metal-tensor-equivalence` diagnostic against `-mt off` reports
-same-top1/same-greedy agreement on all five fixtures with minimum top-5
-overlap `5/5`, top-20 overlap `20/20` across every fixture (no rank
-displacement), `worst_rms ~= 0.0026`, and `worst_top20_max_abs ~= 0.0151`
-(three short fixtures are bit-exact; the residual drift is on the two
-long-context fixtures and comes from the F16/attn-out routes compounding
-through 43 layers). The narrower MoE Tensor window cuts roughly 25× off the
-prior worst-case drift envelope.
+Under this routed-MoE default, the local M5 Max `--metal-tensor-equivalence`
+diagnostic against `-mt off` reports same-top1/same-greedy agreement on all
+five fixtures with minimum top-5 overlap `5/5`, top-20 overlap `20/20` across
+every fixture (no rank displacement), `worst_rms ~= 0.0186`, and
+`worst_top20_max_abs ~= 0.053`.
 
-In a fresh local M5 Max `ds4-bench` sweep with `--gen-tokens 128`, this auto
-profile (`-mt auto`) sampled prefill at `239/266/258/293/280` tokens/sec for
-`512/2048/4096/8192/16384`-token contexts, versus `235/258/265/292/280` t/s
-for standard Metal (`-mt off`) and `222/294/292/284/258` t/s for `--quality`.
-Prefill is now essentially within noise of `-mt off`: the prior all-layer
-routed-MoE prefill win was the cost of admitting the higher MoE Tensor drift,
-and was retracted along with it. Generation tokens/sec tracks `-mt off`
-across the sweep (`34.2` t/s at 512, `30.1` at 4096, `29.8` at 16384) and
-beats `--quality` on the three longest contexts (`+2.2/+3.4/+3.9` t/s at
-4096/8192/16384). Numbers are from one desktop run on a quiet machine; full
-sweeps still show visible desktop-load variance.
+In a local M5 Max `ds4-bench` sweep with `--gen-tokens 128`, this auto profile
+(`-mt auto`) sampled prefill at `273/333/329/351/341` tokens/sec for
+`512/2048/4096/8192/16384`-token contexts, versus `259/322/328/328/329` t/s
+for standard Metal (`-mt off`) and `252/308/326/336/319` t/s for `--quality`.
+Generation tokens/sec at the same frontiers was `36.0/35.4/32.0/32.5/31.4`
+for `-mt auto`, tracking standard Metal within noise and beating `--quality`
+on the three longest contexts.
 
 The `DS4_METAL_MPP_FAST=1` profile is the measured high-throughput diagnostic
 profile under the relaxed same-top1/same-greedy gate. In the current prompt
@@ -506,11 +485,12 @@ but gives up the strongest long-context prefill gains and has a -2.7%
 generation point at 65k. Neither variant is promoted to the default policy; use
 them only for explicit eval runs.
 
-The routed-MoE Tensor projections are enabled by default from layer 40 for gate,
-up, and down. Use `DS4_METAL_MPP_MOE_ENABLE=1`, route-specific enables,
-`DS4_METAL_MPP_FAST=1`, or `-mt on` to test wider windows; the previous
-conservative window starts at layer 12 for down and layer 15 for gate/up when
-routed-MoE Tensor is explicitly widened. For route isolation, use
+The routed-MoE Tensor projections are enabled by default from layer 35 for gate
+and down, and from layer 36 for up. Use `DS4_METAL_MPP_MOE_ENABLE=1`,
+route-specific enables, `DS4_METAL_MPP_FAST=1`, or `-mt on` to test wider
+windows; the previous conservative window starts at layer 12 for down and layer
+15 for gate/up when routed-MoE Tensor is explicitly widened. For route
+isolation, use
 `DS4_METAL_MPP_MOE_GATE_ENABLE/DISABLE`,
 `DS4_METAL_MPP_MOE_UP_ENABLE/DISABLE`, and
 `DS4_METAL_MPP_MOE_DOWN_ENABLE/DISABLE`; `DS4_METAL_MPP_MOE_DISABLE=1`
