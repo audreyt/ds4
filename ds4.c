@@ -10559,6 +10559,9 @@ static void output_logits_one_decode_scratch(
 
 #ifndef DS4_NO_GPU
 static int sample_argmax(const float *logits, uint32_t n_vocab);
+int dspark_sample_draft_token(const float *logits, uint32_t vocab,
+                              float temperature, uint64_t *rng,
+                              float *scratch);
 
 /* =========================================================================
  * Metal Reference Comparison Helpers.
@@ -20329,7 +20332,9 @@ static bool metal_graph_eval_dspark_draft_block(
         int                    *draft_n,
         uint32_t               *base_real_out,
         float                  *last_logits,
-        float                  *all_draft_logits) {
+        float                  *all_draft_logits,
+        float                   draft_temperature,
+        uint64_t               *draft_rng) {
     if (draft_n) *draft_n = 0;
     if (base_real_out) *base_real_out = 0;
     if (!g || !target_model || !target_weights || !dspark_model || !mtp ||
@@ -20390,6 +20395,7 @@ static bool metal_graph_eval_dspark_draft_block(
 
     const uint64_t row_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
     float *row_logits = xmalloc((size_t)row_bytes);
+    float *draft_scratch = draft_temperature > 0.0f ? xmalloc((size_t)row_bytes) : NULL;
     for (uint32_t i = 0; ok && i < block_size; i++) {
         ok = ds4_gpu_tensor_read(g->spec_logits,
                                  (uint64_t)i * row_bytes,
@@ -20398,7 +20404,9 @@ static bool metal_graph_eval_dspark_draft_block(
         if (!ok) break;
         const int prev = i == 0 ? anchor_token : drafts[i - 1u];
         dspark_apply_markov_bias(row_logits, dspark_model, mtp, prev);
-        drafts[i] = sample_argmax(row_logits, DS4_N_VOCAB);
+        drafts[i] = draft_temperature > 0.0f
+            ? dspark_sample_draft_token(row_logits, DS4_N_VOCAB, draft_temperature, draft_rng, draft_scratch)
+            : sample_argmax(row_logits, DS4_N_VOCAB);
         if (all_draft_logits) {
             memcpy(all_draft_logits + (uint64_t)i * DS4_N_VOCAB, row_logits, (size_t)row_bytes);
         }
@@ -20407,6 +20415,7 @@ static bool metal_graph_eval_dspark_draft_block(
         }
     }
     free(row_logits);
+    free(draft_scratch);
     if (!ok) return false;
     *draft_n = (int)block_size;
     return true;
@@ -23779,6 +23788,25 @@ static int b2_sample_from_log_probs(const float *log_probs, uint32_t vocab,
     return (int)(vocab - 1);
 }
 
+/* Sample one token from the temperature-scaled softmax of `logits` (full
+ * vocab, no top-k/top-p truncation) using the xorshift64* state in `*rng`.
+ * `scratch` must point to a caller-owned buffer of `vocab` floats (reused
+ * across calls to avoid hot-path allocation); its contents are clobbered.
+ * Used to draw the DSpark draft proposal from the drafter distribution q
+ * when B2 mode is active, so the B2 accept/reject math below (which assumes
+ * proposals are actually samples from q, not argmax picks) is valid. */
+int dspark_sample_draft_token(const float *logits, uint32_t vocab,
+                              float temperature, uint64_t *rng,
+                              float *scratch) {
+    if (temperature <= 0.0f) return sample_argmax(logits, vocab);
+    const float inv_temp = 1.0f / temperature;
+    for (uint32_t i = 0; i < vocab; i++) {
+        scratch[i] = logits[i] * inv_temp;
+    }
+    b2_log_softmax(scratch, vocab, scratch);
+    return b2_sample_from_log_probs(scratch, vocab, rng);
+}
+
 /* Sample from the residual distribution max(0, target_prob - draft_prob).
  * Both inputs are log-probability vectors. */
 static int b2_sample_residual(const float *log_target, const float *log_draft,
@@ -23836,7 +23864,7 @@ typedef struct {
  * temperature:   sampling temperature (<=0 falls back to argmax matching)
  * rng:           pointer to xorshift64* state (mutated)
  */
-static b2_result b2_rejection_sample(
+b2_result b2_rejection_sample(
     const int   *draft_tokens,
     const float *draft_logits,
     const float *target_logits,
@@ -24577,6 +24605,7 @@ struct ds4_session {
     int dspark_draft_count;
     uint32_t dspark_draft_base_real;
     float *dspark_b2_draft_logits;   /* [block_size * DS4_N_VOCAB] post-markov-bias logits for B2 */
+    float dspark_b2_temp;            /* DS4_SPEC_TEMP resolved once at session create */
     uint64_t dspark_b2_rng;          /* xorshift64* state for B2 rejection sampling (persisted across calls) */
     int dspark_prev_accepted;        /* previous cycle accepted count (for adaptive block size) */
     int dspark_prev_drafted;         /* previous cycle drafted count */
@@ -28104,12 +28133,27 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (ds4_engine_has_mtp(e)) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
         s->mtp_draft_token = -1;
-        /* Allocate B2 draft logits buffer when DS4_SPEC_TEMP is set and DSpark is active. */
-        if (e->mtp_weights.kind == DS4_MTP_DRAFT_DSPARK && getenv("DS4_SPEC_TEMP")) {
+        s->dspark_b2_temp = 0.0f;
+        const char *spec_temp_env = getenv("DS4_SPEC_TEMP");
+        if (spec_temp_env && spec_temp_env[0]) {
+            char *end = NULL;
+            float v = strtof(spec_temp_env, &end);
+            if (end != spec_temp_env && v > 0.0f) s->dspark_b2_temp = v;
+        }
+        if (e->mtp_weights.kind == DS4_MTP_DRAFT_DSPARK && s->dspark_b2_temp > 0.0f) {
             const uint32_t block_size = e->mtp_weights.dspark.block_size > 0
                 ? e->mtp_weights.dspark.block_size : 16;
             s->dspark_b2_draft_logits = xmalloc(
                 (size_t)block_size * DS4_N_VOCAB * sizeof(float));
+            const char *seed_env = getenv("DS4_SPEC_RNG_SEED");
+            if (seed_env && seed_env[0]) {
+                s->dspark_b2_rng = (uint64_t)strtoull(seed_env, NULL, 0);
+            }
+            if (s->dspark_b2_rng == 0) {
+                s->dspark_b2_rng = (uint64_t)time(NULL) ^
+                                   ((uint64_t)getpid() << 32) ^
+                                   (uint64_t)clock();
+            }
         }
     }
     if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
@@ -29167,7 +29211,9 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                                     &draft_n,
                                                     &base_real,
                                                     getenv("DS4_MTP_FULL_LOGITS") ? s->mtp_logits : NULL,
-                                                    s->dspark_b2_draft_logits)) {
+                                                    s->dspark_b2_draft_logits,
+                                                    s->dspark_b2_temp,
+                                                    &s->dspark_b2_rng)) {
                 s->dspark_draft_count = draft_n;
                 s->dspark_draft_base_real = base_real;
                 s->mtp_draft_token = draft_n > 0 ? s->dspark_draft_tokens[0] : -1;
@@ -29305,24 +29351,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
          * ARDD adversarial review fix: RNG state persisted in session struct
          * (not reseeded per call) to avoid correlated random sequences when
          * multiple speculative eval calls happen within the same second. */
-        float b2_temp = 0.0f;
-        const char *spec_temp_env = getenv("DS4_SPEC_TEMP");
-        if (spec_temp_env && spec_temp_env[0]) {
-            char *end = NULL;
-            float v = strtof(spec_temp_env, &end);
-            if (end != spec_temp_env && v > 0.0f) b2_temp = v;
-        }
-        if (b2_temp > 0.0f && s->dspark_b2_rng == 0) {
-            const char *seed_env = getenv("DS4_SPEC_RNG_SEED");
-            if (seed_env && seed_env[0]) {
-                s->dspark_b2_rng = (uint64_t)strtoull(seed_env, NULL, 0);
-            }
-            if (s->dspark_b2_rng == 0) {
-                s->dspark_b2_rng = (uint64_t)time(NULL) ^
-                                   ((uint64_t)getpid() << 32) ^
-                                   (uint64_t)clock();
-            }
-        }
+        const float b2_temp = s->dspark_b2_temp;
 
         /* Greedy first-draft check (common to both greedy and B2 paths).
          * At temp=0 this is exact; at temp>0 it is a fast pre-filter —

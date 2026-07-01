@@ -2424,6 +2424,107 @@ static int test_run_dspark_target_cache_cli_missing_target_model(const char *dat
     if (!WIFEXITED(status)) return -1;
     return WEXITSTATUS(status);
 }
+
+/* Extern declarations for the internal (non-static) B2 helpers in ds4.c —
+ * intentionally not part of the public ds4.h surface, exposed just enough
+ * for this white-box statistical test. */
+typedef struct {
+    int   n_accepted;
+    int   accepted_tokens[16];
+    int   correction_token;
+    bool  has_correction;
+} b2_result;
+
+int dspark_sample_draft_token(const float *logits, uint32_t vocab,
+                              float temperature, uint64_t *rng,
+                              float *scratch);
+
+b2_result b2_rejection_sample(
+    const int   *draft_tokens,
+    const float *draft_logits,
+    const float *target_logits,
+    uint32_t     vocab,
+    int          n_draft,
+    float        temperature,
+    uint64_t    *rng);
+
+/* B2 rejection sampling must reproduce the target distribution exactly when
+ * the draft token is genuinely sampled from the proposal distribution q —
+ * that is the lossless-speculative-sampling invariant for n_draft=1
+ * (Chen et al. 2023 / Leviathan et al. 2023). This is a synthetic, CPU-only
+ * test: no GPU or model required. */
+static void test_dspark_b2_rejection_sampling_unbiased(void) {
+    const uint32_t vocab = 6;
+    /* Deliberately different target (p) and draft (q) logits with full
+     * support, so the test actually exercises rejection + correction, not
+     * just the trivial all-accept case. */
+    const float target_logits[6] = { 2.0f, 0.5f, -1.0f, 1.0f, 0.0f, -0.5f };
+    const float draft_logits[6]  = { 0.2f, 1.8f,  0.5f, -0.5f, 1.0f, 0.0f };
+    const float temperature = 1.0f;
+
+    /* Ground truth: softmax(target_logits / temperature). */
+    float target_probs[6];
+    {
+        float max_v = target_logits[0];
+        for (uint32_t i = 1; i < vocab; i++) if (target_logits[i] > max_v) max_v = target_logits[i];
+        float sum = 0.0f;
+        for (uint32_t i = 0; i < vocab; i++) {
+            target_probs[i] = expf((target_logits[i] - max_v) / temperature);
+            sum += target_probs[i];
+        }
+        for (uint32_t i = 0; i < vocab; i++) target_probs[i] /= sum;
+    }
+
+    const int N = 50000;
+    int hist_correct[6] = {0};
+    int hist_biased[6]  = {0};
+    uint64_t rng_correct = 0xC0FFEEULL;
+    uint64_t rng_biased  = 0xC0FFEEULL;
+    float scratch[6];
+
+    for (int trial = 0; trial < N; trial++) {
+        /* Correct path: proposal genuinely sampled from q. */
+        int draft_tok = dspark_sample_draft_token(draft_logits, vocab, temperature, &rng_correct, scratch);
+        b2_result r = b2_rejection_sample(
+            &draft_tok, draft_logits, target_logits, vocab, 1, temperature, &rng_correct);
+        int out_tok = r.has_correction ? r.correction_token : r.accepted_tokens[0];
+        TEST_ASSERT(out_tok >= 0 && out_tok < (int)vocab);
+        hist_correct[out_tok]++;
+
+        /* Biased control: proposal is argmax(q) (the bug this PR fixes), not
+         * a real sample. This MUST diverge from the target distribution,
+         * proving this test harness actually discriminates correct from
+         * broken proposal sampling. */
+        int argmax_tok = 0;
+        float best = draft_logits[0];
+        for (uint32_t i = 1; i < vocab; i++) if (draft_logits[i] > best) { best = draft_logits[i]; argmax_tok = (int)i; }
+        b2_result rb = b2_rejection_sample(
+            &argmax_tok, draft_logits, target_logits, vocab, 1, temperature, &rng_biased);
+        int out_biased = rb.has_correction ? rb.correction_token : rb.accepted_tokens[0];
+        TEST_ASSERT(out_biased >= 0 && out_biased < (int)vocab);
+        hist_biased[out_biased]++;
+    }
+
+    float max_dev_correct = 0.0f, max_dev_biased = 0.0f;
+    for (uint32_t i = 0; i < vocab; i++) {
+        float p_correct = (float)hist_correct[i] / (float)N;
+        float p_biased  = (float)hist_biased[i]  / (float)N;
+        float dev_correct = fabsf(p_correct - target_probs[i]);
+        float dev_biased  = fabsf(p_biased  - target_probs[i]);
+        if (dev_correct > max_dev_correct) max_dev_correct = dev_correct;
+        if (dev_biased  > max_dev_biased)  max_dev_biased  = dev_biased;
+    }
+    fprintf(stderr,
+            "ds4-test: dspark-b2-unbiased max_dev_correct=%.4f max_dev_biased=%.4f (N=%d)\n",
+            max_dev_correct, max_dev_biased, N);
+    /* Correct (truly-sampled proposal) path must track the target
+     * distribution tightly: binomial std error at N=50000 is ~0.002-0.003,
+     * so 0.015 is a generous but still discriminating bound. */
+    TEST_ASSERT(max_dev_correct < 0.015f);
+    /* The argmax-proposal control must diverge well beyond that bound,
+     * proving the test can tell correct from broken proposal sampling. */
+    TEST_ASSERT(max_dev_biased > 0.05f);
+}
 static bool test_json_u64_field(const char *json, const char *key, uint64_t *out) {
     const char *p = strstr(json, key);
     if (!p) return false;
@@ -2582,6 +2683,7 @@ static const ds4_test_entry test_entries[] = {
     {"--dspark-binder", "dspark-binder", "DSpark draft kind/config defaults without GGUF", test_dspark_binder_helpers},
     {"--dspark-markov-bf16", "dspark-markov-bf16", "DSpark Markov BF16 tensor decoding", test_dspark_markov_bf16_helpers},
     {"--dspark-runtime", "dspark-runtime", "DSpark capture plan and speculative gate helpers", test_dspark_runtime_helpers},
+    {"--dspark-b2-unbiased", "dspark-b2-unbiased", "DSpark B2 rejection sampling is unbiased vs target distribution", test_dspark_b2_rejection_sampling_unbiased},
 
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
