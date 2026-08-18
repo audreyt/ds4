@@ -15376,16 +15376,12 @@ static int qwen_metal_forward_token(float *logits_out, const ds4_model *model, c
     ds4_gpu_tensor *norm = g_qwen_pool.norm;
     int ok = 1;
     // embed token
-    // For Q2_64A, Metal not yet optimized -> fallback to CPU
-    if (weights->token_embd->type == DS4_TENSOR_Q2_64A) { pthread_mutex_unlock(&g_qwen_pool.mu); return 0; }
     if (!ds4_gpu_embed_token_quant_tensor(cur, map, map_size, weights->token_embd->abs_offset, weights->token_embd->type, n_vocab, token, n_embd)) ok = 0;
     for (uint32_t il = 0; ok && il < 64; il++) {
         const ds4_layer_weights *lw = &weights->layer[il];
         bool is_full = (il % 4 == 3);
         if (!ds4_gpu_rms_norm_weight_tensor(normed, cur, map, map_size, lw->attn_norm->abs_offset, n_embd, 1e-6f)) { ok = 0; break; }
         if (is_full && lw->attn_q_b && lw->attn_k_b && lw->attn_v_b && lw->attn_output) {
-            // Q2 fallback
-            if (lw->attn_q_b->type == DS4_TENSOR_Q2_64A || lw->attn_k_b->type == DS4_TENSOR_Q2_64A) { ok = 0; break; }
             if (!ds4_gpu_matmul_quant_tensor(q, map, map_size, lw->attn_q_b->abs_offset, lw->attn_q_b->type, n_embd, n_head*head_dim, normed, 1)) { ok = 0; break; }
             if (!ds4_gpu_matmul_quant_tensor(k, map, map_size, lw->attn_k_b->abs_offset, lw->attn_k_b->type, n_embd, n_head_kv*head_dim, normed, 1)) { ok = 0; break; }
             if (!ds4_gpu_matmul_quant_tensor(v, map, map_size, lw->attn_v_b->abs_offset, lw->attn_v_b->type, n_embd, n_head_kv*head_dim, normed, 1)) { ok = 0; break; }
