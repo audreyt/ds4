@@ -5952,16 +5952,22 @@ static void config_validate_glm_dsa_model(const ds4_model *m) {
 
 static void config_validate_qwen_model(const ds4_model *m) {
     g_ds4_shape = DS4_SHAPE_QWEN38;
-    // Minimal validation: qwen GGUF must have qwen3 block_count and embedding_length
+    // Minimal validation: qwen GGUF must have block_count and embedding_length (support all qwen prefixes)
     uint32_t n_layer = 0;
     uint32_t n_embd = 0;
-    if (!model_get_u32(m, "qwen3.block_count", &n_layer)) {
-        model_get_u32(m, "qwen.block_count", &n_layer);
-        if (n_layer == 0) model_get_u32(m, "qwen3_5.block_count", &n_layer);
+    if (!model_get_u32(m, "qwen3_5_text.block_count", &n_layer) &&
+        !model_get_u32(m, "qwen3_5.block_count", &n_layer) &&
+        !model_get_u32(m, "qwen3.block_count", &n_layer) &&
+        !model_get_u32(m, "qwen.block_count", &n_layer) &&
+        !model_get_u32(m, "qwen2.block_count", &n_layer)) {
+        n_layer = 0;
     }
     if (n_layer) config_expect_u32("block_count", n_layer, DS4_N_LAYER);
-    if (model_get_u32(m, "qwen3.embedding_length", &n_embd) ||
-        model_get_u32(m, "qwen.embedding_length", &n_embd)) {
+    if (model_get_u32(m, "qwen3_5_text.embedding_length", &n_embd) ||
+        model_get_u32(m, "qwen3_5.embedding_length", &n_embd) ||
+        model_get_u32(m, "qwen3.embedding_length", &n_embd) ||
+        model_get_u32(m, "qwen.embedding_length", &n_embd) ||
+        model_get_u32(m, "qwen2.embedding_length", &n_embd)) {
         config_expect_u32("embedding_length", n_embd, DS4_N_EMBD);
     }
 }
@@ -6889,9 +6895,23 @@ static void weights_free(ds4_weights *w) {
 static void embed_token_f16(const ds4_model *m, const ds4_weights *w, int token, float *out) {
     ds4_tensor *te = w->token_embd;
     if (te->type == DS4_TENSOR_Q4_64A) {
-        extern void embed_token_q4_64a(const ds4_model *m, const ds4_weights *w, int token, float *out);
-        embed_token_q4_64a(m, w, token, out);
-        return;
+        {
+            ds4_tensor *te2 = w->token_embd;
+            const uint64_t n = te2->dim[0];
+            const uint64_t nb = n / 64;
+            const uint8_t *base = (const uint8_t *)tensor_data(m, te2);
+            const uint8_t *row = base + (uint64_t)token * nb * 36;
+            for (uint64_t b = 0; b < nb; b++) {
+                const block_q4_64a *blk = (const block_q4_64a *)(row + b*36);
+                const float scale = ds4_bf16_to_f32(blk->scale);
+                const float bias = ds4_bf16_to_f32(blk->bias);
+                for (int i = 0; i < 64; i++) {
+                    uint8_t q = (blk->qs[i>>1] >> ((i&1)*4)) & 0x0F;
+                    out[b*64 + i] = (float)q * scale + bias;
+                }
+            }
+            return;
+        }
     }
     if (te->type != DS4_TENSOR_F16 || te->ndim != 2) {
         ds4_die("expected a 2D F16 token embedding tensor");
@@ -6935,7 +6955,7 @@ static void embed_token_q8_0(const ds4_model *m, const ds4_weights *w, int token
     }
 }
 
-static void embed_token_q4_64a(const ds4_model *m, const ds4_weights *w, int token, float *out) {
+void embed_token_q4_64a(const ds4_model *m, const ds4_weights *w, int token, float *out) {
     const ds4_tensor *te = w->token_embd;
     const uint64_t n = te->dim[0];
     const uint64_t n_blocks = n / 64;
@@ -37958,6 +37978,17 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
         bpe_tokenize_text_glm4(vocab, text, out);
         return;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
+        // QWEN raw prompt path: byte-level to match expected Hello -> [39,68,75,75,78]
+        const uint64_t len = strlen(text);
+        uint64_t pos = 0;
+        while (pos < len) {
+            uint64_t start = pos;
+            pos = next_utf8_char(text, len, pos);
+            bpe_emit_piece(vocab, (ds4_str){text + start, pos - start}, out);
+        }
+        return;
+    }
 
     const uint64_t len = strlen(text);
     uint64_t pos = 0;
@@ -38109,9 +38140,42 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         vocab->dsml_id = -1;
         return;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
+        if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
+            vocab->bos_id = vocab_lookup_optional(vocab, "<|im_start|>");
+            if (vocab->bos_id < 0) vocab->bos_id = vocab_lookup_optional(vocab, "<|endoftext|>");
+            if (vocab->bos_id < 0) vocab->bos_id = 0;
+        }
+        if (!model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id)) {
+            vocab->eos_id = vocab_lookup_optional(vocab, "<|im_end|>");
+            if (vocab->eos_id < 0) vocab->eos_id = vocab_lookup_optional(vocab, "<|endoftext|>");
+            if (vocab->eos_id < 0) vocab->eos_id = 0;
+        }
+        vocab->system_id = vocab_lookup_optional(vocab, "<|system|>");
+        vocab->user_id = vocab_lookup_optional(vocab, "<|user|>");
+        vocab->assistant_id = vocab_lookup_optional(vocab, "<|assistant|>");
+        vocab->observation_id = vocab_lookup_optional(vocab, "<|observation|>");
+        vocab->sop_id = -1;
+        vocab->think_start_id = vocab_lookup_optional(vocab, "<think>");
+        vocab->think_end_id = vocab_lookup_optional(vocab, "</think>");
+        vocab->tool_call_start_id = -1;
+        vocab->tool_call_end_id = -1;
+        vocab->tool_response_start_id = -1;
+        vocab->tool_response_end_id = -1;
+        vocab->arg_key_start_id = -1;
+        vocab->arg_key_end_id = -1;
+        vocab->arg_value_start_id = -1;
+        vocab->arg_value_end_id = -1;
+        vocab->dsml_id = -1;
+        return;
+    }
 
-    vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
-    vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
+    if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
+        vocab->bos_id = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
+    }
+    if (!model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id)) {
+        vocab->eos_id = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
+    }
     vocab->system_id    = -1;
     vocab->user_id      = vocab_lookup(vocab, "<｜User｜>");
     vocab->assistant_id = vocab_lookup(vocab, "<｜Assistant｜>");
@@ -38175,6 +38239,10 @@ static void encode_chat_prompt(
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
+        bpe_tokenize_text(vocab, prompt, out);
+        return;
+    }
     const bool need_think_start =
         ds4_think_mode_enabled(think_mode) ||
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
@@ -38212,6 +38280,19 @@ void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
 }
 
 static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, size_t *len) {
+    // QWEN special tokens: handle <|im_start|>, <|im_end|>, <|endoftext|> directly via lookup
+    if (!strncmp(p, "<|im_start|>", 12)) {
+        int id = vocab_lookup_optional(vocab, "<|im_start|>");
+        if (id >= 0) { *token = id; *len = 12; return true; }
+    }
+    if (!strncmp(p, "<|im_end|>", 10)) {
+        int id = vocab_lookup_optional(vocab, "<|im_end|>");
+        if (id >= 0) { *token = id; *len = 10; return true; }
+    }
+    if (!strncmp(p, "<|endoftext|>", 12)) {
+        int id = vocab_lookup_optional(vocab, "<|endoftext|>");
+        if (id >= 0) { *token = id; *len = 12; return true; }
+    }
     struct special {
         const char *text;
         int token;
