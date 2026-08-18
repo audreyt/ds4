@@ -4880,7 +4880,7 @@ static void tensor_expect_routed_expert(
 }
 
 static bool weights_have_output_head(const ds4_weights *w) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
         return w && w->output_norm && w->output;
     }
     return w &&
@@ -4892,7 +4892,7 @@ static bool weights_have_output_head(const ds4_weights *w) {
 }
 
 static bool weights_have_partial_output_head(const ds4_weights *w) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
         return w && (w->output_norm || w->output);
     }
     return w &&
@@ -6888,6 +6888,11 @@ static void weights_free(ds4_weights *w) {
 /* Load one token embedding row and expand it to float activations. */
 static void embed_token_f16(const ds4_model *m, const ds4_weights *w, int token, float *out) {
     ds4_tensor *te = w->token_embd;
+    if (te->type == DS4_TENSOR_Q4_64A) {
+        extern void embed_token_q4_64a(const ds4_model *m, const ds4_weights *w, int token, float *out);
+        embed_token_q4_64a(m, w, token, out);
+        return;
+    }
     if (te->type != DS4_TENSOR_F16 || te->ndim != 2) {
         ds4_die("expected a 2D F16 token embedding tensor");
     }
@@ -6930,6 +6935,28 @@ static void embed_token_q8_0(const ds4_model *m, const ds4_weights *w, int token
     }
 }
 
+static void embed_token_q4_64a(const ds4_model *m, const ds4_weights *w, int token, float *out) {
+    const ds4_tensor *te = w->token_embd;
+    const uint64_t n = te->dim[0];
+    const uint64_t n_blocks = n / 64;
+    const uint8_t *row = (const uint8_t *)tensor_data(m, te) + (uint64_t)token * n_blocks * 36;
+    for (uint64_t b = 0; b < n_blocks; b++) {
+        const uint8_t *block = row + b * 36;
+        const uint8_t *qs = block;
+        uint16_t scale_bits, bias_bits;
+        memcpy(&scale_bits, block + 32, sizeof(scale_bits));
+        memcpy(&bias_bits, block + 34, sizeof(bias_bits));
+        const float scale = ds4_bf16_to_f32(scale_bits);
+        const float bias = ds4_bf16_to_f32(bias_bits);
+        const uint64_t i0 = b * 64;
+        for (uint64_t i = 0; i < 64; i++) {
+            const uint8_t packed = qs[i >> 1];
+            const uint32_t q = (packed >> ((i & 1) * 4)) & 0x0F;
+            out[i0 + i] = (float)q * scale + bias;
+        }
+    }
+}
+
 static void embed_token_any(const ds4_model *m, const ds4_weights *w, int token, float *out) {
     if (!w->token_embd) ds4_die("token embedding tensor is missing");
     switch (w->token_embd->type) {
@@ -6938,6 +6965,9 @@ static void embed_token_any(const ds4_model *m, const ds4_weights *w, int token,
         break;
     case DS4_TENSOR_Q8_0:
         embed_token_q8_0(m, w, token, out);
+        break;
+    case DS4_TENSOR_Q4_64A:
+        embed_token_q4_64a(m, w, token, out);
         break;
     default:
         ds4_die("unsupported token embedding tensor type");
@@ -7791,6 +7821,21 @@ static void matvec_q8_0(float *out, const ds4_model *m, const ds4_tensor *w, con
     matvec_q8_0_rows(out, m, w, x, 0, w->dim[1]);
 }
 
+typedef struct { float *out; const uint8_t *data; const float *x; uint64_t in_dim; } matvec_q4_64a_ctx;
+static void matvec_q4_64a_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    matvec_q4_64a_ctx *ctx = vctx;
+    for (uint64_t r = r0; r < r1; r++) {
+        const block_q4_64a *row = (const block_q4_64a *)(ctx->data + r * ((ctx->in_dim/64)*36));
+        ctx->out[r] = ds4_vec_dot_q4_64a_f32((int)ctx->in_dim, row, ctx->x);
+    }
+}
+static void matvec_q4_64a(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
+    if (w->type != DS4_TENSOR_Q4_64A || w->ndim != 2) ds4_die("expected a 2D Q4_64A tensor");
+    if (w->dim[0] % 64 != 0) ds4_die("Q4_64A in_dim must be multiple of 64");
+    matvec_q4_64a_ctx ctx = { .out = out, .data = tensor_data(m,w), .x = x, .in_dim = w->dim[0] };
+    ds4_parallel_for(w->dim[1], matvec_q4_64a_worker, &ctx);
+}
+
 static inline float dot_q8_0_row_f32_ref(
         const uint8_t *row,
         const float   *x,
@@ -8049,11 +8094,14 @@ static void matvec_f32(float *out, const ds4_model *m, const ds4_tensor *w, cons
 }
 
 /* Dispatch for dense F32/F16/Q8_0 tensors used by auxiliary projections. */
+static void matvec_q4_64a(float *out, const ds4_model *m, const ds4_tensor *w, const float *x);
+
 static void matvec_any(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
     switch (w->type) {
     case 0: matvec_f32(out, m, w, x); break;
     case 1: matvec_f16(out, m, w, x); break;
     case 8: matvec_q8_0(out, m, w, x); break;
+    case 36: matvec_q4_64a(out, m, w, x); break;
     default:
         ds4_die("unsupported tensor type for dense matvec");
     }
@@ -12381,6 +12429,27 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
 static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ctx_size) {
     memset(scratch, 0, sizeof(*scratch));
     if (ctx_size == 0) ctx_size = 1;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
+        const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+        const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+        scratch->ctx_size = ctx_size;
+        scratch->plain = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+        scratch->cur = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+        scratch->next = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+        scratch->attn_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+        scratch->q = xmalloc((size_t)q_dim * sizeof(float));
+        scratch->kv = xmalloc((size_t)kv_dim * sizeof(float));
+        scratch->heads = xmalloc((size_t)q_dim * sizeof(float));
+        scratch->attn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+        scratch->ffn_cur = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+        scratch->ffn_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+        scratch->shared_gate = xmalloc((size_t)DS4_N_FF_DENSE * sizeof(float));
+        scratch->shared_up = xmalloc((size_t)DS4_N_FF_DENSE * sizeof(float));
+        scratch->shared_mid = xmalloc((size_t)DS4_N_FF_DENSE * sizeof(float));
+        scratch->q8_xq = xmalloc(32 * sizeof(int8_t));
+        scratch->q8_xscale = xmalloc(sizeof(float));
+        return;
+    }
     const uint32_t raw_cap = ds4_default_raw_cap(ctx_size);
     const uint32_t comp_cap = ctx_size / 4 + 2;
     const uint32_t attn_score_cap = raw_cap + comp_cap;
@@ -13886,8 +13955,108 @@ static void output_logits_one_decode_scratch(
         const float            * inp_hc,
         ds4_cpu_decode_scratch * scratch);
 
+static void qwen_layer_forward(float *out, const ds4_model *model, const ds4_layer_weights *lw, const float *inp, uint32_t pos, ds4_cpu_decode_scratch *scratch);
+static void qwen_forward_token_cpu_decode_scratch(float *logits, const ds4_model *model, const ds4_weights *weights, ds4_kv_cache *cache, int token, uint32_t pos, ds4_cpu_decode_scratch *scratch);
+static void qwen_prefill_layer_major_cpu(float *logits, const ds4_model *model, const ds4_weights *weights, ds4_kv_cache *cache, const token_vec *prompt);
+
+static void qwen_layer_forward(float *out, const ds4_model *model, const ds4_layer_weights *lw, const float *inp, uint32_t pos, ds4_cpu_decode_scratch *scratch) {
+    const bool has_attn = lw->attn_q_b && lw->attn_k_b && lw->attn_v_b && lw->attn_output && lw->attn_norm;
+    const bool has_ffn = lw->ffn_gate && lw->ffn_up && lw->ffn_down && lw->ffn_norm;
+    float *normed = scratch->attn_norm;
+    float *q = scratch->q;
+    float *kv_tmp = scratch->kv;
+    float *heads = scratch->heads;
+    float *attn_out = scratch->attn_out;
+    float attn_residual[5120];
+    memcpy(attn_residual, inp, (size_t)DS4_N_EMBD * sizeof(float));
+    if (has_attn) {
+        const float *w_norm = tensor_data(model, lw->attn_norm);
+        rms_norm_weight(normed, inp, w_norm, DS4_N_EMBD, DS4_RMS_EPS);
+        matvec_any(q, model, lw->attn_q_b, normed);
+        matvec_any(kv_tmp, model, lw->attn_k_b, normed);
+        matvec_any(heads, model, lw->attn_v_b, normed);
+        rope_tail_layer_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, 0, false);
+        rope_tail_layer_inplace(kv_tmp, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos, 0, false);
+        for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
+            uint32_t kv_h = h / (DS4_N_HEAD / DS4_N_HEAD_KV);
+            memcpy(q + (uint64_t)h*DS4_N_HEAD_DIM, heads + (uint64_t)kv_h*DS4_N_HEAD_DIM, (size_t)DS4_N_HEAD_DIM * sizeof(float));
+        }
+        matvec_any(attn_out, model, lw->attn_output, q);
+        for (uint32_t i = 0; i < DS4_N_EMBD; i++) out[i] = attn_residual[i] + attn_out[i];
+    } else {
+        memcpy(out, inp, (size_t)DS4_N_EMBD * sizeof(float));
+    }
+    if (has_ffn) {
+        float ffn_residual[5120];
+        memcpy(ffn_residual, out, (size_t)DS4_N_EMBD * sizeof(float));
+        const float *w_ffn_norm = tensor_data(model, lw->ffn_norm);
+        float *ffn_normed = scratch->ffn_norm;
+        rms_norm_weight(ffn_normed, out, w_ffn_norm, DS4_N_EMBD, DS4_RMS_EPS);
+        float *gate = scratch->shared_gate;
+        float *up = scratch->shared_up;
+        float *mid = scratch->shared_mid;
+        matvec_any(gate, model, lw->ffn_gate, ffn_normed);
+        matvec_any(up, model, lw->ffn_up, ffn_normed);
+        for (uint32_t i = 0; i < DS4_N_FF_DENSE; i++) {
+            float g = gate[i];
+            float sig = 1.0f / (1.0f + expf(-g));
+            mid[i] = g * sig * up[i];
+        }
+        float ffn_out[5120];
+        matvec_any(ffn_out, model, lw->ffn_down, mid);
+        for (uint32_t i = 0; i < DS4_N_EMBD; i++) out[i] = ffn_residual[i] + ffn_out[i];
+    }
+}
+static void qwen_forward_token_cpu_decode_scratch(float *logits, const ds4_model *model, const ds4_weights *weights, ds4_kv_cache *cache, int token, uint32_t pos, ds4_cpu_decode_scratch *scratch) {
+    (void)cache;
+    float *cur = scratch->cur;
+    float *next = scratch->next;
+    embed_token_any(model, weights, token, scratch->plain);
+    memcpy(cur, scratch->plain, (size_t)DS4_N_EMBD * sizeof(float));
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        qwen_layer_forward(next, model, &weights->layer[il], cur, pos, scratch);
+        float *tmp = cur; cur = next; next = tmp;
+    }
+    if (logits) {
+        const float *w_norm = tensor_data(model, weights->output_norm);
+        float normed[5120];
+        rms_norm_weight(normed, cur, w_norm, DS4_N_EMBD, DS4_RMS_EPS);
+        matvec_any(logits, model, weights->output, normed);
+    }
+}
+static void qwen_prefill_layer_major_cpu(float *logits, const ds4_model *model, const ds4_weights *weights, ds4_kv_cache *cache, const token_vec *prompt) {
+    const uint64_t n_tok = (uint64_t)prompt->len;
+    float *cur = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(float));
+    float *next = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(float));
+    float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    ds4_cpu_decode_scratch scratch;
+    cpu_decode_scratch_init(&scratch, (uint32_t)n_tok);
+    for (uint64_t t = 0; t < n_tok; t++) {
+        embed_token_any(model, weights, prompt->v[t], plain);
+        memcpy(cur + t*DS4_N_EMBD, plain, (size_t)DS4_N_EMBD * sizeof(float));
+    }
+    free(plain);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        for (uint64_t t = 0; t < n_tok; t++) {
+            qwen_layer_forward(next + t*DS4_N_EMBD, model, &weights->layer[il], cur + t*DS4_N_EMBD, (uint32_t)t, &scratch);
+        }
+        float *tmp = cur; cur = next; next = tmp;
+    }
+    if (logits) {
+        const float *w_norm = tensor_data(model, weights->output_norm);
+        float normed[5120];
+        rms_norm_weight(normed, cur + (n_tok-1)*DS4_N_EMBD, w_norm, DS4_N_EMBD, DS4_RMS_EPS);
+        matvec_any(logits, model, weights->output, normed);
+    }
+    cpu_decode_scratch_free(&scratch);
+    free(next);
+    free(cur);
+}
+
 /* CPU decode for one token through all 43 layers.  The caller owns scratch and
  * cache lifetimes so no per-token allocations are needed. */
+static void qwen_forward_token_cpu_decode_scratch(float *logits, const ds4_model *model, const ds4_weights *weights, ds4_kv_cache *cache, int token, uint32_t pos, ds4_cpu_decode_scratch *scratch);
+
 static void forward_token_raw_swa_cpu_decode_scratch(
         float             * logits,
         const ds4_model   * model,
@@ -13899,6 +14068,10 @@ static void forward_token_raw_swa_cpu_decode_scratch(
         float               steering_attn_scale,
         float               steering_ffn_scale,
         ds4_cpu_decode_scratch * scratch) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
+        qwen_forward_token_cpu_decode_scratch(logits, model, weights, cache, token, pos, scratch);
+        return;
+    }
     float *cur = scratch->cur;
     float *next = scratch->next;
 
@@ -13957,6 +14130,10 @@ static void prefill_layer_major_cpu(
         const float       * steering_dirs,
         float               steering_attn_scale,
         float               steering_ffn_scale) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
+        qwen_prefill_layer_major_cpu(logits, model, weights, cache, prompt);
+        return;
+    }
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t n_tok = (uint64_t)prompt->len;
     float *cur = xmalloc((size_t)n_tok * hc_dim * sizeof(cur[0]));
@@ -37878,9 +38055,15 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         tokens.len > INT32_MAX) {
         ds4_die("GGUF tokenizer token table is missing or invalid");
     }
-    if (!model_get_array(model, "tokenizer.ggml.merges", &merges) ||
-        merges.type != GGUF_VALUE_STRING) {
+    bool have_merges = model_get_array(model, "tokenizer.ggml.merges", &merges) &&
+                         merges.type == GGUF_VALUE_STRING;
+    if (!have_merges && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN) {
         ds4_die("GGUF tokenizer merge table is missing or invalid");
+    }
+    if (!have_merges) {
+        merges.len = 0;
+        merges.type = GGUF_VALUE_STRING;
+        merges.data_pos = 0;
     }
 
     vocab->n_vocab = (int)tokens.len;

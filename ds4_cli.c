@@ -364,6 +364,9 @@ static bool is_rendered_chat_prompt(const char *prompt) {
         "<|user|>",
         "<|assistant|>",
         "<|observation|>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|endoftext|>",
     };
     if (!prompt) return false;
     for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {

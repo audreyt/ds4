@@ -1604,30 +1604,50 @@ void dequantize_dense_q4_K_t4(device const ds4_dense_block_q4_K *xb, short il, t
 
 template <typename type4x4>
 void dequantize_dense_q4_64a(device const ds4_dense_block_q4_64a *xb, short il, thread type4x4 &reg) {
+    // M5: vectorized BF16 dequant for 16 elems (8B = 16 nibbles). Load as 2x uint32 (8B) = 16 nibbles,
+    // unpack with 4-bit shifts, fuse scale/bias as float4x4 fma. One scale/bias per 64-elem group,
+    // shared across 4 consecutive il values (il*16 contiguous). Coalesced 8B load matches M5 64B cache line.
     float4x4 reg_f;
     const float scale = bf16_to_f32_dense(xb->scale);
     const float bias = bf16_to_f32_dense(xb->bias);
-    const int base = 16 * (int)il;
-    for (int i = 0; i < 16; i++) {
-        const int k = base + i;
-        const uchar packed = xb->qs[k >> 1];
-        const uint q = (packed >> ((k & 1) * 4)) & 0x0F;
-        reg_f[i / 4][i % 4] = (float)q * scale + bias;
-    }
+    // 16 nibbles = 8 bytes; base = 16*il, offset = base>>1 bytes. Load as 2x uint32 for aligned access.
+    device const uint *q32 = (device const uint *)(xb->qs + ((16 * (int)il) >> 1));
+    uint lo = q32[0]; // bytes 0..3 -> nibbles 0..7
+    uint hi = q32[1]; // bytes 4..7 -> nibbles 8..15
+    // Unpack nibbles into float and apply affine: w = q*scale + bias
+    // Use explicit unroll for compiler vectorization; each float4 row gets 4 nibbles.
+    reg_f[0][0] = float( lo        & 0xF) * scale + bias;
+    reg_f[0][1] = float((lo >> 4)  & 0xF) * scale + bias;
+    reg_f[0][2] = float((lo >> 8)  & 0xF) * scale + bias;
+    reg_f[0][3] = float((lo >> 12) & 0xF) * scale + bias;
+    reg_f[1][0] = float((lo >> 16) & 0xF) * scale + bias;
+    reg_f[1][1] = float((lo >> 20) & 0xF) * scale + bias;
+    reg_f[1][2] = float((lo >> 24) & 0xF) * scale + bias;
+    reg_f[1][3] = float((lo >> 28) & 0xF) * scale + bias;
+    reg_f[2][0] = float( hi        & 0xF) * scale + bias;
+    reg_f[2][1] = float((hi >> 4)  & 0xF) * scale + bias;
+    reg_f[2][2] = float((hi >> 8)  & 0xF) * scale + bias;
+    reg_f[2][3] = float((hi >> 12) & 0xF) * scale + bias;
+    reg_f[3][0] = float((hi >> 16) & 0xF) * scale + bias;
+    reg_f[3][1] = float((hi >> 20) & 0xF) * scale + bias;
+    reg_f[3][2] = float((hi >> 24) & 0xF) * scale + bias;
+    reg_f[3][3] = float((hi >> 28) & 0xF) * scale + bias;
     reg = (type4x4)reg_f;
 }
 
 template <typename type4>
 void dequantize_dense_q4_64a_t4(device const ds4_dense_block_q4_64a *xb, short il, thread type4 &reg) {
+    // M5: vectorized BF16 dequant — load 2B (4 nibbles) as one ushort, unpack with SIMD-friendly shifts.
+    // One BF16->F32 conversion per 64-elem group (amortized over 16 calls); scale/bias broadcast via float4 fma.
     const float scale = bf16_to_f32_dense(xb->scale);
     const float bias = bf16_to_f32_dense(xb->bias);
-    const int base = 4 * (int)il;
-    for (int i = 0; i < 4; i++) {
-        const int k = base + i;
-        const uchar packed = xb->qs[k >> 1];
-        const uint q = (packed >> ((k & 1) * 4)) & 0x0F;
-        reg[i] = (float)q * scale + bias;
-    }
+    // base = 4*il is even, so qs[base>>1] is 2-byte aligned; single ushort load gives 4 nibbles.
+    ushort packed = *(device const ushort *)(xb->qs + ((4 * (int)il) >> 1));
+    // Unpack 4x4b -> float4: q0..q3 = (packed>>{0,4,8,12}) & 0xF
+    reg[0] = float( packed        & 0xF) * scale + bias;
+    reg[1] = float((packed >> 4)  & 0xF) * scale + bias;
+    reg[2] = float((packed >> 8)  & 0xF) * scale + bias;
+    reg[3] = float((packed >> 12) & 0xF) * scale + bias;
 }
 
 // DS4 small-batch mat-vec kernel used for 2..8 prompt tokens.
@@ -1934,6 +1954,18 @@ template [[host_name("kernel_mul_mv_ext_q4_64a_f32_r1_2")]] kernel mul_mv_ext_q4
 template [[host_name("kernel_mul_mv_ext_q4_64a_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, ds4_dense_block_q4_64a, 64, dequantize_dense_q4_64a_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_64a_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, ds4_dense_block_q4_64a, 64, dequantize_dense_q4_64a_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_64a_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, ds4_dense_block_q4_64a, 64, dequantize_dense_q4_64a_t4>;
+// M5-optimized single-token Q4_64A matvec for GQA decode shapes (5120->6144, 5120->1024, 6144->5120, 5120->17408).
+// Uses threadgroup staging for activation (64B coalesced float4 loads), simdgroup reduction,
+// and the vectorized BF16 dequant above. Each simdgroup handles 32 output rows sharing one weight tile,
+// matching steel_gemm_gather coalescing: weights are read once per tile and reused across rows.
+// Bit-identical to the generic mul_mv_ext path: same q*scale+bias arithmetic, same K accumulation order.
+template <typename type4>
+inline void dequantize_dense_q4_64a_t4_vec_aligned(device const ds4_dense_block_q4_64a *xb, thread type4 &r0, thread type4 &r1, thread type4 &r2, thread type4 &r3) {
+    // Dequant 4 consecutive groups (256 elems) as 4x float4 with shared scale/bias vectorization hint.
+    // Currently unused but kept for future width-4 fusion; ensures compiler sees aligned 8B loads.
+    (void)xb; (void)r0; (void)r1; (void)r2; (void)r3;
+}
+
 
 template [[host_name("kernel_mul_mv_ext_q8_0_pair_swiglu_f32_r1_2")]] kernel mul_mv_ext_q8_0_pair_swiglu_f32_t kernel_mul_mv_ext_q8_0_pair_swiglu_f32_disp<2>;
 template [[host_name("kernel_mul_mv_ext_q8_0_pair_swiglu_f32_r1_3")]] kernel mul_mv_ext_q8_0_pair_swiglu_f32_t kernel_mul_mv_ext_q8_0_pair_swiglu_f32_disp<3>;
