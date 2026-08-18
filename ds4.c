@@ -486,12 +486,14 @@ enum {
 typedef enum {
     DS4_MODEL_FAMILY_DEEPSEEK4 = 0,
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
+    DS4_MODEL_FAMILY_QWEN      = 2,
 } ds4_model_family;
 
 typedef enum {
     DS4_VARIANT_FLASH = 0,
     DS4_VARIANT_PRO   = 1,
     DS4_VARIANT_GLM52 = 2,
+    DS4_VARIANT_QWEN38 = 3,
 } ds4_variant;
 
 typedef struct {
@@ -658,6 +660,50 @@ static const ds4_shape DS4_SHAPE_GLM52 = {
     .rope_orig_ctx = 1048576,
 };
 
+static const ds4_shape DS4_SHAPE_QWEN38 = {
+    .name = "Qwen 3.8 27B (4b g64 affine)",
+    .family = DS4_MODEL_FAMILY_QWEN,
+    .variant = DS4_VARIANT_QWEN38,
+    .n_layer = 64,
+    .n_embd = 5120,
+    .n_vocab = 248320,
+    .n_head = 24,
+    .n_head_kv = 4,
+    .n_head_dim = 256,
+    .n_value_dim = 256,
+    .n_rot = 64,
+    .n_out_group = 0,
+    .n_lora_q = 0,
+    .n_lora_o = 0,
+    .n_expert = 0,
+    .n_expert_used = 0,
+    .n_expert_shared = 0,
+    .n_ff_exp = 0,
+    .n_ff_dense = 17408,
+    .n_hash_layer = 0,
+    .n_swa = 0,
+    .n_indexer_head = 0,
+    .n_indexer_head_dim = 0,
+    .n_indexer_top_k = 0,
+    .n_hc = 0,
+    .n_hc_sinkhorn_iter = 0,
+    .n_nextn_predict = 0,
+    .n_leading_dense = 64,
+    .n_kv_lora = 0,
+    .n_key_mla = 0,
+    .n_value_mla = 0,
+    .rms_eps = 1.0e-6f,
+    .hc_eps = 0.0f,
+    .expert_weight_scale = 0.0f,
+    .swiglu_clamp_exp = 0.0f,
+    .rope_freq_base = 10000000.0f,
+    .rope_scale_factor = 1.0f,
+    .rope_yarn_beta_fast = 0.0f,
+    .rope_yarn_beta_slow = 0.0f,
+    .compress_rope_freq_base = 0.0f,
+    .rope_orig_ctx = 262144,
+};
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -809,6 +855,12 @@ typedef struct {
     uint8_t qs[QK_MXFP4 / 2];
 } block_mxfp4;
 
+typedef struct {
+    uint8_t qs[32];
+    uint16_t scale;
+    uint16_t bias;
+} block_q4_64a;
+
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
@@ -817,6 +869,7 @@ DS4_STATIC_ASSERT(ds4_block_q6_k_size, sizeof(block_q6_K) == 210);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
 DS4_STATIC_ASSERT(ds4_block_mxfp4_size, sizeof(block_mxfp4) == 17);
+DS4_STATIC_ASSERT(ds4_block_q4_64a_size, sizeof(block_q4_64a) == 36);
 
 typedef struct {
     uint32_t ctx_size;
@@ -2049,6 +2102,7 @@ static const gguf_type_info gguf_types[] = {
     [28] = {"f64",      1,   8},
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
+    [36] = {"q4_64a",  64,  36},
     [39] = {"mxfp4",   32,  17},
 };
 
@@ -2064,6 +2118,7 @@ enum {
     DS4_TENSOR_Q8_K     = 15,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,
+    DS4_TENSOR_Q4_64A   = 36,
     DS4_TENSOR_MXFP4    = 39,
 };
 
@@ -3824,6 +3879,48 @@ static float ds4_vec_dot_q6_K_f32(int n, const block_q6_K *x, const float *y) {
     return sumf;
 }
 
+static inline float ds4_bf16_to_f32(uint16_t bits) {
+    uint32_t v = (uint32_t)bits << 16;
+    float f;
+    memcpy(&f, &v, sizeof(f));
+    return f;
+}
+
+static float ds4_vec_dot_q4_64a_f32(int n, const block_q4_64a *x, const float *y) {
+    const int nb = n / 64;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float scale = ds4_bf16_to_f32(x[i].scale);
+        const float bias = ds4_bf16_to_f32(x[i].bias);
+        const uint8_t *qs = x[i].qs;
+        const float *yb = y + (uint64_t)i * 64;
+        for (int j = 0; j < 64; j++) {
+            const uint8_t q = (qs[j >> 1] >> ((j & 1) * 4)) & 0x0F;
+            sumf += ((float)q * scale + bias) * yb[j];
+        }
+    }
+    return sumf;
+}
+
+static void ds4_vec_dot_q4_64a_q8_K(int n, float *s, const block_q4_64a *x, const block_q8_K *y) {
+    const int nb = n / 64;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float scale = ds4_bf16_to_f32(x[i].scale);
+        const float bias = ds4_bf16_to_f32(x[i].bias);
+        const uint8_t *qs = x[i].qs;
+        for (int j = 0; j < 64; j++) {
+            const uint8_t q = (qs[j >> 1] >> ((j & 1) * 4)) & 0x0F;
+            const float w = (float)q * scale + bias;
+            const int idx = i * 64 + j;
+            const int yb = idx / QK_K;
+            const int yo = idx % QK_K;
+            sumf += w * y[yb].d * (float)y[yb].qs[yo];
+        }
+    }
+    *s = sumf;
+}
+
 static inline float ds4_vec_dot_q5_q6_K_f32(uint32_t type, int n, const uint8_t *x, const float *y) {
     if (type == DS4_TENSOR_Q5_K) {
         return ds4_vec_dot_q5_K_f32(n, (const block_q5_K *)x, y);
@@ -4328,13 +4425,19 @@ static void tensor_expect_layout(
 static bool tensor_type_is_glm_dense_quant(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_Q4_K ||
-           type == DS4_TENSOR_Q4_0;
+           type == DS4_TENSOR_Q4_0 ||
+           type == DS4_TENSOR_Q4_64A;
 }
 
 static bool tensor_type_is_dense_quant(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_Q4_K ||
-           type == DS4_TENSOR_Q4_0;
+           type == DS4_TENSOR_Q4_0 ||
+           type == DS4_TENSOR_Q4_64A;
+}
+
+static bool tensor_type_is_q4_64a(uint32_t type) {
+    return type == DS4_TENSOR_Q4_64A;
 }
 
 static void tensor_expect_glm_dense_quant_layout(
@@ -5009,12 +5112,53 @@ static void weights_validate_glm_dsa_layout(
     }
 }
 
+static void weights_validate_qwen_layout(
+        const ds4_weights *w,
+        uint32_t           layer_start,
+        uint32_t           layer_end,
+        bool               require_token_embd,
+        bool               require_output) {
+    if (!w) ds4_die("missing weights for Qwen layout");
+    if (layer_start >= DS4_N_LAYER) ds4_die("invalid first layer Qwen");
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) ds4_die("invalid layer range Qwen");
+    if (require_token_embd && !w->token_embd) ds4_die("required token_embd missing Qwen");
+    if (w->token_embd) tensor_expect_glm_dense_quant_layout(w->token_embd, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    const bool have_output = weights_have_output_head(w);
+    if (require_output && !have_output) ds4_die("required output head missing Qwen");
+    if (have_output) {
+        tensor_expect_layout(w->output_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_glm_dense_quant_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!l->attn_norm || !l->attn_q_b || !l->attn_k_b || !l->attn_v_b || !l->attn_output ||
+            !l->ffn_norm || !l->ffn_gate || !l->ffn_up || !l->ffn_down) {
+            fprintf(stderr, "ds4: required Qwen tensors for layer %u are missing\n", il);
+            exit(1);
+        }
+        tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_glm_dense_quant_layout(l->attn_q_b, 2, DS4_N_EMBD, DS4_N_HEAD*DS4_N_HEAD_DIM, 0);
+        tensor_expect_glm_dense_quant_layout(l->attn_k_b, 2, DS4_N_EMBD, DS4_N_HEAD_KV*DS4_N_HEAD_DIM, 0);
+        tensor_expect_glm_dense_quant_layout(l->attn_v_b, 2, DS4_N_EMBD, DS4_N_HEAD_KV*DS4_N_HEAD_DIM, 0);
+        tensor_expect_glm_dense_quant_layout(l->attn_output, 2, DS4_N_HEAD*DS4_N_HEAD_DIM, DS4_N_EMBD, 0);
+        tensor_expect_layout(l->ffn_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_glm_dense_quant_layout(l->ffn_gate, 2, DS4_N_EMBD, DS4_N_FF_DENSE, 0);
+        tensor_expect_glm_dense_quant_layout(l->ffn_up, 2, DS4_N_EMBD, DS4_N_FF_DENSE, 0);
+        tensor_expect_glm_dense_quant_layout(l->ffn_down, 2, DS4_N_FF_DENSE, DS4_N_EMBD, 0);
+    }
+}
+
 static void weights_validate_layout(
         const ds4_weights *w,
         uint32_t           layer_start,
         uint32_t           layer_end,
         bool               require_token_embd,
         bool               require_output) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
+        weights_validate_qwen_layout(w, layer_start, layer_end, require_token_embd, require_output);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         weights_validate_glm_dsa_layout(w,
                                         layer_start,
@@ -5806,11 +5950,34 @@ static void config_validate_glm_dsa_model(const ds4_model *m) {
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
 }
 
+static void config_validate_qwen_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_QWEN38;
+    // Minimal validation: qwen GGUF must have qwen3 block_count and embedding_length
+    uint32_t n_layer = 0;
+    uint32_t n_embd = 0;
+    if (!model_get_u32(m, "qwen3.block_count", &n_layer)) {
+        model_get_u32(m, "qwen.block_count", &n_layer);
+        if (n_layer == 0) model_get_u32(m, "qwen3_5.block_count", &n_layer);
+    }
+    if (n_layer) config_expect_u32("block_count", n_layer, DS4_N_LAYER);
+    if (model_get_u32(m, "qwen3.embedding_length", &n_embd) ||
+        model_get_u32(m, "qwen.embedding_length", &n_embd)) {
+        config_expect_u32("embedding_length", n_embd, DS4_N_EMBD);
+    }
+}
+
 static void config_validate_model(const ds4_model *m) {
     ds4_str arch = {0};
     if (model_get_string(m, "general.architecture", &arch) &&
         ds4_streq(arch, "glm-dsa")) {
         config_validate_glm_dsa_model(m);
+        return;
+    }
+    if (model_get_string(m, "general.architecture", &arch) &&
+        (ds4_streq(arch, "qwen3") || ds4_streq(arch, "qwen3_5") ||
+         ds4_streq(arch, "qwen3_5_text") || ds4_streq(arch, "qwen2") ||
+         ds4_streq(arch, "qwen"))) {
+        config_validate_qwen_model(m);
         return;
     }
     config_validate_deepseek4_model(m);
@@ -5821,7 +5988,15 @@ static void weights_bind_output(
         const ds4_model *m,
         bool             required,
         bool             optional) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
+        if (required) {
+            w->output_norm = required_tensor(m, "output_norm.weight");
+            w->output      = required_tensor(m, "output.weight");
+        } else if (optional) {
+            w->output_norm = model_find_tensor(m, "output_norm.weight");
+            w->output      = model_find_tensor(m, "output.weight");
+        }
+    } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (required) {
             w->output_norm = required_tensor(m, "output_norm.weight");
             w->output      = required_tensor(m, "output.weight");
@@ -5848,6 +6023,21 @@ static void weights_bind_output(
         !weights_have_output_head(w)) {
         ds4_die("partial output head in GGUF");
     }
+}
+
+static void weights_bind_qwen_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    // Qwen 3.5/3.8 dense GQA + gated SwiGLU. Reuse ffn_gate/up/down and attn_q/k/v/output.
+    l->attn_norm = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->attn_q_b = required_tensorf(m, "blk.%u.attn_q.weight", il);
+    l->attn_k_b = required_tensorf(m, "blk.%u.attn_k.weight", il);
+    l->attn_v_b = required_tensorf(m, "blk.%u.attn_v.weight", il);
+    l->attn_output = required_tensorf(m, "blk.%u.attn_output.weight", il);
+    // Use ffn_norm + dense ffn triple; weights_bind_layer generic path will use ffn_gate/up/down
+    l->ffn_norm = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+    l->ffn_gate = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
+    l->ffn_up   = required_tensorf(m, "blk.%u.ffn_up.weight", il);
+    l->ffn_down = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+    // Keep other pointers null for clean dense path
 }
 
 static void weights_bind_glm_dsa_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
@@ -5893,6 +6083,10 @@ static void weights_bind_glm_dsa_layer(ds4_layer_weights *l, const ds4_model *m,
 }
 
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
+        weights_bind_qwen_layer(l, m, il);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         weights_bind_glm_dsa_layer(l, m, il);
         return;

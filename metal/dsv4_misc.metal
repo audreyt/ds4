@@ -1622,6 +1622,7 @@ static inline float glm_q8_0_dot_row_dev_f32(
 #define DS4_METAL_GGUF_Q4_0 2u
 #define DS4_METAL_GGUF_Q8_0 8u
 #define DS4_METAL_GGUF_Q4_K 12u
+#define DS4_METAL_GGUF_Q4_64A 36u
 
 static inline uchar2 glm_q4_K_scale_min(int j, int k, device const uchar *q) {
     return j < 4 ? uchar2{uchar(q[j + 0 + k] & 63), uchar(q[j + 4 + k] & 63)}
@@ -1658,12 +1659,29 @@ static inline float glm_q4_K_weight_at(device const char *row, uint col) {
     return d * (float)sm.x * (float)q - dmin * (float)sm.y;
 }
 
+static inline float bf16_to_f32_dsv4(ushort b) { return as_type<float>(uint(b) << 16); }
+
+static inline float glm_q4_64a_weight_at(device const char *row, uint col) {
+    const uint block = col >> 6u;
+    const uint idx = col & 63u;
+    device const char *block_base = row + (uint64_t)block * 36u;
+    const ushort sbits = *((device const ushort *)(block_base + 32));
+    const ushort bbits = *((device const ushort *)(block_base + 34));
+    const float scale = bf16_to_f32_dsv4(sbits);
+    const float bias = bf16_to_f32_dsv4(bbits);
+    device const uchar *qs = (device const uchar *)block_base;
+    const uchar qb = qs[idx >> 1u];
+    const uint q = (qb >> ((idx & 1u) * 4u)) & 0x0Fu;
+    return (float)q * scale + bias;
+}
+
 static inline float glm_quant_weight_at(
         uint weight_type,
         device const char *row,
         uint col) {
     if (weight_type == DS4_METAL_GGUF_Q4_0) return glm_q4_0_weight_at(row, col);
     if (weight_type == DS4_METAL_GGUF_Q4_K) return glm_q4_K_weight_at(row, col);
+    if (weight_type == DS4_METAL_GGUF_Q4_64A) return glm_q4_64a_weight_at(row, col);
     return glm_q8_0_weight_at(row, col);
 }
 
@@ -1689,6 +1707,28 @@ static inline float glm_q4_K_dot_row_tg_f32(
     return acc;
 }
 
+static inline float glm_q4_64a_dot_row_tg_f32(
+        device const char *row,
+        threadgroup const float *x,
+        uint n_cols) {
+    float acc = 0.0f;
+    for (uint col = 0; col < n_cols; col++) {
+        acc += glm_q4_64a_weight_at(row, col) * x[col];
+    }
+    return acc;
+}
+
+static inline float glm_q4_64a_dot_row_dev_f32(
+        device const char *row,
+        device const float *x,
+        uint n_cols) {
+    float acc = 0.0f;
+    for (uint col = 0; col < n_cols; col++) {
+        acc += glm_q4_64a_weight_at(row, col) * x[col];
+    }
+    return acc;
+}
+
 static inline float glm_quant_dot_row_tg_f32(
         uint weight_type,
         device const char *row,
@@ -1696,6 +1736,7 @@ static inline float glm_quant_dot_row_tg_f32(
         uint n_cols) {
     if (weight_type == DS4_METAL_GGUF_Q4_0) return glm_q4_0_dot_row_tg_f32(row, x, n_cols);
     if (weight_type == DS4_METAL_GGUF_Q4_K) return glm_q4_K_dot_row_tg_f32(row, x, n_cols);
+    if (weight_type == DS4_METAL_GGUF_Q4_64A) return glm_q4_64a_dot_row_tg_f32(row, x, n_cols);
     return glm_q8_0_dot_row_tg_f32_fast(row, x, n_cols);
 }
 
@@ -1734,6 +1775,7 @@ static inline float glm_quant_dot_row_dev_f32(
         device const float *x,
         uint n_cols) {
     if (weight_type == DS4_METAL_GGUF_Q8_0) return glm_q8_0_dot_row_dev_f32(row, x, n_cols);
+    if (weight_type == DS4_METAL_GGUF_Q4_64A) return glm_q4_64a_dot_row_dev_f32(row, x, n_cols);
     float acc = 0.0f;
     for (uint col = 0; col < n_cols; col++) {
         acc += glm_quant_weight_at(weight_type, row, col) * x[col];
