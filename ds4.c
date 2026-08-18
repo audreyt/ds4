@@ -861,6 +861,12 @@ typedef struct {
     uint16_t bias;
 } block_q4_64a;
 
+typedef struct {
+    uint8_t qs[16];
+    uint16_t scale;
+    uint16_t bias;
+} block_q2_64a;
+
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
@@ -870,6 +876,7 @@ DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
 DS4_STATIC_ASSERT(ds4_block_mxfp4_size, sizeof(block_mxfp4) == 17);
 DS4_STATIC_ASSERT(ds4_block_q4_64a_size, sizeof(block_q4_64a) == 36);
+DS4_STATIC_ASSERT(ds4_block_q2_64a_size, sizeof(block_q2_64a) == 20);
 
 typedef struct {
     uint32_t ctx_size;
@@ -2103,6 +2110,7 @@ static const gguf_type_info gguf_types[] = {
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
     [36] = {"q4_64a",  64,  36},
+    [37] = {"q2_64a",  64,  20},
     [39] = {"mxfp4",   32,  17},
 };
 
@@ -2119,6 +2127,7 @@ enum {
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_Q4_64A   = 36,
+    DS4_TENSOR_Q2_64A   = 37,
     DS4_TENSOR_MXFP4    = 39,
 };
 
@@ -3889,6 +3898,32 @@ static inline float ds4_bf16_to_f32(uint16_t bits) {
 static float ds4_vec_dot_q4_64a_f32(int n, const block_q4_64a *x, const float *y) {
     const int nb = n / 64;
     float sumf = 0.0f;
+#if defined(__ARM_NEON)
+    for (int i = 0; i < nb; i++) {
+        const float scale = ds4_bf16_to_f32(x[i].scale);
+        const float bias = ds4_bf16_to_f32(x[i].bias);
+        const uint8_t *qs = x[i].qs;
+        const float *yb = y + (uint64_t)i * 64;
+        float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0), acc2 = vdupq_n_f32(0), acc3 = vdupq_n_f32(0);
+        for (int j = 0; j < 64; j += 16) {
+            uint8_t bytes[8];
+            for (int k=0;k<8;k++) bytes[k]=qs[(j>>1)+k];
+            float qf[16];
+            for (int k=0;k<8;k++) { qf[2*k] = (float)(bytes[k] & 0xF); qf[2*k+1] = (float)(bytes[k] >> 4); }
+            float32x4_t q0 = vld1q_f32(qf+0), q1 = vld1q_f32(qf+4), q2 = vld1q_f32(qf+8), q3 = vld1q_f32(qf+12);
+            float32x4_t y0 = vld1q_f32(yb+j+0), y1 = vld1q_f32(yb+j+4), y2 = vld1q_f32(yb+j+8), y3 = vld1q_f32(yb+j+12);
+            q0 = vmlaq_n_f32(vdupq_n_f32(bias), q0, scale);
+            q1 = vmlaq_n_f32(vdupq_n_f32(bias), q1, scale);
+            q2 = vmlaq_n_f32(vdupq_n_f32(bias), q2, scale);
+            q3 = vmlaq_n_f32(vdupq_n_f32(bias), q3, scale);
+            acc0 = vmlaq_f32(acc0, q0, y0);
+            acc1 = vmlaq_f32(acc1, q1, y1);
+            acc2 = vmlaq_f32(acc2, q2, y2);
+            acc3 = vmlaq_f32(acc3, q3, y3);
+        }
+        sumf += vaddvq_f32(acc0) + vaddvq_f32(acc1) + vaddvq_f32(acc2) + vaddvq_f32(acc3);
+    }
+#else
     for (int i = 0; i < nb; i++) {
         const float scale = ds4_bf16_to_f32(x[i].scale);
         const float bias = ds4_bf16_to_f32(x[i].bias);
@@ -3899,6 +3934,7 @@ static float ds4_vec_dot_q4_64a_f32(int n, const block_q4_64a *x, const float *y
             sumf += ((float)q * scale + bias) * yb[j];
         }
     }
+#endif
     return sumf;
 }
 
@@ -3919,6 +3955,22 @@ static void ds4_vec_dot_q4_64a_q8_K(int n, float *s, const block_q4_64a *x, cons
         }
     }
     *s = sumf;
+}
+
+static float ds4_vec_dot_q2_64a_f32(int n, const block_q2_64a *x, const float *y) {
+    const int nb = n / 64;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float scale = ds4_bf16_to_f32(x[i].scale);
+        const float bias = ds4_bf16_to_f32(x[i].bias);
+        const uint8_t *qs = x[i].qs;
+        const float *yb = y + (uint64_t)i * 64;
+        for (int j = 0; j < 64; j++) {
+            const uint8_t q = (qs[j >> 2] >> ((j & 3) * 2)) & 0x03;
+            sumf += ((float)q * scale + bias) * yb[j];
+        }
+    }
+    return sumf;
 }
 
 static inline float ds4_vec_dot_q5_q6_K_f32(uint32_t type, int n, const uint8_t *x, const float *y) {
@@ -4426,18 +4478,24 @@ static bool tensor_type_is_glm_dense_quant(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q4_0 ||
-           type == DS4_TENSOR_Q4_64A;
+           type == DS4_TENSOR_Q4_64A ||
+           type == DS4_TENSOR_Q2_64A;
 }
 
 static bool tensor_type_is_dense_quant(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q4_0 ||
-           type == DS4_TENSOR_Q4_64A;
+           type == DS4_TENSOR_Q4_64A ||
+           type == DS4_TENSOR_Q2_64A;
 }
 
 static bool tensor_type_is_q4_64a(uint32_t type) {
     return type == DS4_TENSOR_Q4_64A;
+}
+
+static bool tensor_type_is_q2_64a(uint32_t type) {
+    return type == DS4_TENSOR_Q2_64A;
 }
 
 static void tensor_expect_glm_dense_quant_layout(
@@ -6961,6 +7019,30 @@ static void embed_token_q4_64a(const ds4_model *m, const ds4_weights *w, int tok
     }
 }
 
+static void embed_token_q2_64a(const ds4_model *m, const ds4_weights *w, int token, float *out) {
+    ds4_tensor *te = w->token_embd;
+    if (te->type != DS4_TENSOR_Q2_64A || te->ndim != 2) {
+        ds4_die("expected a 2D Q2_64A token embedding tensor");
+    }
+    if (token < 0 || (uint64_t)token >= te->dim[1]) {
+        ds4_die("token id is outside the embedding table");
+    }
+    const uint64_t n = te->dim[0];
+    const uint64_t nblocks = (n + 63) / 64;
+    const uint8_t *row = (const uint8_t *)tensor_data(m, te) + (uint64_t)token * nblocks * 20;
+    for (uint64_t b = 0; b < nblocks; b++) {
+        const block_q2_64a *blk = (const block_q2_64a *)(row + b * 20);
+        const float scale = ds4_bf16_to_f32(blk->scale);
+        const float bias = ds4_bf16_to_f32(blk->bias);
+        const uint64_t i0 = b * 64;
+        const uint64_t bn = n - i0 < 64 ? n - i0 : 64;
+        for (uint64_t i = 0; i < bn; i++) {
+            const uint8_t q = (blk->qs[i >> 2] >> ((i & 3) * 2)) & 0x03;
+            out[i0 + i] = (float)q * scale + bias;
+        }
+    }
+}
+
 static void embed_token_any(const ds4_model *m, const ds4_weights *w, int token, float *out) {
     if (!w->token_embd) ds4_die("token embedding tensor is missing");
     switch (w->token_embd->type) {
@@ -6972,6 +7054,9 @@ static void embed_token_any(const ds4_model *m, const ds4_weights *w, int token,
         break;
     case DS4_TENSOR_Q4_64A:
         embed_token_q4_64a(m, w, token, out);
+        break;
+    case DS4_TENSOR_Q2_64A:
+        embed_token_q2_64a(m, w, token, out);
         break;
     default:
         ds4_die("unsupported token embedding tensor type");
@@ -8096,12 +8181,26 @@ static void matvec_q4_64a(float *out, const ds4_model *m, const ds4_tensor *w, c
     }
 }
 
+static void matvec_q2_64a(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
+    if (w->type != DS4_TENSOR_Q2_64A || w->ndim < 2) ds4_die("expected Q2_64A matrix");
+    const uint64_t in_dim = w->dim[0];
+    const uint64_t out_dim = w->dim[1];
+    const uint64_t nblocks = (in_dim + 63) / 64;
+    const uint64_t row_bytes = nblocks * 20;
+    const uint8_t *data = tensor_data(m, w);
+    for (uint64_t r = 0; r < out_dim; r++) {
+        const block_q2_64a *row = (const block_q2_64a *)(data + r * row_bytes);
+        out[r] = ds4_vec_dot_q2_64a_f32((int)in_dim, row, x);
+    }
+}
+
 static void matvec_any(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
     switch (w->type) {
     case 0: matvec_f32(out, m, w, x); break;
     case 1: matvec_f16(out, m, w, x); break;
     case 8: matvec_q8_0(out, m, w, x); break;
     case DS4_TENSOR_Q4_64A: matvec_q4_64a(out, m, w, x); break;
+    case DS4_TENSOR_Q2_64A: matvec_q2_64a(out, m, w, x); break;
     default:
         ds4_die("unsupported tensor type for dense matvec");
     }
@@ -15118,16 +15217,16 @@ static void qwen_layer_forward_cpu(float *out, const ds4_model *m, const ds4_lay
         float *k = xmalloc((size_t)n_head_kv * head_dim * sizeof(float));
         float *v = xmalloc((size_t)n_head_kv * head_dim * sizeof(float));
         float *heads = xmalloc((size_t)n_head * head_dim * sizeof(float));
-        matvec_q4_64a(q, m, lw->attn_q_b, normed);
-        matvec_q4_64a(k, m, lw->attn_k_b, normed);
-        matvec_q4_64a(v, m, lw->attn_v_b, normed);
+        matvec_any(q, m, lw->attn_q_b, normed);
+        matvec_any(k, m, lw->attn_k_b, normed);
+        matvec_any(v, m, lw->attn_v_b, normed);
         rope_tail_layer_inplace(q, n_head, head_dim, 64, pos, 0, false);
         rope_tail_layer_inplace(k, n_head_kv, head_dim, 64, pos, 0, false);
         for (uint32_t h = 0; h < n_head; h++) {
             uint32_t kv_h = h / (n_head / n_head_kv);
             memcpy(heads + (uint64_t)h * head_dim, v + (uint64_t)kv_h * head_dim, (size_t)head_dim * sizeof(float));
         }
-        matvec_q4_64a(attn_out, m, lw->attn_output, heads);
+        matvec_any(attn_out, m, lw->attn_output, heads);
         free(heads);
         free(v);
         free(k);
@@ -15144,8 +15243,8 @@ static void qwen_layer_forward_cpu(float *out, const ds4_model *m, const ds4_lay
     float *gate = xmalloc((size_t)ff_dense * sizeof(float));
     float *up = xmalloc((size_t)ff_dense * sizeof(float));
     float *mid = xmalloc((size_t)ff_dense * sizeof(float));
-    matvec_q4_64a(gate, m, lw->ffn_gate, ffn_normed);
-    matvec_q4_64a(up, m, lw->ffn_up, ffn_normed);
+    matvec_any(gate, m, lw->ffn_gate, ffn_normed);
+    matvec_any(up, m, lw->ffn_up, ffn_normed);
     for (uint32_t i = 0; i < ff_dense; i++) {
         float g = gate[i];
         float sig = 1.0f / (1.0f + expf(-g));
@@ -15155,7 +15254,7 @@ static void qwen_layer_forward_cpu(float *out, const ds4_model *m, const ds4_lay
     free(up);
     free(ffn_normed);
     float *ffn_out = xmalloc((size_t)n_embd * sizeof(float));
-    matvec_q4_64a(ffn_out, m, lw->ffn_down, mid);
+    matvec_any(ffn_out, m, lw->ffn_down, mid);
     free(mid);
     for (uint32_t i = 0; i < n_embd; i++) out[i] = after_attn[i] + ffn_out[i];
     free(ffn_out);
@@ -15174,7 +15273,7 @@ static void qwen_forward_token_cpu(float *logits, const ds4_model *model, const 
     }
     float *norm = xmalloc((size_t)n_embd * sizeof(float));
     rms_norm_weight(norm, cur, tensor_data(model, weights->output_norm), n_embd, 1e-6f);
-    matvec_q4_64a(logits, model, weights->output, norm);
+    matvec_any(logits, model, weights->output, norm);
     // logits size is n_vocab, but we only need to fill; matvec does it
     (void)n_vocab;
     free(norm);
@@ -15277,30 +15376,34 @@ static int qwen_metal_forward_token(float *logits_out, const ds4_model *model, c
     ds4_gpu_tensor *norm = g_qwen_pool.norm;
     int ok = 1;
     // embed token
-    if (!ds4_gpu_embed_token_quant_tensor(cur, map, map_size, weights->token_embd->abs_offset, 36, n_vocab, token, n_embd)) ok = 0;
+    // For Q2_64A, Metal not yet optimized -> fallback to CPU
+    if (weights->token_embd->type == DS4_TENSOR_Q2_64A) { pthread_mutex_unlock(&g_qwen_pool.mu); return 0; }
+    if (!ds4_gpu_embed_token_quant_tensor(cur, map, map_size, weights->token_embd->abs_offset, weights->token_embd->type, n_vocab, token, n_embd)) ok = 0;
     for (uint32_t il = 0; ok && il < 64; il++) {
         const ds4_layer_weights *lw = &weights->layer[il];
         bool is_full = (il % 4 == 3);
         if (!ds4_gpu_rms_norm_weight_tensor(normed, cur, map, map_size, lw->attn_norm->abs_offset, n_embd, 1e-6f)) { ok = 0; break; }
         if (is_full && lw->attn_q_b && lw->attn_k_b && lw->attn_v_b && lw->attn_output) {
-            if (!ds4_gpu_matmul_quant_tensor(q, map, map_size, lw->attn_q_b->abs_offset, 36, n_embd, n_head*head_dim, normed, 1)) { ok = 0; break; }
-            if (!ds4_gpu_matmul_quant_tensor(k, map, map_size, lw->attn_k_b->abs_offset, 36, n_embd, n_head_kv*head_dim, normed, 1)) { ok = 0; break; }
-            if (!ds4_gpu_matmul_quant_tensor(v, map, map_size, lw->attn_v_b->abs_offset, 36, n_embd, n_head_kv*head_dim, normed, 1)) { ok = 0; break; }
+            // Q2 fallback
+            if (lw->attn_q_b->type == DS4_TENSOR_Q2_64A || lw->attn_k_b->type == DS4_TENSOR_Q2_64A) { ok = 0; break; }
+            if (!ds4_gpu_matmul_quant_tensor(q, map, map_size, lw->attn_q_b->abs_offset, lw->attn_q_b->type, n_embd, n_head*head_dim, normed, 1)) { ok = 0; break; }
+            if (!ds4_gpu_matmul_quant_tensor(k, map, map_size, lw->attn_k_b->abs_offset, lw->attn_k_b->type, n_embd, n_head_kv*head_dim, normed, 1)) { ok = 0; break; }
+            if (!ds4_gpu_matmul_quant_tensor(v, map, map_size, lw->attn_v_b->abs_offset, lw->attn_v_b->type, n_embd, n_head_kv*head_dim, normed, 1)) { ok = 0; break; }
             // RoPE (partial 64 of 256) - use qwen rope: n_rot=64, pos, base 10M
             if (!ds4_gpu_rope_tail_tensor(q, 1, n_head, head_dim, 64, pos, 262144, false, 10000000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f)) { ok = 0; break; }
             if (!ds4_gpu_rope_tail_tensor(k, 1, n_head_kv, head_dim, 64, pos, 262144, false, 10000000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f)) { ok = 0; break; }
             // expand V (4 heads) to 24 heads on GPU (no readback)
             if (!ds4_gpu_gqa_expand_f32_tensor(heads, v, n_head, n_head_kv, head_dim)) { ok = 0; break; }
-            if (!ds4_gpu_matmul_quant_tensor(attn_out, map, map_size, lw->attn_output->abs_offset, 36, n_head*head_dim, n_embd, heads, 1)) { ok = 0; break; }
+            if (!ds4_gpu_matmul_quant_tensor(attn_out, map, map_size, lw->attn_output->abs_offset, lw->attn_output->type, n_head*head_dim, n_embd, heads, 1)) { ok = 0; break; }
         } else {
             if (!ds4_gpu_fill_f32_tensor(attn_out, 0.0f, n_embd)) { ok = 0; break; }
         }
         if (!ds4_gpu_add_tensor(after_attn, cur, attn_out, n_embd)) { ok = 0; break; }
         if (!ds4_gpu_rms_norm_weight_tensor(ffn_normed, after_attn, map, map_size, lw->ffn_norm->abs_offset, n_embd, 1e-6f)) { ok = 0; break; }
-        if (!ds4_gpu_matmul_quant_tensor(gate, map, map_size, lw->ffn_gate->abs_offset, 36, n_embd, ff_dense, ffn_normed, 1)) { ok = 0; break; }
-        if (!ds4_gpu_matmul_quant_tensor(up, map, map_size, lw->ffn_up->abs_offset, 36, n_embd, ff_dense, ffn_normed, 1)) { ok = 0; break; }
+        if (!ds4_gpu_matmul_quant_tensor(gate, map, map_size, lw->ffn_gate->abs_offset, lw->ffn_gate->type, n_embd, ff_dense, ffn_normed, 1)) { ok = 0; break; }
+        if (!ds4_gpu_matmul_quant_tensor(up, map, map_size, lw->ffn_up->abs_offset, lw->ffn_up->type, n_embd, ff_dense, ffn_normed, 1)) { ok = 0; break; }
         if (!ds4_gpu_swiglu_tensor(mid, gate, up, ff_dense, 0.0f, 1.0f)) { ok = 0; break; }
-        if (!ds4_gpu_matmul_quant_tensor(ffn_out, map, map_size, lw->ffn_down->abs_offset, 36, ff_dense, n_embd, mid, 1)) { ok = 0; break; }
+        if (!ds4_gpu_matmul_quant_tensor(ffn_out, map, map_size, lw->ffn_down->abs_offset, lw->ffn_down->type, ff_dense, n_embd, mid, 1)) { ok = 0; break; }
         if (!ds4_gpu_add_tensor(next, after_attn, ffn_out, n_embd)) { ok = 0; break; }
         ds4_gpu_tensor *tmp = cur; cur = next; next = tmp;
     }
@@ -15309,7 +15412,7 @@ static int qwen_metal_forward_token(float *logits_out, const ds4_model *model, c
         // After loop, cur holds last output. Ensure we read from cur (pointer may be swapped)
         // cur/next were swapped in loop via tmp, so cur is correct here.
         if (!ds4_gpu_rms_norm_weight_tensor(norm, cur, map, map_size, weights->output_norm->abs_offset, n_embd, 1e-6f)) ok = 0;
-        else if (!ds4_gpu_matmul_quant_tensor(logits_gpu, map, map_size, weights->output->abs_offset, 36, n_embd, n_vocab, norm, 1)) ok = 0;
+        else if (!ds4_gpu_matmul_quant_tensor(logits_gpu, map, map_size, weights->output->abs_offset, weights->output->type, n_embd, n_vocab, norm, 1)) ok = 0;
         else if (!ds4_gpu_tensor_read(logits_gpu, 0, logits_out, (uint64_t)n_vocab * sizeof(float))) ok = 0;
     }
     // Update pool pointers to preserve swapped cur/next for next call
