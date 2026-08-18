@@ -2834,6 +2834,18 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+int ds4_gpu_gqa_expand_f32_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim);
+
+int ds4_gpu_fill_f32_tensor(
+        ds4_gpu_tensor *dst,
+        float            value,
+        uint32_t         n);
+
 /* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
  * out and stay eager).  Design ported from the Entrpi/ds4 batched-serving
  * fork's per-layer decode graph capture.  The key identifies a captured

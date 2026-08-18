@@ -67,6 +67,8 @@ static id<MTLComputePipelineState> g_get_rows_q8_0_pipeline;
 static id<MTLComputePipelineState> g_get_rows_q4_0_pipeline;
 static id<MTLComputePipelineState> g_get_rows_q4_K_pipeline;
 static id<MTLComputePipelineState> g_repeat_f32_pipeline;
+static id<MTLComputePipelineState> g_gqa_expand_f32_pipeline;
+static id<MTLComputePipelineState> g_fill_f32_pipeline;
 static id<MTLComputePipelineState> g_concat_pipeline;
 static id<MTLComputePipelineState> g_cpy_f32_f32_pipeline;
 static id<MTLComputePipelineState> g_cpy_f32_f16_pipeline;
@@ -6576,6 +6578,34 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
+        fn = [library newFunctionWithName:@"kernel_gqa_expand_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_gqa_expand_f32 function not found, will fallback to CPU expand\n");
+        } else {
+            g_gqa_expand_f32_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+            if (!g_gqa_expand_f32_pipeline) {
+                fprintf(stderr, "ds4: Metal kernel_gqa_expand_f32 pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+                g_queue = nil;
+                g_device = nil;
+                return 0;
+            }
+        }
+
+        fn = [library newFunctionWithName:@"kernel_fill_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_fill_f32 function not found, will fallback to CPU fill\n");
+        } else {
+            g_fill_f32_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+            if (!g_fill_f32_pipeline) {
+                fprintf(stderr, "ds4: Metal kernel_fill_f32 pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+                g_queue = nil;
+                g_device = nil;
+                return 0;
+            }
+        }
+
         fn = [library newFunctionWithName:@"kernel_set_rows_f32_i32"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_set_rows_f32_i32 function not found\n");
@@ -10184,6 +10214,8 @@ void ds4_gpu_cleanup(void) {
         g_get_rows_q4_0_pipeline = nil;
         g_get_rows_q4_K_pipeline = nil;
         g_repeat_f32_pipeline = nil;
+        g_gqa_expand_f32_pipeline = nil;
+        g_fill_f32_pipeline = nil;
         g_concat_pipeline = nil;
         g_cpy_f32_f32_pipeline = nil;
         g_cpy_f32_f16_pipeline = nil;
@@ -20579,6 +20611,94 @@ int ds4_gpu_repeat_hc_rows_tensor(
         if (!ds4_gpu_finish_command_buffer(cb, owned, "HC row repeat")) return 0;
     }
 
+    return 1;
+}
+
+int ds4_gpu_gqa_expand_f32_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!dst || !src || n_head == 0 || n_head_kv == 0 || head_dim == 0) return 0;
+    if (n_head % n_head_kv != 0) return 0;
+    if (!g_gqa_expand_f32_pipeline) {
+        // Fallback: CPU expand via read/write (slow but keeps correctness if kernel missing)
+        float *tmp_src = (float*)malloc((size_t)n_head_kv * head_dim * sizeof(float));
+        float *tmp_dst = (float*)malloc((size_t)n_head * head_dim * sizeof(float));
+        if (!tmp_src || !tmp_dst) { free(tmp_src); free(tmp_dst); return 0; }
+        if (!ds4_gpu_tensor_read(src, 0, tmp_src, (uint64_t)n_head_kv * head_dim * sizeof(float))) { free(tmp_src); free(tmp_dst); return 0; }
+        for (uint32_t h=0; h<n_head; h++) { uint32_t kv_h = h / (n_head / n_head_kv); memcpy(tmp_dst + (uint64_t)h*head_dim, tmp_src + (uint64_t)kv_h*head_dim, (size_t)head_dim*sizeof(float)); }
+        int ok = ds4_gpu_tensor_write(dst, 0, tmp_dst, (uint64_t)n_head * head_dim * sizeof(float));
+        free(tmp_src); free(tmp_dst); return ok;
+    }
+    @autoreleasepool {
+        id<MTLBuffer> sbuf = ds4_gpu_tensor_buffer(src);
+        id<MTLBuffer> dbuf = ds4_gpu_tensor_buffer(dst);
+        const uint64_t s_bytes = (uint64_t)n_head_kv * head_dim * sizeof(float);
+        const uint64_t d_bytes = (uint64_t)n_head * head_dim * sizeof(float);
+        if (!sbuf || !dbuf || ds4_gpu_tensor_bytes(src) < s_bytes || ds4_gpu_tensor_bytes(dst) < d_bytes) {
+            fprintf(stderr, "ds4: Metal GQA expand received undersized buffers\n");
+            return 0;
+        }
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_gqa_expand_f32_pipeline];
+        struct { uint32_t n_head; uint32_t n_head_kv; uint32_t head_dim; } args = { n_head, n_head_kv, head_dim };
+        [enc setBuffer:sbuf offset:ds4_gpu_tensor_offset(src) atIndex:0];
+        [enc setBuffer:dbuf offset:ds4_gpu_tensor_offset(dst) atIndex:1];
+        [enc setBytes:&args length:sizeof(args) atIndex:2];
+        const uint64_t total = (uint64_t)n_head * head_dim;
+        NSUInteger nth = g_gqa_expand_f32_pipeline.maxTotalThreadsPerThreadgroup;
+        if (nth > 256) nth = 256;
+        if (nth == 0) nth = 1;
+        NSUInteger groups = (NSUInteger)((total + nth - 1) / nth);
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "gqa expand")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_fill_f32_tensor(
+        ds4_gpu_tensor *dst,
+        float            value,
+        uint32_t         n) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!dst || n == 0) return 0;
+    if (!g_fill_f32_pipeline) {
+        float *tmp = (float*)calloc((size_t)n, sizeof(float));
+        if (!tmp) return 0;
+        if (value != 0.0f) for (uint32_t i=0;i<n;i++) tmp[i]=value;
+        int ok = ds4_gpu_tensor_write(dst, 0, tmp, (uint64_t)n*sizeof(float));
+        free(tmp); return ok;
+    }
+    @autoreleasepool {
+        id<MTLBuffer> dbuf = ds4_gpu_tensor_buffer(dst);
+        const uint64_t bytes = (uint64_t)n * sizeof(float);
+        if (!dbuf || ds4_gpu_tensor_bytes(dst) < bytes) {
+            fprintf(stderr, "ds4: Metal fill received undersized buffer\n");
+            return 0;
+        }
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_fill_f32_pipeline];
+        [enc setBuffer:dbuf offset:ds4_gpu_tensor_offset(dst) atIndex:0];
+        [enc setBytes:&value length:sizeof(value) atIndex:1];
+        [enc setBytes:&n length:sizeof(n) atIndex:2];
+        NSUInteger nth = g_fill_f32_pipeline.maxTotalThreadsPerThreadgroup;
+        if (nth > 256) nth = 256;
+        if (nth == 0) nth = 1;
+        NSUInteger groups = (NSUInteger)(((uint64_t)n + nth - 1) / nth);
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "fill f32")) return 0;
+    }
     return 1;
 }
 

@@ -50,3 +50,34 @@ typedef decltype(kernel_repeat<float>) kernel_repeat_t;
 
 // Host-visible F32 repeat used for HC expansion of embeddings.
 template [[host_name("kernel_repeat_f32")]] kernel kernel_repeat_t kernel_repeat<float>;
+
+// Qwen GQA expand: 4 kv heads (1024) -> 24 heads (6144), head_dim 256, factor 6.
+struct ds4_gqa_args {
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+};
+
+kernel void kernel_gqa_expand_f32(
+        device const float * src [[buffer(0)]],
+        device float * dst [[buffer(1)]],
+        constant ds4_gqa_args & args [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    const uint total = args.n_head * args.head_dim;
+    if (gid >= total) return;
+    const uint h = gid / args.head_dim;
+    const uint off = gid % args.head_dim;
+    const uint group = args.n_head / args.n_head_kv;
+    const uint kv_h = h / group;
+    dst[gid] = src[kv_h * args.head_dim + off];
+}
+
+// Fill with zero (or arbitrary value) for attn_out zero path
+kernel void kernel_fill_f32(
+        device float * dst [[buffer(0)]],
+        constant float & value [[buffer(1)]],
+        constant uint & n [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    dst[gid] = value;
+}
