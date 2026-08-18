@@ -127,6 +127,8 @@ typedef struct {
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    const char *dflash_path;
+    int dflash_draft_n_max;
     ds4_backend backend;
     int n_threads;
     int context_size;

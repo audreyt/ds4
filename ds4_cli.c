@@ -1846,6 +1846,17 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
+        } else if (!strcmp(arg, "--dflash") || !strcmp(arg, "--dflash2") || !strcmp(arg, "--draft-model") || !strcmp(arg, "-hfd")) {
+            c.engine.dflash_path = need_arg(&i, argc, argv, arg);
+            if (c.engine.dflash_draft_n_max == 0) c.engine.dflash_draft_n_max = 7;
+        } else if (!strcmp(arg, "--spec-type") || !strcmp(arg, "--spec-draft-type")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (strcmp(v, "draft-dflash") && strcmp(v, "dflash") && strcmp(v, "dflash2")) {
+                fprintf(stderr, "ds4: --spec-type only supports draft-dflash/dflash/dflash2 for QWEN\n");
+                exit(1);
+            }
+        } else if (!strcmp(arg, "--spec-draft-n-max") || !strcmp(arg, "--dflash-n-max")) {
+            c.engine.dflash_draft_n_max = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--glm-mtp")) {
             c.engine.glm_mtp = true;
         } else if (!strcmp(arg, "--glm-mtp-timing")) {
