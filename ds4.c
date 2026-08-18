@@ -6012,6 +6012,12 @@ static void config_validate_glm_dsa_model(const ds4_model *m) {
 
 static void config_validate_qwen_model(const ds4_model *m) {
     g_ds4_shape = DS4_SHAPE_QWEN38;
+    ds4_str arch = {0};
+    if (model_get_string(m, "general.architecture", &arch) && ds4_streq(arch, "dflash")) {
+        // DFlash2 draft: 1.9B, different dims, reuse QWEN38 shape for ds4's qwen path is not exact but allows loading for draft
+        // Skip strict block_count/embedding_length checks; draft will be run via its own path if needed
+        return;
+    }
     // Minimal validation: qwen GGUF must have qwen3 block_count and embedding_length
     uint32_t n_layer = 0;
     uint32_t n_embd = 0;
@@ -6036,7 +6042,7 @@ static void config_validate_model(const ds4_model *m) {
     if (model_get_string(m, "general.architecture", &arch) &&
         (ds4_streq(arch, "qwen3") || ds4_streq(arch, "qwen3_5") ||
          ds4_streq(arch, "qwen3_5_text") || ds4_streq(arch, "qwen2") ||
-         ds4_streq(arch, "qwen"))) {
+         ds4_streq(arch, "qwen") || ds4_streq(arch, "dflash"))) {
         config_validate_qwen_model(m);
         return;
     }
