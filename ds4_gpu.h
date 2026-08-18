@@ -2846,6 +2846,21 @@ int ds4_gpu_fill_f32_tensor(
         float            value,
         uint32_t         n);
 
+int ds4_gpu_qwen_gqa_attn_decode_tensor(
+        ds4_gpu_tensor       *heads_out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_new,
+        const ds4_gpu_tensor *v_new,
+        ds4_gpu_tensor       *k_cache,
+        uint64_t              k_cache_offset,
+        ds4_gpu_tensor       *v_cache,
+        uint64_t              v_cache_offset,
+        uint32_t              pos,
+        uint32_t              max_ctx,
+        uint32_t              n_head,
+        uint32_t              n_head_kv,
+        uint32_t              head_dim);
+
 /* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
  * out and stay eager).  Design ported from the Entrpi/ds4 batched-serving
  * fork's per-layer decode graph capture.  The key identifies a captured

@@ -70,6 +70,7 @@ static id<MTLComputePipelineState> g_get_rows_q4_K_pipeline;
 static id<MTLComputePipelineState> g_repeat_f32_pipeline;
 static id<MTLComputePipelineState> g_gqa_expand_f32_pipeline;
 static id<MTLComputePipelineState> g_fill_f32_pipeline;
+static id<MTLComputePipelineState> g_qwen_gqa_attn_decode_pipeline;
 static id<MTLComputePipelineState> g_concat_pipeline;
 static id<MTLComputePipelineState> g_cpy_f32_f32_pipeline;
 static id<MTLComputePipelineState> g_cpy_f32_f16_pipeline;
@@ -2490,28 +2491,16 @@ static void ds4_gpu_detect_metal4_features(void) {
         }
 
         if (g_metal4_family_supported) {
-            const int default_enable =
-                ds4_gpu_device_name_contains("M5") ||
-                ds4_gpu_device_name_contains("M6") ||
-                ds4_gpu_device_name_contains("A19") ||
-                ds4_gpu_device_name_contains("A20");
-
-            /*
-             * Metal 4 TensorOps are portable in source, but on pre-M5 hardware
-             * they can map to ordinary shader fallbacks.  Keep the automatic
-             * fast path restricted to hardware generations where the Neural
-             * Accelerator/TensorOps path is expected to pay off; older Metal
-             * machines continue to use the established kernels unless a future
-             * device is explicitly added here.
-             */
-            if (default_enable) {
+            const int pre_m5_disabled = ds4_gpu_env_bool("DS4_METAL_DISABLE_PRE_M5_TENSOR") > 0;
+            const int pre_m5 = ds4_gpu_device_is_pre_m5_apple_silicon();
+            if (pre_m5 && pre_m5_disabled) {
+                fprintf(stderr, "ds4: Metal 4 tensor API disabled for pre-M5 devices by DS4_METAL_DISABLE_PRE_M5_TENSOR\n");
+            } else {
                 g_metal4_tensor_api_compile_supported = ds4_gpu_compile_tensor_probe();
                 g_metal4_tensor_api_enabled = g_metal4_tensor_api_compile_supported;
                 if (!g_metal4_tensor_api_enabled) {
                     fprintf(stderr, "ds4: Metal 4 tensor API probe failed; using legacy Metal kernels\n");
                 }
-            } else {
-                fprintf(stderr, "ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices\n");
             }
         }
     }
@@ -6627,6 +6616,17 @@ int ds4_gpu_init(void) {
             }
         }
 
+        fn = [library newFunctionWithName:@"kernel_qwen_gqa_attn_decode"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_qwen_gqa_attn_decode function not found\n");
+        } else {
+            g_qwen_gqa_attn_decode_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+            if (!g_qwen_gqa_attn_decode_pipeline) {
+                fprintf(stderr, "ds4: Metal kernel_qwen_gqa_attn_decode pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            }
+        }
+
         fn = [library newFunctionWithName:@"kernel_set_rows_f32_i32"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_set_rows_f32_i32 function not found\n");
@@ -10237,6 +10237,7 @@ void ds4_gpu_cleanup(void) {
         g_repeat_f32_pipeline = nil;
         g_gqa_expand_f32_pipeline = nil;
         g_fill_f32_pipeline = nil;
+        g_qwen_gqa_attn_decode_pipeline = nil;
         g_concat_pipeline = nil;
         g_cpy_f32_f32_pipeline = nil;
         g_cpy_f32_f16_pipeline = nil;
@@ -20742,6 +20743,61 @@ int ds4_gpu_fill_f32_tensor(
         [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "fill f32")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_qwen_gqa_attn_decode_tensor(
+        ds4_gpu_tensor       *heads_out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_new,
+        const ds4_gpu_tensor *v_new,
+        ds4_gpu_tensor       *k_cache,
+        uint64_t              k_cache_offset,
+        ds4_gpu_tensor       *v_cache,
+        uint64_t              v_cache_offset,
+        uint32_t              pos,
+        uint32_t              max_ctx,
+        uint32_t              n_head,
+        uint32_t              n_head_kv,
+        uint32_t              head_dim) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!heads_out || !q || !k_new || !v_new || !k_cache || !v_cache) return 0;
+    if (!g_qwen_gqa_attn_decode_pipeline) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> q_buf = ds4_gpu_tensor_buffer(q);
+        id<MTLBuffer> k_buf = ds4_gpu_tensor_buffer(k_new);
+        id<MTLBuffer> v_buf = ds4_gpu_tensor_buffer(v_new);
+        id<MTLBuffer> kc_buf = ds4_gpu_tensor_buffer(k_cache);
+        id<MTLBuffer> vc_buf = ds4_gpu_tensor_buffer(v_cache);
+        id<MTLBuffer> out_buf = ds4_gpu_tensor_buffer(heads_out);
+        if (!q_buf || !k_buf || !v_buf || !kc_buf || !vc_buf || !out_buf) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_qwen_gqa_attn_decode_pipeline];
+
+        struct {
+            uint32_t pos;
+            uint32_t max_ctx;
+            uint32_t n_head;
+            uint32_t n_head_kv;
+            uint32_t head_dim;
+        } args = { pos, max_ctx, n_head, n_head_kv, head_dim };
+
+        [enc setBuffer:q_buf offset:ds4_gpu_tensor_offset(q) atIndex:0];
+        [enc setBuffer:k_buf offset:ds4_gpu_tensor_offset(k_new) atIndex:1];
+        [enc setBuffer:v_buf offset:ds4_gpu_tensor_offset(v_new) atIndex:2];
+        [enc setBuffer:kc_buf offset:ds4_gpu_tensor_offset(k_cache) + k_cache_offset atIndex:3];
+        [enc setBuffer:vc_buf offset:ds4_gpu_tensor_offset(v_cache) + v_cache_offset atIndex:4];
+        [enc setBuffer:out_buf offset:ds4_gpu_tensor_offset(heads_out) atIndex:5];
+        [enc setBytes:&args length:sizeof(args) atIndex:6];
+
+        [enc dispatchThreadgroups:MTLSizeMake(n_head, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "qwen gqa decode")) return 0;
     }
     return 1;
 }
