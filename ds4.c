@@ -40201,6 +40201,17 @@ static int qwen_generate_hybrid(
                 break;
             }
         }
+        /* Slots pos+1..pos+accepted were written from draft hiddens.
+           Replay them with target hiddens so the next round attends truth. */
+#ifndef DS4_NO_GPU
+        if (use_mtp && accepted > 0) {
+            for (int d = 0; d < accepted; d++) {
+                qwen_mtp_draft_one_metal(NULL, NULL, NULL, model, weights, &mtp_w,
+                                         ver_hidden + (size_t)d * 5120,
+                                         drafts[d], (uint32_t)pos + 1u + (uint32_t)d, 0);
+            }
+        }
+#endif
         if (accepted + 1 < (int)n_ver && !qwen_hybrid_restore_gdn_prefix((uint32_t)accepted)) {
             /* the recurrent state now carries rejected rows; drop the run
                rather than emit tokens conditioned on it */
