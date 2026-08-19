@@ -280,6 +280,50 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
                                             n_embd);
 }
 
+extern "C" int ds4_gpu_model_is_mapped(const void *model_map) {
+    (void)model_map;
+    return 1;
+}
+extern "C" void ds4_gpu_set_concurrent_encoder(int on) { (void)on; }
+extern "C" int ds4_gpu_matmul_q4_k_pair_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *model_map, uint64_t model_size,
+        uint64_t weight0_offset, uint64_t weight1_offset, uint32_t weight_type,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    (void)out0; (void)out1; (void)model_map; (void)model_size;
+    (void)weight0_offset; (void)weight1_offset; (void)weight_type;
+    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
+    return 0;
+}
+
+
+extern "C" int ds4_gpu_qwen_gdn_core_tensor(
+        ds4_gpu_tensor *core, ds4_gpu_tensor *conv, ds4_gpu_tensor *state,
+        const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha, const ds4_gpu_tensor *beta,
+        const void *model_map, uint64_t model_size,
+        uint64_t conv_w_off, uint64_t a_off, uint64_t dt_off, uint64_t snorm_off,
+        uint32_t layer) {
+    (void)core; (void)conv; (void)state; (void)qkv; (void)z;
+    (void)alpha; (void)beta; (void)model_map; (void)model_size;
+    (void)conv_w_off; (void)a_off; (void)dt_off; (void)snorm_off; (void)layer;
+    return 0;
+}
+extern "C" int ds4_gpu_qwen_full_attn_tensor(
+        ds4_gpu_tensor *heads, ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
+        const void *model_map, uint64_t model_size,
+        uint64_t q_norm_off, uint64_t k_norm_off,
+        uint32_t has_q_norm, uint32_t has_k_norm, uint32_t gated,
+        uint32_t pos, uint32_t layer, uint32_t cap) {
+    (void)heads; (void)q; (void)k; (void)v; (void)gate; (void)k_cache; (void)v_cache;
+    (void)model_map; (void)model_size; (void)q_norm_off; (void)k_norm_off;
+    (void)has_q_norm; (void)has_k_norm; (void)gated; (void)pos; (void)layer; (void)cap;
+    return 0;
+}
+
+
+
 extern "C" int ds4_gpu_matmul_quant_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint32_t weight_type, uint64_t in_dim,

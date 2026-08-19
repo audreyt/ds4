@@ -3341,6 +3341,25 @@ kernel void kernel_mul_mv_q4_K_dense_f32(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
+kernel void kernel_mul_mv_q4_K_dense_f32_pair(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1,
+        device       char * dst_a,
+        device       char * dst_b,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (sgitg < 2) {
+        kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(args, src0_a, src1, dst_a, shmem, tgpig, tiisg, sgitg);
+    } else {
+        kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(args, src0_b, src1, dst_b, shmem, tgpig, tiisg, (ushort)(sgitg - 2));
+    }
+}
+
+
 
 // DS4 attention output low projection, specialized for the fixed block
 // diagonal mapping used by the model:
