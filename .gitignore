@@ -40,3 +40,4 @@ __pycache__/
 .DS_Store
 /logs/
 /.worktrees/
+/mtp-heads/

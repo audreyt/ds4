@@ -4257,6 +4257,13 @@ static int ds4_gpu_model_map_log_enabled(void) {
     return trace && trace[0] && strcmp(trace, "0") != 0;
 }
 
+static id<MTLBuffer> ds4_gpu_wrap_model_exact_range(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    offset,
+        uint64_t    len,
+        uint64_t   *inner_offset);
+
 static id<MTLBuffer> ds4_gpu_wrap_model_range(
         const void *model_map,
         uint64_t    model_size,
@@ -11551,11 +11558,8 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
         }
     }
 
-    fprintf(stderr,
-            "ds4: Metal model range %.2f..%.2f GiB is not covered by mapped model views\n",
-            ds4_gpu_gib(offset),
-            ds4_gpu_gib(end));
-    return nil;
+    /* A second mmap (MTP sidecar) is not in the backbone view table. */
+    return ds4_gpu_wrap_model_exact_range(model_map, model_size, offset, len, inner_offset);
 }
 
 typedef enum {

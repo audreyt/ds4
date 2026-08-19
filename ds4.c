@@ -16940,6 +16940,7 @@ static void qwen_metal_prefill(float *logits, const ds4_model *model, const ds4_
 // and rollback via pool snapshot (cur/next pointers + hidden).
 
 typedef struct {
+    const ds4_model *src;
     ds4_tensor *e_proj;
     ds4_tensor *h_proj;
     ds4_tensor *enorm;
@@ -16967,9 +16968,16 @@ static bool qwen_has_mtp(const ds4_model *m) {
            model_find_tensor(m, "mtp.0.hnorm.weight") != NULL;
 }
 
-static void qwen_mtp_bind(qwen_mtp_weights_t *w, const ds4_model *m) {
-    memset(w, 0, sizeof(*w));
-    if (!m) return;
+static ds4_model g_qwen_mtp_sidecar;
+static int g_qwen_mtp_sidecar_ready; /* 0 unset, 1 loaded, -1 none/fail */
+
+static const ds4_model *qwen_mtp_src(const qwen_mtp_weights_t *w, const ds4_model *fallback) {
+    return (w && w->src) ? w->src : fallback;
+}
+
+static bool qwen_mtp_is_valid(const qwen_mtp_weights_t *w);
+static void qwen_mtp_bind_from(qwen_mtp_weights_t *w, const ds4_model *m) {
+    w->src = m;
     w->e_proj = model_find_tensor(m, "mtp.0.e_proj.weight");
     w->h_proj = model_find_tensor(m, "mtp.0.h_proj.weight");
     w->enorm = model_find_tensor(m, "mtp.0.enorm.weight");
@@ -16986,9 +16994,33 @@ static void qwen_mtp_bind(qwen_mtp_weights_t *w, const ds4_model *m) {
     w->ffn_gate = model_find_tensor(m, "mtp.0.ffn_gate.weight");
     w->ffn_up = model_find_tensor(m, "mtp.0.ffn_up.weight");
     w->ffn_down = model_find_tensor(m, "mtp.0.ffn_down.weight");
-
-    // compat: alternative naming from bf16 head (fc = concat e_proj+h_proj)
     if (!w->e_proj) w->e_proj = model_find_tensor(m, "mtp.0.fc.weight");
+}
+
+static void qwen_mtp_bind(qwen_mtp_weights_t *w, const ds4_model *m) {
+    memset(w, 0, sizeof(*w));
+    if (!m) return;
+    if (g_qwen_mtp_sidecar_ready == 0) {
+        const char *p = getenv("DS4_QWEN_MTP_HEAD");
+        if (p && p[0]) {
+            model_open(&g_qwen_mtp_sidecar, p, true, true);
+            qwen_mtp_weights_t probe;
+            memset(&probe, 0, sizeof(probe));
+            qwen_mtp_bind_from(&probe, &g_qwen_mtp_sidecar);
+            if (qwen_mtp_is_valid(&probe)) {
+                g_qwen_mtp_sidecar_ready = 1;
+                fprintf(stderr, "ds4: using MTP head sidecar %s\n", p);
+            } else {
+                fprintf(stderr, "ds4: MTP head sidecar %s is missing required tensors; ignoring\n", p);
+                model_close(&g_qwen_mtp_sidecar);
+                g_qwen_mtp_sidecar_ready = -1;
+            }
+        } else {
+            g_qwen_mtp_sidecar_ready = -1;
+        }
+    }
+    if (g_qwen_mtp_sidecar_ready == 1) qwen_mtp_bind_from(w, &g_qwen_mtp_sidecar);
+    else qwen_mtp_bind_from(w, m);
 }
 
 static bool qwen_mtp_is_valid(const qwen_mtp_weights_t *w) {
@@ -17132,7 +17164,8 @@ static int qwen_metal_forward_token_capture(float *logits_out, float *hidden_out
 }
 #endif
 
-static void qwen_mtp_layer_forward_cpu(float *out, const ds4_model *m, const qwen_mtp_weights_t *mtp, const float *inp, uint32_t pos) {
+static void qwen_mtp_layer_forward_cpu(float *out, const ds4_model *fallback, const qwen_mtp_weights_t *mtp, const float *inp, uint32_t pos) {
+    const ds4_model *m = qwen_mtp_src(mtp, fallback);
 
     const uint32_t n_embd = 5120;
     const uint32_t n_head = 24;
@@ -17234,11 +17267,12 @@ static int qwen_mtp_draft_one_cpu(float *logits_out, float *hidden_out, const ds
     float *eproj = xmalloc((size_t)n_embd * sizeof(float));
     float *hproj = xmalloc((size_t)n_embd * sizeof(float));
     float *fused = xmalloc((size_t)n_embd * sizeof(float));
+    const ds4_model *head = qwen_mtp_src(mtp, model);
     embed_token_any(model, base_weights, next_token, e_emb);
-    rms_norm_weight(enormed, e_emb, tensor_data(model, mtp->enorm), n_embd, 1e-6f);
-    rms_norm_weight(hnormed, hidden_in, tensor_data(model, mtp->hnorm), n_embd, 1e-6f);
-    matvec_any(eproj, model, mtp->e_proj, enormed);
-    matvec_any(hproj, model, mtp->h_proj, hnormed);
+    rms_norm_weight(enormed, e_emb, tensor_data(head, mtp->enorm), n_embd, 1e-6f);
+    rms_norm_weight(hnormed, hidden_in, tensor_data(head, mtp->hnorm), n_embd, 1e-6f);
+    matvec_any(eproj, head, mtp->e_proj, enormed);
+    matvec_any(hproj, head, mtp->h_proj, hnormed);
     for (uint32_t i=0;i<n_embd;i++) fused[i]=eproj[i]+hproj[i];
     free(e_emb); free(enormed); free(hnormed); free(eproj); free(hproj);
     // optionally run mtp block
@@ -17252,7 +17286,7 @@ static int qwen_mtp_draft_one_cpu(float *logits_out, float *hidden_out, const ds
         to_norm = tmp_block;
     }
     float *normed = xmalloc((size_t)n_embd * sizeof(float));
-    const float *norm_w = mtp->norm ? tensor_data(model, mtp->norm) : tensor_data(model, base_weights->output_norm);
+    const float *norm_w = mtp->norm ? tensor_data(head, mtp->norm) : tensor_data(model, base_weights->output_norm);
     rms_norm_weight(normed, to_norm, norm_w, n_embd, 1e-6f);
     matvec_any(logits_out, model, base_weights->output, normed);
     if (hidden_out) memcpy(hidden_out, to_norm, (size_t)n_embd*sizeof(float));
@@ -17341,8 +17375,11 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
     if (slot > 7u) slot = 7u;
     if (!qwen_mtp_is_valid(mtp) || !hidden_in) return 0;
     if (!qwen_mtp_metal_ensure_pool()) return 0;
-    const void *map = model->map;
-    const uint64_t map_size = model->size;
+    const ds4_model *head = qwen_mtp_src(mtp, model);
+    const void *map = head->map;
+    const uint64_t map_size = head->size;
+    const void *base_map = model->map;
+    const uint64_t base_size = model->size;
     const uint32_t n_embd = 5120, n_vocab = 248320, ff_dense = 17408;
     const uint32_t n_head = 24, n_head_kv = 4, head_dim = 256;
     const uint64_t q_out = mtp->attn_q ? mtp->attn_q->dim[1] : 0;
@@ -17355,7 +17392,7 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
     if (ok && !ds4_gpu_begin_commands()) ok = 0;
     if (!ok) { pthread_mutex_unlock(&g_mtp_pool.mu); return 0; }
 
-    if (!ds4_gpu_embed_token_quant_tensor(g_mtp_pool.e_emb, map, map_size,
+    if (!ds4_gpu_embed_token_quant_tensor(g_mtp_pool.e_emb, base_map, base_size,
                                           base_weights->token_embd->abs_offset,
                                           base_weights->token_embd->type,
                                           n_vocab, next_token, n_embd)) ok = 0;
@@ -17363,24 +17400,19 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
                                               mtp->enorm->abs_offset, n_embd, 1e-6f)) ok = 0;
     if (ok && !ds4_gpu_rms_norm_weight_tensor(g_mtp_pool.hnorm, g_mtp_pool.hidden, map, map_size,
                                               mtp->hnorm->abs_offset, n_embd, 1e-6f)) ok = 0;
-    if (ok && !ds4_gpu_matmul_quant_tensor(g_mtp_pool.eproj, map, map_size, mtp->e_proj->abs_offset,
-                                           mtp->e_proj->type, n_embd, n_embd, g_mtp_pool.enorm, 1)) ok = 0;
-    if (ok && !ds4_gpu_matmul_quant_tensor(g_mtp_pool.hproj, map, map_size, mtp->h_proj->abs_offset,
-                                           mtp->h_proj->type, n_embd, n_embd, g_mtp_pool.hnorm, 1)) ok = 0;
+    if (ok && !qwen_gpu_matmul(g_mtp_pool.eproj, head, mtp->e_proj, n_embd, n_embd, g_mtp_pool.enorm, 1)) ok = 0;
+    if (ok && !qwen_gpu_matmul(g_mtp_pool.hproj, head, mtp->h_proj, n_embd, n_embd, g_mtp_pool.hnorm, 1)) ok = 0;
     if (ok && !ds4_gpu_add_tensor(g_mtp_pool.fused, g_mtp_pool.eproj, g_mtp_pool.hproj, n_embd)) ok = 0;
 
     ds4_gpu_tensor *tail = g_mtp_pool.fused;
     if (ok && has_block) {
         if (!ds4_gpu_rms_norm_weight_tensor(g_mtp_pool.normed, g_mtp_pool.fused, map, map_size,
                                             mtp->attn_norm->abs_offset, n_embd, 1e-6f)) ok = 0;
-        if (ok && !ds4_gpu_matmul_quant_tensor(g_mtp_pool.q, map, map_size, mtp->attn_q->abs_offset,
-                                               mtp->attn_q->type, n_embd, q_out, g_mtp_pool.normed, 1)) ok = 0;
-        if (ok && !ds4_gpu_matmul_quant_tensor(g_mtp_pool.k, map, map_size, mtp->attn_k->abs_offset,
-                                               mtp->attn_k->type, n_embd, n_head_kv * head_dim,
-                                               g_mtp_pool.normed, 1)) ok = 0;
-        if (ok && !ds4_gpu_matmul_quant_tensor(g_mtp_pool.v, map, map_size, mtp->attn_v->abs_offset,
-                                               mtp->attn_v->type, n_embd, n_head_kv * head_dim,
-                                               g_mtp_pool.normed, 1)) ok = 0;
+        if (ok && !qwen_gpu_matmul(g_mtp_pool.q, head, mtp->attn_q, n_embd, q_out, g_mtp_pool.normed, 1)) ok = 0;
+        if (ok && !qwen_gpu_matmul(g_mtp_pool.k, head, mtp->attn_k, n_embd, n_head_kv * head_dim,
+                                   g_mtp_pool.normed, 1)) ok = 0;
+        if (ok && !qwen_gpu_matmul(g_mtp_pool.v, head, mtp->attn_v, n_embd, n_head_kv * head_dim,
+                                   g_mtp_pool.normed, 1)) ok = 0;
         if (ok && !ds4_gpu_qwen_full_attn_tensor(g_mtp_pool.heads, g_mtp_pool.q, g_mtp_pool.k,
                                                  g_mtp_pool.v, g_mtp_pool.gate,
                                                  g_mtp_pool.k_cache, g_mtp_pool.v_cache,
@@ -17389,23 +17421,19 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
                                                  mtp->attn_k_norm ? mtp->attn_k_norm->abs_offset : 0,
                                                  mtp->attn_q_norm != NULL, mtp->attn_k_norm != NULL,
                                                  gated_q, slot, 0, 8)) ok = 0;
-        if (ok && !ds4_gpu_matmul_quant_tensor(g_mtp_pool.attn_out, map, map_size, mtp->attn_out->abs_offset,
-                                               mtp->attn_out->type, n_head * head_dim, n_embd,
-                                               g_mtp_pool.heads, 1)) ok = 0;
+        if (ok && !qwen_gpu_matmul(g_mtp_pool.attn_out, head, mtp->attn_out, n_head * head_dim, n_embd,
+                                   g_mtp_pool.heads, 1)) ok = 0;
         if (ok && !ds4_gpu_add_tensor(g_mtp_pool.after, g_mtp_pool.fused, g_mtp_pool.attn_out, n_embd)) ok = 0;
         if (ok && !ds4_gpu_rms_norm_weight_tensor(g_mtp_pool.ffn_normed, g_mtp_pool.after, map, map_size,
                                                   mtp->ffn_norm->abs_offset, n_embd, 1e-6f)) ok = 0;
-        if (ok && !ds4_gpu_matmul_quant_tensor(g_mtp_pool.ffn_gate, map, map_size, mtp->ffn_gate->abs_offset,
-                                               mtp->ffn_gate->type, n_embd, ff_dense,
-                                               g_mtp_pool.ffn_normed, 1)) ok = 0;
-        if (ok && !ds4_gpu_matmul_quant_tensor(g_mtp_pool.ffn_up, map, map_size, mtp->ffn_up->abs_offset,
-                                               mtp->ffn_up->type, n_embd, ff_dense,
-                                               g_mtp_pool.ffn_normed, 1)) ok = 0;
+        if (ok && !qwen_gpu_matmul(g_mtp_pool.ffn_gate, head, mtp->ffn_gate, n_embd, ff_dense,
+                                   g_mtp_pool.ffn_normed, 1)) ok = 0;
+        if (ok && !qwen_gpu_matmul(g_mtp_pool.ffn_up, head, mtp->ffn_up, n_embd, ff_dense,
+                                   g_mtp_pool.ffn_normed, 1)) ok = 0;
         if (ok && !ds4_gpu_swiglu_tensor(g_mtp_pool.ffn_mid, g_mtp_pool.ffn_gate, g_mtp_pool.ffn_up,
                                          ff_dense, 0.0f, 1.0f)) ok = 0;
-        if (ok && !ds4_gpu_matmul_quant_tensor(g_mtp_pool.ffn_out, map, map_size, mtp->ffn_down->abs_offset,
-                                               mtp->ffn_down->type, ff_dense, n_embd,
-                                               g_mtp_pool.ffn_mid, 1)) ok = 0;
+        if (ok && !qwen_gpu_matmul(g_mtp_pool.ffn_out, head, mtp->ffn_down, ff_dense, n_embd,
+                                   g_mtp_pool.ffn_mid, 1)) ok = 0;
         if (ok && !ds4_gpu_add_tensor(g_mtp_pool.block_out, g_mtp_pool.after, g_mtp_pool.ffn_out, n_embd)) ok = 0;
         if (ok) tail = g_mtp_pool.block_out;
     }
@@ -17413,7 +17441,7 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
     if (ok && !ds4_gpu_rms_norm_weight_tensor(g_mtp_pool.normed, tail, map, map_size,
                                               mtp->norm ? mtp->norm->abs_offset : base_weights->output_norm->abs_offset,
                                               n_embd, 1e-6f)) ok = 0;
-    if (ok && !ds4_gpu_matmul_quant_tensor(g_mtp_pool.logits, map, map_size, base_weights->output->abs_offset,
+    if (ok && !ds4_gpu_matmul_quant_tensor(g_mtp_pool.logits, base_map, base_size, base_weights->output->abs_offset,
                                            base_weights->output->type, n_embd, n_vocab,
                                            g_mtp_pool.normed, 1)) ok = 0;
     if (ok && tok_out && !ds4_gpu_indexer_topk_tensor(g_mtp_pool.argmax, g_mtp_pool.logits, n_vocab, 1, 1)) ok = 0;
