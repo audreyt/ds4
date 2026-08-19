@@ -17665,7 +17665,8 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
     const uint32_t n_head = 24, n_head_kv = 4, head_dim = 256;
     const uint64_t q_out = mtp->attn_q ? mtp->attn_q->dim[1] : 0;
     const uint32_t gated_q = (q_out == (uint64_t)n_head * head_dim * 2u) ? 1u : 0u;
-    const int has_block = mtp->attn_norm && mtp->attn_q && mtp->attn_k && mtp->attn_v &&
+    const int has_block = !(getenv("DS4_QWEN_MTP_NO_BLOCK") && getenv("DS4_QWEN_MTP_NO_BLOCK")[0] != '0') &&
+                          mtp->attn_norm && mtp->attn_q && mtp->attn_k && mtp->attn_v &&
                           mtp->attn_out && mtp->ffn_norm && mtp->ffn_gate && mtp->ffn_up && mtp->ffn_down;
     const bool has_packed_head = mtp->draft_lm_head_q &&
                                  mtp->draft_lm_head_scales &&
