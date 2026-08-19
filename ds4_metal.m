@@ -19680,6 +19680,106 @@ int ds4_gpu_qwen_gdn_core_rows_tensor(
     return 1;
 }
 
+int ds4_gpu_qwen_full_attn_rows_tensor(
+        ds4_gpu_tensor       *heads,
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *k_cache,
+        ds4_gpu_tensor       *v_cache,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_norm_off,
+        uint64_t              k_norm_off,
+        uint32_t              has_q_norm,
+        uint32_t              has_k_norm,
+        uint32_t              gated,
+        uint32_t              pos0,
+        uint32_t              layer,
+        uint32_t              cap,
+        uint32_t              n_tok) {
+    const uint32_t n_head = 24, n_head_kv = 4, head_dim = 256;
+    const uint64_t kv_bytes = (uint64_t)n_head_kv * head_dim * sizeof(float);
+    if (!heads || !q || !k || !v || !gate || !k_cache || !v_cache) return 0;
+    if (n_tok == 0 || pos0 + n_tok > cap) return 0;
+    if (gated) {
+        id<MTLComputePipelineState> split_p = ds4_gpu_get_pipeline("kernel_qwen_split_gated_q_rows");
+        if (!split_p) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        struct { uint32_t n_head; uint32_t head_dim; uint32_t n_tok; } sargs = { n_head, head_dim, n_tok };
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:split_p];
+        [enc setBytes:&sargs length:sizeof(sargs) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(q) offset:ds4_gpu_tensor_offset(q) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(heads) offset:ds4_gpu_tensor_offset(heads) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(gate) offset:ds4_gpu_tensor_offset(gate) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n_head * head_dim * n_tok, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "qwen split q rows")) return 0;
+        if (!ds4_gpu_tensor_copy_compute(q, 0, heads, 0,
+                                         (uint64_t)n_tok * n_head * head_dim * sizeof(float))) return 0;
+    }
+    if (has_q_norm) {
+        if (!ds4_gpu_rms_norm_weight_rows_tensor(q, q, model_map, model_size, q_norm_off,
+                                                 head_dim, n_head * n_tok, 1e-6f)) return 0;
+    }
+    if (has_k_norm) {
+        if (!ds4_gpu_rms_norm_weight_rows_tensor(k, k, model_map, model_size, k_norm_off,
+                                                 head_dim, n_head_kv * n_tok, 1e-6f)) return 0;
+    }
+    id<MTLComputePipelineState> rope_p = ds4_gpu_get_pipeline("kernel_qwen_rope_rotate_half_rows");
+    id<MTLComputePipelineState> attn_p = ds4_gpu_get_pipeline("kernel_qwen_attn_decode_rows");
+    if (!rope_p || !attn_p) return 0;
+    {
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        struct { uint32_t n_head, head_dim, n_rot, pos0; float freq_base; uint32_t n_tok; } rargs =
+            { n_head, head_dim, 64u, pos0, 10000000.0f, n_tok };
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:rope_p];
+        [enc setBytes:&rargs length:sizeof(rargs) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(q) offset:ds4_gpu_tensor_offset(q) atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake(n_head, n_tok, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        rargs.n_head = n_head_kv;
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:rope_p];
+        [enc setBytes:&rargs length:sizeof(rargs) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(k) offset:ds4_gpu_tensor_offset(k) atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake(n_head_kv, n_tok, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "qwen rope rows")) return 0;
+    }
+    const uint64_t kv_off = ((uint64_t)layer * cap + pos0) * kv_bytes;
+    if (!ds4_gpu_tensor_copy_compute(k_cache, kv_off, k, 0, (uint64_t)n_tok * kv_bytes)) return 0;
+    if (!ds4_gpu_tensor_copy_compute(v_cache, kv_off, v, 0, (uint64_t)n_tok * kv_bytes)) return 0;
+    {
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        struct {
+            uint32_t n_head, n_head_kv, head_dim, pos0, layer, cap, gated, n_tok;
+        } aargs = { n_head, n_head_kv, head_dim, pos0, layer, cap, gated, n_tok };
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:attn_p];
+        [enc setBytes:&aargs length:sizeof(aargs) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(q) offset:ds4_gpu_tensor_offset(q) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(k_cache) offset:ds4_gpu_tensor_offset(k_cache) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(v_cache) offset:ds4_gpu_tensor_offset(v_cache) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(gate) offset:ds4_gpu_tensor_offset(gate) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(heads) offset:ds4_gpu_tensor_offset(heads) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(n_head, n_tok, 1) threadsPerThreadgroup:MTLSizeMake(head_dim, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "qwen attn rows")) return 0;
+    }
+    return 1;
+}
+
 int ds4_gpu_qwen_full_attn_tensor(
         ds4_gpu_tensor       *heads,
         ds4_gpu_tensor       *q,

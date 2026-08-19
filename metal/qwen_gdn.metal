@@ -294,6 +294,130 @@ kernel void kernel_qwen_attn_decode(
     heads[h * args.head_dim + d] = out;
 }
 
+/* Row-batched twins of the decode path: a speculative round verifies several
+   rows at once, and one dispatch per layer beats one dispatch per row. */
+struct ds4_qwen_split_q_rows_args {
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t n_tok;
+};
+
+kernel void kernel_qwen_split_gated_q_rows(
+        constant ds4_qwen_split_q_rows_args & args,
+        device const float * q_raw,
+        device float * q,
+        device float * gate,
+        uint gid [[thread_position_in_grid]]) {
+    const uint per_row = args.n_head * args.head_dim;
+    if (gid >= per_row * args.n_tok) return;
+    const uint t = gid / per_row;
+    const uint idx = gid % per_row;
+    const uint h = idx / args.head_dim;
+    const uint d = idx % args.head_dim;
+    const device float *src = q_raw + (uint64_t)t * per_row * 2u;
+    q[gid] = src[h * args.head_dim * 2u + d];
+    gate[gid] = src[h * args.head_dim * 2u + args.head_dim + d];
+}
+
+struct ds4_qwen_rope_rows_args {
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t n_rot;
+    uint32_t pos0;
+    float freq_base;
+    uint32_t n_tok;
+};
+
+kernel void kernel_qwen_rope_rotate_half_rows(
+        constant ds4_qwen_rope_rows_args & args,
+        device float * x,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint lid [[thread_index_in_threadgroup]]) {
+    const uint h = tgpig.x;
+    const uint t = tgpig.y;
+    const uint n_half = args.n_rot / 2u;
+    if (h >= args.n_head || t >= args.n_tok || lid >= n_half) return;
+    const float theta_scale = pow(args.freq_base, -2.0f / (float)args.n_rot);
+    float theta = (float)(args.pos0 + t);
+    for (uint i = 0; i < lid; i++) theta *= theta_scale;
+    device float *xh = x + (uint64_t)t * args.n_head * args.head_dim + h * args.head_dim;
+    const float c = cos(theta);
+    const float s = sin(theta);
+    const float x0 = xh[lid];
+    const float x1 = xh[lid + n_half];
+    xh[lid] = x0 * c - x1 * s;
+    xh[lid + n_half] = x0 * s + x1 * c;
+}
+
+struct ds4_qwen_fullattn_rows_args {
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint32_t pos0;
+    uint32_t layer;
+    uint32_t cap;
+    uint32_t gated;
+    uint32_t n_tok;
+};
+
+kernel void kernel_qwen_attn_decode_rows(
+        constant ds4_qwen_fullattn_rows_args & args,
+        device const float * q,
+        device const float * k_cache,
+        device const float * v_cache,
+        device const float * gate,
+        device float * heads,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint lid [[thread_index_in_threadgroup]]) {
+    const uint h = tgpig.x;
+    const uint t = tgpig.y;
+    const uint d = lid;
+    if (h >= args.n_head || t >= args.n_tok || d >= args.head_dim) return;
+    const uint kv_dim = args.n_head_kv * args.head_dim;
+    const uint kv_h = h / (args.n_head / args.n_head_kv);
+    const uint row_off = t * args.n_head * args.head_dim;
+    const device float *base_k = k_cache + ((uint)args.layer * args.cap) * kv_dim;
+    const device float *base_v = v_cache + ((uint)args.layer * args.cap) * kv_dim;
+    threadgroup float qh[256];
+    qh[d] = q[row_off + h * args.head_dim + d];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float scale = 1.0f / sqrt((float)args.head_dim);
+    const uint last = args.pos0 + t;
+    float m_prev = -1.0e30f;
+    float l_prev = 0.0f;
+    float acc = 0.0f;
+    const uint sg = lid / 32u;
+    for (uint p = 0; p <= last; p++) {
+        const device float *kt = base_k + p * kv_dim + kv_h * args.head_dim;
+        float partial = qh[d] * kt[d];
+        partial += simd_shuffle_xor(partial, 1u);
+        partial += simd_shuffle_xor(partial, 2u);
+        partial += simd_shuffle_xor(partial, 4u);
+        partial += simd_shuffle_xor(partial, 8u);
+        partial += simd_shuffle_xor(partial, 16u);
+        threadgroup float dot_sg[8];
+        if ((lid & 31u) == 0u) dot_sg[sg] = partial;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float score = (dot_sg[0] + dot_sg[1] + dot_sg[2] + dot_sg[3]
+                     + dot_sg[4] + dot_sg[5] + dot_sg[6] + dot_sg[7]) * scale;
+        const float m_curr = max(m_prev, score);
+        const float al = exp(m_prev - m_curr);
+        const float be = exp(score - m_curr);
+        l_prev = l_prev * al + be;
+        const device float *vt = base_v + p * kv_dim + kv_h * args.head_dim;
+        acc = acc * al + be * vt[d];
+        m_prev = m_curr;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float out = acc / (l_prev > 1e-8f ? l_prev : 1.0f);
+    if (args.gated) {
+        const float g = gate[row_off + h * args.head_dim + d];
+        out *= 1.0f / (1.0f + exp(-g));
+    }
+    heads[row_off + h * args.head_dim + d] = out;
+}
+
 struct ds4_qwen_q6k_args {
     uint32_t in_dim;
     uint32_t out_dim;

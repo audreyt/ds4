@@ -114,6 +114,26 @@ int ds4_gpu_qwen_gdn_core_rows_tensor(
 void ds4_gpu_qwen_set_gdn_steps(ds4_gpu_tensor *conv_steps, ds4_gpu_tensor *state_steps);
 
 
+int ds4_gpu_qwen_full_attn_rows_tensor(
+        ds4_gpu_tensor       *heads,
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *k_cache,
+        ds4_gpu_tensor       *v_cache,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_norm_off,
+        uint64_t              k_norm_off,
+        uint32_t              has_q_norm,
+        uint32_t              has_k_norm,
+        uint32_t              gated,
+        uint32_t              pos0,
+        uint32_t              layer,
+        uint32_t              cap,
+        uint32_t              n_tok);
+
 int ds4_gpu_qwen_full_attn_tensor(
         ds4_gpu_tensor       *heads,
         ds4_gpu_tensor       *q,

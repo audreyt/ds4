@@ -16735,7 +16735,19 @@ static int qwen_hybrid_metal_forward_tokens(
                 ok = 0; fail = "attn_v"; fail_il = il;
             }
             const int gated_q = (q_out == (uint64_t)n_head * head_dim * 2u);
-            for (uint32_t t = 0; ok && t < n_tok; t++) {
+            int rows_attn = 0;
+            if (ok && g_qwen_pool.k_cache && g_qwen_pool.v_cache) {
+                rows_attn = ds4_gpu_qwen_full_attn_rows_tensor(
+                    g_qwen_pool.batch_mid, g_qwen_pool.batch_q, g_qwen_pool.batch_k,
+                    g_qwen_pool.batch_v, g_qwen_pool.batch_heads,
+                    g_qwen_pool.k_cache, g_qwen_pool.v_cache,
+                    model->map, model->size,
+                    lw->attn_q_norm ? lw->attn_q_norm->abs_offset : 0,
+                    lw->attn_k_norm ? lw->attn_k_norm->abs_offset : 0,
+                    lw->attn_q_norm != NULL, lw->attn_k_norm != NULL,
+                    gated_q, pos0, il, g_qwen_pool.max_ctx, n_tok);
+            }
+            for (uint32_t t = 0; ok && !rows_attn && t < n_tok; t++) {
                 ds4_gpu_tensor *row_q = ds4_gpu_tensor_view(g_qwen_pool.batch_q,
                     (uint64_t)t * q_out * sizeof(float), q_out * sizeof(float));
                 ds4_gpu_tensor *row_k = ds4_gpu_tensor_view(g_qwen_pool.batch_k,

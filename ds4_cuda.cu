@@ -30118,6 +30118,19 @@ extern "C" void ds4_gpu_qwen_set_gdn_steps(ds4_gpu_tensor *conv_steps, ds4_gpu_t
 }
 
 
+extern "C" int ds4_gpu_qwen_full_attn_rows_tensor(
+        ds4_gpu_tensor *heads, ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
+        const void *model_map, uint64_t model_size, uint64_t q_norm_off, uint64_t k_norm_off,
+        uint32_t has_q_norm, uint32_t has_k_norm, uint32_t gated, uint32_t pos0,
+        uint32_t layer, uint32_t cap, uint32_t n_tok) {
+    (void)heads; (void)q; (void)k; (void)v; (void)gate; (void)k_cache; (void)v_cache;
+    (void)model_map; (void)model_size; (void)q_norm_off; (void)k_norm_off;
+    (void)has_q_norm; (void)has_k_norm; (void)gated; (void)pos0; (void)layer; (void)cap; (void)n_tok;
+    return 0;
+}
+
+
 extern "C" int ds4_gpu_qwen_full_attn_tensor(
         ds4_gpu_tensor *heads, ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
         ds4_gpu_tensor *gate, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
