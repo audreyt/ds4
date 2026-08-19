@@ -16974,6 +16974,72 @@ static int qwen_mtp_map_draft_id(int id) {
     if (id < QWEN_MTP_DRAFT_REAL) return id + (QWEN_MTP_DRAFT_CONTROL - QWEN_MTP_DRAFT_PREFIX);
     return QWEN_MTP_DRAFT_CONTROL;
 }
+static void qwen_mtp_top32(int *top32_ids, const float *scores, uint32_t n) {
+    float heap_val[32];
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        float v = scores[i];
+        if (count < 32) {
+            heap_val[count] = v;
+            top32_ids[count] = (int)i;
+            int pos = (int)count;
+            while (pos > 0) {
+                int parent = (pos - 1) / 2;
+                if (heap_val[pos] < heap_val[parent]) {
+                    float tv = heap_val[pos]; heap_val[pos] = heap_val[parent]; heap_val[parent] = tv;
+                    int ti = top32_ids[pos]; top32_ids[pos] = top32_ids[parent]; top32_ids[parent] = ti;
+                    pos = parent;
+                } else {
+                    break;
+                }
+            }
+            count++;
+        } else if (v > heap_val[0]) {
+            heap_val[0] = v;
+            top32_ids[0] = (int)i;
+            int pos = 0;
+            while (1) {
+                int left = 2 * pos + 1;
+                int right = left + 1;
+                if (left >= 32) break;
+                int best = left;
+                if (right < 32 && heap_val[right] < heap_val[left]) best = right;
+                if (heap_val[pos] <= heap_val[best]) break;
+                float tv = heap_val[pos]; heap_val[pos] = heap_val[best]; heap_val[best] = tv;
+                int ti = top32_ids[pos]; top32_ids[pos] = top32_ids[best]; top32_ids[best] = ti;
+                pos = best;
+            }
+        }
+    }
+}
+
+static int qwen_mtp_rerank_winner(const ds4_model *head, const ds4_tensor *draft_rerank,
+                                  const float *normed, uint32_t n_embd,
+                                  const int *candidate_ids, int n_candidates) {
+    if (!draft_rerank || n_candidates <= 0) return 0;
+    int best_id = candidate_ids[0];
+    float best_score = -1e30f;
+    const uint16_t *data_f16 = (draft_rerank->type == DS4_TENSOR_F16) ? tensor_data(head, draft_rerank) : NULL;
+    const float *data_f32 = (draft_rerank->type == 0) ? tensor_data(head, draft_rerank) : NULL;
+    for (int k = 0; k < n_candidates; k++) {
+        int cand = candidate_ids[k];
+        float score = 0.0f;
+        if (data_f16) {
+            const uint16_t *row = data_f16 + (uint64_t)cand * n_embd;
+            score = dot_f16_row(row, normed, n_embd);
+        } else if (data_f32) {
+            const float *row = data_f32 + (uint64_t)cand * n_embd;
+            for (uint32_t j = 0; j < n_embd; j++) score += row[j] * normed[j];
+        } else {
+            for (uint32_t j = 0; j < n_embd; j++) score += tensor_2d_value(head, draft_rerank, j, cand) * normed[j];
+        }
+        if (score > best_score) {
+            best_score = score;
+            best_id = cand;
+        }
+    }
+    return best_id;
+}
 
 
 static bool qwen_has_mtp(const ds4_model *m) {
@@ -17028,7 +17094,9 @@ static void qwen_mtp_bind(qwen_mtp_weights_t *w, const ds4_model *m) {
             if (qwen_mtp_is_valid(&probe)) {
                 g_qwen_mtp_sidecar_ready = 1;
                 fprintf(stderr, "ds4: using MTP head sidecar %s\n", p);
-                if (probe.draft_rerank) {
+                if (probe.draft_lm_head && probe.draft_rerank) {
+                    fprintf(stderr, "ds4: MTP ofou shortlist K=32 + rerank\n");
+                } else if (probe.draft_rerank) {
                     fprintf(stderr, "ds4: MTP compact draft rerank readout 98330/%" PRIu64 "\n", probe.draft_rerank->dim[1]);
                 } else if (probe.draft_lm_head) {
                     fprintf(stderr, "ds4: MTP compact draft readout 98330/%" PRIu64 "\n", probe.draft_lm_head->dim[1]);
@@ -17042,8 +17110,22 @@ static void qwen_mtp_bind(qwen_mtp_weights_t *w, const ds4_model *m) {
             g_qwen_mtp_sidecar_ready = -1;
         }
     }
-    if (g_qwen_mtp_sidecar_ready == 1) qwen_mtp_bind_from(w, &g_qwen_mtp_sidecar);
-    else qwen_mtp_bind_from(w, m);
+    if (g_qwen_mtp_sidecar_ready == 1) {
+        qwen_mtp_bind_from(w, &g_qwen_mtp_sidecar);
+    } else {
+        qwen_mtp_bind_from(w, m);
+        static int logged_base = 0;
+        if (!logged_base && qwen_mtp_is_valid(w)) {
+            logged_base = 1;
+            if (w->draft_lm_head && w->draft_rerank) {
+                fprintf(stderr, "ds4: MTP ofou shortlist K=32 + rerank\n");
+            } else if (w->draft_rerank) {
+                fprintf(stderr, "ds4: MTP compact draft rerank readout 98330/%" PRIu64 "\n", w->draft_rerank->dim[1]);
+            } else if (w->draft_lm_head) {
+                fprintf(stderr, "ds4: MTP compact draft readout 98330/%" PRIu64 "\n", w->draft_lm_head->dim[1]);
+            }
+        }
+    }
 }
 
 static bool qwen_mtp_is_valid(const qwen_mtp_weights_t *w) {
@@ -17317,7 +17399,20 @@ static int qwen_mtp_draft_one_cpu(float *logits_out, float *hidden_out, const ds
     const bool has_compact_head = mtp->draft_lm_head &&
                                   mtp->draft_lm_head->dim[0] == n_embd &&
                                   mtp->draft_lm_head->dim[1] >= (uint64_t)QWEN_MTP_DRAFT_REAL;
-    if (has_rerank) {
+    if (has_compact_head && has_rerank) {
+        const uint64_t draft_out_dim = mtp->draft_lm_head->dim[1];
+        float *draft_logits = xmalloc((size_t)draft_out_dim * sizeof(float));
+        matvec_any(draft_logits, head, mtp->draft_lm_head, normed);
+        int top32[32];
+        qwen_mtp_top32(top32, draft_logits, QWEN_MTP_DRAFT_REAL);
+        int best_id = qwen_mtp_rerank_winner(head, mtp->draft_rerank, normed, n_embd, top32, 32);
+        int mapped_tok = qwen_mtp_map_draft_id(best_id);
+        if (logits_out) {
+            for (uint32_t i = 0; i < 248320; i++) logits_out[i] = -1e9f;
+            logits_out[mapped_tok] = 1.0f;
+        }
+        free(draft_logits);
+    } else if (has_rerank) {
         const uint64_t draft_out_dim = mtp->draft_rerank->dim[1];
         float *draft_logits = xmalloc((size_t)draft_out_dim * sizeof(float));
         matvec_any(draft_logits, head, mtp->draft_rerank, normed);
@@ -17351,12 +17446,12 @@ static int qwen_mtp_draft_one_cpu(float *logits_out, float *hidden_out, const ds
 }
 
 #ifndef DS4_NO_GPU
-/* One draft step used to cost ~20 Metal allocations; the head is a single
-   layer, so its tensors are pooled instead. The KV is private and one slot
-   deep: the head attends to its own position only, as the CPU draft does. */
+/* MTP single-layer scratch pool and persistent private KV cache. */
+#define QWEN_MTP_KV_CAP 4096u
 static struct {
     int inited;
     pthread_mutex_t mu;
+    uint32_t kv_cap;
     ds4_gpu_tensor *hidden, *e_emb, *enorm, *hnorm, *eproj, *hproj, *fused;
     ds4_gpu_tensor *normed, *logits, *argmax;
     ds4_gpu_tensor *q, *k, *v, *gate, *heads, *attn_out, *after, *ffn_normed;
@@ -17373,6 +17468,7 @@ static int qwen_mtp_metal_ensure_pool(void) {
     const uint64_t f = sizeof(float);
     const uint64_t n_embd = 5120, n_vocab = 248320, ff = 17408;
     const uint64_t q_full = 24ull * 256ull * 2ull, heads = 24ull * 256ull, kv = 4ull * 256ull;
+    uint64_t mtp_kv_cap = (uint64_t)QWEN_MTP_KV_CAP;
     struct { ds4_gpu_tensor **slot; uint64_t bytes; } want[] = {
         { &g_mtp_pool.hidden,     n_embd * f },
         { &g_mtp_pool.e_emb,      n_embd * f },
@@ -17397,8 +17493,8 @@ static int qwen_mtp_metal_ensure_pool(void) {
         { &g_mtp_pool.ffn_mid,    ff * f },
         { &g_mtp_pool.ffn_out,    n_embd * f },
         { &g_mtp_pool.block_out,  n_embd * f },
-        { &g_mtp_pool.k_cache,    8ull * kv * f },
-        { &g_mtp_pool.v_cache,    8ull * kv * f },
+        { &g_mtp_pool.k_cache,    mtp_kv_cap * kv * f },
+        { &g_mtp_pool.v_cache,    mtp_kv_cap * kv * f },
     };
     const size_t n_want = sizeof(want) / sizeof(want[0]);
     int ok = 1;
@@ -17410,24 +17506,47 @@ static int qwen_mtp_metal_ensure_pool(void) {
         for (size_t i = 0; i < n_want; i++) {
             if (*want[i].slot) { ds4_gpu_tensor_free(*want[i].slot); *want[i].slot = NULL; }
         }
-    } else {
+        mtp_kv_cap = 512ull;
+        want[n_want - 2].bytes = mtp_kv_cap * kv * f;
+        want[n_want - 1].bytes = mtp_kv_cap * kv * f;
+        ok = 1;
+        for (size_t i = 0; i < n_want; i++) {
+            *want[i].slot = ds4_gpu_tensor_alloc(want[i].bytes);
+            if (!*want[i].slot) ok = 0;
+        }
+        if (!ok) {
+            for (size_t i = 0; i < n_want; i++) {
+                if (*want[i].slot) { ds4_gpu_tensor_free(*want[i].slot); *want[i].slot = NULL; }
+            }
+        }
+    }
+    if (ok) {
+        g_mtp_pool.kv_cap = (uint32_t)mtp_kv_cap;
         g_mtp_pool.inited = 1;
     }
     pthread_mutex_unlock(&init_mu);
     return ok;
 }
 
-/* `slot` is the draft's index inside the round: the head attends over the
-   round's earlier drafts, which are real inputs, and never over prompt
-   positions it was never run on. */
+static void qwen_mtp_metal_reset_kv(void) {
+    if (!qwen_mtp_metal_ensure_pool()) return;
+    pthread_mutex_lock(&g_mtp_pool.mu);
+    if (g_mtp_pool.k_cache && g_mtp_pool.v_cache && g_mtp_pool.kv_cap > 0) {
+        const uint32_t kv_floats = g_mtp_pool.kv_cap * 4u * 256u;
+        ds4_gpu_fill_f32_tensor(g_mtp_pool.k_cache, 0.0f, kv_floats);
+        ds4_gpu_fill_f32_tensor(g_mtp_pool.v_cache, 0.0f, kv_floats);
+    }
+    pthread_mutex_unlock(&g_mtp_pool.mu);
+}
+
 static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidden_out,
                                     const ds4_model *model, const ds4_weights *base_weights,
                                     const qwen_mtp_weights_t *mtp, const float *hidden_in,
                                     int next_token, uint32_t pos, uint32_t slot) {
-    (void)pos;
-    if (slot > 7u) slot = 7u;
+    (void)slot;
     if (!qwen_mtp_is_valid(mtp) || !hidden_in) return 0;
     if (!qwen_mtp_metal_ensure_pool()) return 0;
+    if (pos >= g_mtp_pool.kv_cap) return 0;
     const ds4_model *head = qwen_mtp_src(mtp, model);
     const void *map = head->map;
     const uint64_t map_size = head->size;
@@ -17440,13 +17559,14 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
     const int has_block = mtp->attn_norm && mtp->attn_q && mtp->attn_k && mtp->attn_v &&
                           mtp->attn_out && mtp->ffn_norm && mtp->ffn_gate && mtp->ffn_up && mtp->ffn_down;
     const bool has_rerank = mtp->draft_rerank &&
-                            mtp->draft_rerank->type == DS4_TENSOR_F16 &&
+                            qwen_gpu_matvec_ok(mtp->draft_rerank) &&
                             mtp->draft_rerank->dim[0] == n_embd &&
                             mtp->draft_rerank->dim[1] >= (uint64_t)QWEN_MTP_DRAFT_REAL;
     const bool has_compact_head = mtp->draft_lm_head &&
-                                  mtp->draft_lm_head->type == DS4_TENSOR_F16 &&
+                                  qwen_gpu_matvec_ok(mtp->draft_lm_head) &&
                                   mtp->draft_lm_head->dim[0] == n_embd &&
                                   mtp->draft_lm_head->dim[1] >= (uint64_t)QWEN_MTP_DRAFT_REAL;
+    const bool use_ofou = has_compact_head && has_rerank;
 
     pthread_mutex_lock(&g_mtp_pool.mu);
     int ok = ds4_gpu_tensor_write(g_mtp_pool.hidden, 0, hidden_in, (uint64_t)n_embd * sizeof(float));
@@ -17481,7 +17601,7 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
                                                  mtp->attn_q_norm ? mtp->attn_q_norm->abs_offset : 0,
                                                  mtp->attn_k_norm ? mtp->attn_k_norm->abs_offset : 0,
                                                  mtp->attn_q_norm != NULL, mtp->attn_k_norm != NULL,
-                                                 gated_q, slot, 0, 8)) ok = 0;
+                                                 gated_q, pos, 0, g_mtp_pool.kv_cap)) ok = 0;
         if (ok && !qwen_gpu_matmul(g_mtp_pool.attn_out, head, mtp->attn_out, n_head * head_dim, n_embd,
                                    g_mtp_pool.heads, 1)) ok = 0;
         if (ok && !ds4_gpu_add_tensor(g_mtp_pool.after, g_mtp_pool.fused, g_mtp_pool.attn_out, n_embd)) ok = 0;
@@ -17502,7 +17622,10 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
     if (ok && !ds4_gpu_rms_norm_weight_tensor(g_mtp_pool.normed, tail, map, map_size,
                                               mtp->norm ? mtp->norm->abs_offset : base_weights->output_norm->abs_offset,
                                               n_embd, 1e-6f)) ok = 0;
-    if (has_rerank) {
+    if (use_ofou) {
+        const uint64_t draft_out_dim = mtp->draft_lm_head->dim[1];
+        if (ok && !qwen_gpu_matmul(g_mtp_pool.logits, head, mtp->draft_lm_head, n_embd, draft_out_dim, g_mtp_pool.normed, 1)) ok = 0;
+    } else if (has_rerank) {
         const uint64_t draft_out_dim = mtp->draft_rerank->dim[1];
         if (ok && !qwen_gpu_matmul(g_mtp_pool.logits, head, mtp->draft_rerank, n_embd, draft_out_dim, g_mtp_pool.normed, 1)) ok = 0;
         if (ok && tok_out && !ds4_gpu_indexer_topk_tensor(g_mtp_pool.argmax, g_mtp_pool.logits, QWEN_MTP_DRAFT_REAL, 1, 1)) ok = 0;
@@ -17523,20 +17646,40 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
         (void)ds4_gpu_end_commands();
     }
 
-    if (ok && tok_out) {
-        int32_t idx = 0;
-        if (!ds4_gpu_tensor_read(g_mtp_pool.argmax, 0, &idx, sizeof(idx))) ok = 0;
-        else *tok_out = (has_rerank || has_compact_head) ? qwen_mtp_map_draft_id((int)idx) : (int)idx;
-    }
-    if (ok && logits_out) {
-        if (has_rerank) {
-            uint64_t n_read = mtp->draft_rerank->dim[1];
-            if (!ds4_gpu_tensor_read(g_mtp_pool.logits, 0, logits_out, n_read * sizeof(float))) ok = 0;
-        } else if (has_compact_head) {
-            uint64_t n_read = mtp->draft_lm_head->dim[1];
-            if (!ds4_gpu_tensor_read(g_mtp_pool.logits, 0, logits_out, n_read * sizeof(float))) ok = 0;
+    if (ok && (tok_out || logits_out) && use_ofou) {
+        float host_normed[5120];
+        float *host_logits = xmalloc((size_t)QWEN_MTP_DRAFT_REAL * sizeof(float));
+        if (!ds4_gpu_tensor_read(g_mtp_pool.normed, 0, host_normed, (uint64_t)n_embd * sizeof(float)) ||
+            !ds4_gpu_tensor_read(g_mtp_pool.logits, 0, host_logits, (uint64_t)QWEN_MTP_DRAFT_REAL * sizeof(float))) {
+            ok = 0;
         } else {
-            if (!ds4_gpu_tensor_read(g_mtp_pool.logits, 0, logits_out, (uint64_t)n_vocab * sizeof(float))) ok = 0;
+            int top32[32];
+            qwen_mtp_top32(top32, host_logits, QWEN_MTP_DRAFT_REAL);
+            int best_id = qwen_mtp_rerank_winner(head, mtp->draft_rerank, host_normed, n_embd, top32, 32);
+            int mapped_tok = qwen_mtp_map_draft_id(best_id);
+            if (tok_out) *tok_out = mapped_tok;
+            if (logits_out) {
+                for (uint32_t i = 0; i < 248320; i++) logits_out[i] = -1e9f;
+                logits_out[mapped_tok] = 1.0f;
+            }
+        }
+        free(host_logits);
+    } else {
+        if (ok && tok_out) {
+            int32_t idx = 0;
+            if (!ds4_gpu_tensor_read(g_mtp_pool.argmax, 0, &idx, sizeof(idx))) ok = 0;
+            else *tok_out = (has_rerank || has_compact_head) ? qwen_mtp_map_draft_id((int)idx) : (int)idx;
+        }
+        if (ok && logits_out) {
+            if (has_rerank) {
+                uint64_t n_read = mtp->draft_rerank->dim[1];
+                if (!ds4_gpu_tensor_read(g_mtp_pool.logits, 0, logits_out, n_read * sizeof(float))) ok = 0;
+            } else if (has_compact_head) {
+                uint64_t n_read = mtp->draft_lm_head->dim[1];
+                if (!ds4_gpu_tensor_read(g_mtp_pool.logits, 0, logits_out, n_read * sizeof(float))) ok = 0;
+            } else {
+                if (!ds4_gpu_tensor_read(g_mtp_pool.logits, 0, logits_out, (uint64_t)n_vocab * sizeof(float))) ok = 0;
+            }
         }
     }
     if (ok && hidden_out && !ds4_gpu_tensor_read(tail, 0, hidden_out,
@@ -39814,6 +39957,9 @@ static int qwen_generate_hybrid(
     const int use_mtp = qwen_mtp_is_valid(&mtp_w);
     fprintf(stderr, "ds4: using Qwen hybrid Metal+CPU generation%s\n",
             use_mtp ? " + MTP draft/verify" : "");
+#ifndef DS4_NO_GPU
+    if (use_mtp) qwen_mtp_metal_reset_kv();
+#endif
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     float *hidden = use_mtp ? xmalloc((size_t)5120 * sizeof(float)) : NULL;
@@ -51891,6 +52037,7 @@ static int generate_metal_graph_raw_swa(
             qwen_mtp_bind(&mtp_w, model);
             if (qwen_mtp_is_valid(&mtp_w)) {
                 fprintf(stderr, "ds4: using Qwen Metal MTP speculative (adaptive 0..8)\n");
+                qwen_mtp_metal_reset_kv();
                 // warm pools and pipelines (as in SOTA warmAllDepths)
                 if (!qwen_metal_ensure_pool()) {
                     fprintf(stderr, "ds4: Qwen Metal pool warm failed\n");
