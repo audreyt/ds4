@@ -16617,7 +16617,9 @@ static int qwen_hybrid_metal_forward_tokens(
     if (!qwen_metal_ensure_pool() || n_tok > g_qwen_pool.batch_cap) return 0;
     const double t0 = now_sec();
     const int skip_full = getenv("DS4_QWEN_SKIP_FULL") != NULL;
-
+    const int skip_gdn = getenv("DS4_QWEN_SKIP_GDN") != NULL;
+    const int skip_ffn = getenv("DS4_QWEN_SKIP_FFN") != NULL;
+    const int skip_head = getenv("DS4_QWEN_SKIP_HEAD") != NULL;
 
     pthread_mutex_lock(&g_qwen_pool.mu);
     int32_t ids[8];
@@ -16671,7 +16673,11 @@ static int qwen_hybrid_metal_forward_tokens(
             ok = 0; fail = "attn_rms"; fail_il = il; break;
 
         }
-        if (lw->qwen_linear_attn &&
+        if (lw->qwen_linear_attn && skip_gdn) {
+            if (!ds4_gpu_fill_f32_tensor(g_qwen_pool.batch_attn_out, 0.0f, n_embd * n_tok)) {
+                ok = 0; fail = "skip_gdn"; fail_il = il;
+            }
+        } else if (lw->qwen_linear_attn &&
             qwen_gpu_matvec_ok(lw->attn_qkv) && qwen_gpu_matvec_ok(lw->attn_gate) &&
             qwen_gpu_matvec_ok(lw->ssm_alpha) && qwen_gpu_matvec_ok(lw->ssm_beta) &&
             qwen_gpu_matvec_ok(lw->ssm_out)) {
@@ -16804,6 +16810,13 @@ static int qwen_hybrid_metal_forward_tokens(
         }
 
         if (!ok) break;
+        if (skip_ffn) {
+            if (!ds4_gpu_tensor_copy(next, 0, cur, 0, (uint64_t)n_embd * n_tok * sizeof(float))) {
+                ok = 0; fail = "skip_ffn"; fail_il = il;
+            }
+            ds4_gpu_tensor *tmp = cur; cur = next; next = tmp;
+            continue;
+        }
         if (!qwen_gpu_matvec_ok(lw->ffn_gate) || !qwen_gpu_matvec_ok(lw->ffn_up) || !qwen_gpu_matvec_ok(lw->ffn_down)) {
             ok = 0; fail = "ffn_type"; fail_il = il; break;
         }
@@ -16855,7 +16868,7 @@ static int qwen_hybrid_metal_forward_tokens(
         ds4_gpu_tensor *tmp = cur; cur = next; next = tmp;
     }
 
-    if (ok && (logits_out || argmax_out)) {
+    if (ok && (logits_out || argmax_out) && !skip_head) {
         if (!ds4_gpu_rms_norm_weight_rows_tensor(g_qwen_pool.batch_norm, cur, model->map, model->size,
                                                  weights->output_norm->abs_offset, n_embd, n_tok, 1e-6f)) ok = 0;
         if (ok && !ds4_gpu_matmul_quant_tensor(g_qwen_pool.batch_logits, model->map, model->size,
