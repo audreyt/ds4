@@ -11129,7 +11129,10 @@ int ds4_gpu_embed_tokens_quant_tensor(
         if (!ds4_gpu_quant_table_bytes(weight_type, n_vocab, n_embd, &weight_bytes) ||
             weight_offset > model_size ||
             weight_bytes > model_size - weight_offset) {
-            fprintf(stderr, "ds4: Metal quant batched embedding range is outside the mapped model\n");
+            static int warned;
+            if (!warned++) {
+                fprintf(stderr, "ds4: Metal quant batched embedding range is outside the mapped model\n");
+            }
             return 0;
         }
 
@@ -18744,10 +18747,19 @@ static int ds4_gpu_matmul_quant_impl_tensor(
         out && x && model_map &&
         in_dim > 0 && out_dim > 0) {
         static id<MTLComputePipelineState> nvfp4_pipe;
+        static id<MTLComputePipelineState> nvfp4_pipe_n_cache[9];
+        id<MTLComputePipelineState> nvfp4_pipe_n = nil;
         const int16_t nsg = 4;
+        const bool multi_col = (n_tok > 1u && n_tok <= 8u);
         if (!nvfp4_pipe) {
             nvfp4_pipe = ds4_gpu_get_mul_mv_ext_pipeline("kernel_mul_mv_nvfp4_dense_f32", nsg, 8);
         }
+        if (multi_col && !nvfp4_pipe_n_cache[n_tok]) {
+            char nvfp4_kern[64];
+            snprintf(nvfp4_kern, sizeof(nvfp4_kern), "kernel_mul_mv_nvfp4_dense_f32_n%u", (unsigned)n_tok);
+            nvfp4_pipe_n_cache[n_tok] = ds4_gpu_get_mul_mv_ext_pipeline(nvfp4_kern, nsg, 8);
+        }
+        nvfp4_pipe_n = multi_col ? nvfp4_pipe_n_cache[n_tok] : nil;
         if (nvfp4_pipe) {
             uint64_t row_bytes = 0;
             if (ds4_gpu_quant_row_bytes(weight_type, (uint32_t)in_dim, &row_bytes) &&
@@ -18786,20 +18798,30 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                             .r3 = 1,
                         };
                         const uint64_t rows_ptg = (uint64_t)nsg * 2u;
+                        const bool use_multi = multi_col && nvfp4_pipe_n != nil;
+                        if (use_multi) args.ne11 = (int32_t)n_tok;
                         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-                        [enc setComputePipelineState:nvfp4_pipe];
+                        [enc setComputePipelineState:(use_multi ? nvfp4_pipe_n : nvfp4_pipe)];
                         [enc setBytes:&args length:sizeof(args) atIndex:0];
                         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
                         const float nvfp4_gs = ds4_nvfp4_global_scale(weight_offset);
                         [enc setBytes:&nvfp4_gs length:sizeof(nvfp4_gs) atIndex:4];
-                        for (uint64_t t = 0; t < n_tok; t++) {
-                            const NSUInteger x_off = ds4_gpu_tensor_offset(x) + (NSUInteger)(t * in_dim * sizeof(float));
-                            const NSUInteger y_off = ds4_gpu_tensor_offset(out) + (NSUInteger)(t * out_dim * sizeof(float));
-                            [enc setBuffer:xbuf offset:x_off atIndex:2];
-                            [enc setBuffer:outbuf offset:y_off atIndex:3];
+                        if (use_multi) {
+                            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+                            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
                             [enc setThreadgroupMemoryLength:32 atIndex:0];
                             [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + rows_ptg - 1u) / rows_ptg, 1, 1)
                                  threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
+                        } else {
+                            for (uint64_t t = 0; t < n_tok; t++) {
+                                const NSUInteger x_off = ds4_gpu_tensor_offset(x) + (NSUInteger)(t * in_dim * sizeof(float));
+                                const NSUInteger y_off = ds4_gpu_tensor_offset(out) + (NSUInteger)(t * out_dim * sizeof(float));
+                                [enc setBuffer:xbuf offset:x_off atIndex:2];
+                                [enc setBuffer:outbuf offset:y_off atIndex:3];
+                                [enc setThreadgroupMemoryLength:32 atIndex:0];
+                                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + rows_ptg - 1u) / rows_ptg, 1, 1)
+                                     threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
+                            }
                         }
                         ds4_gpu_end_compute_encoder(cb, enc);
                         if (ds4_gpu_finish_command_buffer(cb, owned, "NVFP4 classic mul_mv")) return 1;
