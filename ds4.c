@@ -40213,7 +40213,6 @@ static int qwen_generate_hybrid(
             else qwen_forward_token_cpu(out, model, weights, prompt->v[i], (uint32_t)i);
         }
     }
-    const double t1 = now_sec();
     if (use_mtp && hidden && hidden_stash && prompt->len > 0) {
         memcpy(hidden, hidden_stash + (size_t)(prompt->len - 1) * 5120, (size_t)5120 * sizeof(float));
     }
@@ -40233,6 +40232,7 @@ static int qwen_generate_hybrid(
         memcpy(g_mtp_verified_fused, g_mtp_prev_fused, sizeof(g_mtp_verified_fused));
     }
 #endif
+    const double t1 = now_sec();
     int pos = prompt->len;
     int n_generated = 0;
     int token = sample_argmax(logits, DS4_N_VOCAB);
