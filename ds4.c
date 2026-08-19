@@ -40156,6 +40156,8 @@ static int qwen_generate_hybrid(
     double ema[8];
     for (int i = 0; i < 8; i++) ema[i] = 0.85 * pow(0.98, (double)i);
     uint64_t n_drafted = 0, n_accepted = 0;
+    double t_draft = 0.0, t_verify = 0.0, t_repair = 0.0;
+    const int mtp_prof = getenv("DS4_QWEN_MTP_PROFILE") && getenv("DS4_QWEN_MTP_PROFILE")[0] != '0';
     static float ver_hidden[8 * 5120];
     const char *env_k = getenv("DS4_QWEN_MTP_K");
     int fixed_k = (env_k && env_k[0]) ? atoi(env_k) : -1;
@@ -40184,6 +40186,7 @@ static int qwen_generate_hybrid(
         int drafts[8] = {0};
         int drafted = 0;
         if (K > 0) {
+            const double td0 = mtp_prof ? now_sec() : 0.0;
             float cur_hidden[5120];
             memcpy(cur_hidden, hidden, sizeof(cur_hidden));
             int cur_token = token;
@@ -40194,8 +40197,10 @@ static int qwen_generate_hybrid(
                 int tok = 0;
                 int okd = 0;
 #ifndef DS4_NO_GPU
-                okd = qwen_mtp_draft_one_metal(NULL, &tok, tmp_hidden, model, weights, &mtp_w,
-                                               cur_hidden, cur_token, cur_pos, (uint32_t)d, d == 0);
+                if (!getenv("DS4_QWEN_MTP_CPU")) {
+                    okd = qwen_mtp_draft_one_metal(NULL, &tok, tmp_hidden, model, weights, &mtp_w,
+                                                   cur_hidden, cur_token, cur_pos, (uint32_t)d, d == 0);
+                }
 #endif
                 if (!okd) {
                     if (!qwen_mtp_draft_one_cpu(tmp_logits, tmp_hidden, model, weights, &mtp_w,
@@ -40209,6 +40214,7 @@ static int qwen_generate_hybrid(
                 cur_pos++;
                 if (vocab_token_is_generation_stop(vocab, tok)) break;
             }
+            if (mtp_prof) t_draft += now_sec() - td0;
         }
 
         n_drafted += (uint64_t)drafted;
@@ -40221,9 +40227,11 @@ static int qwen_generate_hybrid(
         int ver_argmax[8] = {0};
         ver_tokens[0] = token;
         for (int d = 0; d < drafted; d++) ver_tokens[d + 1] = drafts[d];
+        const double tv0 = mtp_prof ? now_sec() : 0.0;
         int ver_ok = qwen_hybrid_metal_forward_tokens(NULL, ver_argmax, use_mtp ? ver_hidden : NULL,
                                                       NULL, NULL, 0, model, weights,
                                                       ver_tokens, n_ver, (uint32_t)pos);
+        if (mtp_prof) t_verify += now_sec() - tv0;
         if (!ver_ok) {
             float v_logits[248320];
             float v_hidden[5120];
@@ -40258,19 +40266,19 @@ static int qwen_generate_hybrid(
                 break;
             }
         }
-        /* Rewrite committed MTP slots from target hiddens and restore the
-           2-tap prev to the last verified fused residual. */
+        /* Primary KV at `pos` was written from the target hidden. Only
+           accepted draft slots were written from the head's own hiddens. */
 #ifndef DS4_NO_GPU
-        if (use_mtp) {
+        if (use_mtp && accepted > 0) {
+            const double tr0 = mtp_prof ? now_sec() : 0.0;
             memcpy(g_mtp_prev_fused, g_mtp_verified_fused, sizeof(g_mtp_prev_fused));
-            qwen_mtp_draft_one_metal(NULL, NULL, NULL, model, weights, &mtp_w,
-                                     hidden, token, (uint32_t)pos, 0, 1);
             for (int d = 0; d < accepted; d++) {
                 qwen_mtp_draft_one_metal(NULL, NULL, NULL, model, weights, &mtp_w,
                                          ver_hidden + (size_t)d * 5120,
                                          drafts[d], (uint32_t)pos + 1u + (uint32_t)d, 0, 1);
             }
             memcpy(g_mtp_verified_fused, g_mtp_prev_fused, sizeof(g_mtp_verified_fused));
+            if (mtp_prof) t_repair += now_sec() - tr0;
         }
 #endif
         if (accepted + 1 < (int)n_ver && !qwen_hybrid_restore_gdn_prefix((uint32_t)accepted)) {
@@ -40292,9 +40300,14 @@ hybrid_done:
                 (t1 - t0) > 0.0 ? (double)prompt->len / (t1 - t0) : 0.0,
                 (t2 - t1) > 0.0 ? (double)n_generated / (t2 - t1) : 0.0);
         if (use_mtp) {
-            fprintf(stderr, "  mtp drafted=%llu accepted=%llu (%.2f/round)\n",
+            fprintf(stderr, "  mtp drafted=%llu accepted=%llu (%.2f/round)",
                     (unsigned long long)n_drafted, (unsigned long long)n_accepted,
                     n_generated > 0 ? (double)n_accepted / (double)n_generated * (1.0 + (n_drafted > 0 ? (double)n_accepted / (double)n_drafted : 0.0)) : 0.0);
+            if (mtp_prof) {
+                fprintf(stderr, "  draft=%.1fms verify=%.1fms repair=%.1fms",
+                        1e3 * t_draft, 1e3 * t_verify, 1e3 * t_repair);
+            }
+            fprintf(stderr, "\n");
         } else {
             fprintf(stderr, "\n");
         }
