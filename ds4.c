@@ -53374,6 +53374,8 @@ struct ds4_session {
     float *sample_probs;
     float *mtp_logits;
     int greedy_splitkv_anchor_len;
+    float *qwen_layers;
+    float *qwen_hidden;
 #ifndef DS4_NO_GPU
     float *spec_row_logits;
     float *dspark_markov_bias;
@@ -62486,6 +62488,10 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
 }
 
+bool ds4_engine_dflash_ready(const ds4_engine *e) {
+    return e && e->dflash_ready;
+}
+
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
@@ -62797,12 +62803,16 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 0;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
-        // Qwen 3.8 Metal path: simple session without deepseek graph
-        // For now use CPU forward for both, but allocate logits and mark ready
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
-        // No graph allocation needed; qwen sync/eval will use qwen_forward_token_cpu (or Metal variant)
+        if (e->dflash_ready) {
+            const ds4_dflash2_weights *dw = &e->dflash2;
+            s->qwen_layers = xcalloc(1, (size_t)dw->n_target * 5120 * sizeof(float));
+            s->qwen_hidden = xcalloc(1, (size_t)5120 * sizeof(float));
+        }
         if (!ds4_session_tp_register(s)) {
+            free(s->qwen_layers);
+            free(s->qwen_hidden);
             free(s->logits);
             free(s->sample_probs);
             free(s);
@@ -63002,6 +63012,8 @@ void ds4_session_free(ds4_session *s) {
             glm_graph_free(&s->glm_graph);
         } else if (ds4_session_is_qwen(s)) {
             // Qwen Metal session has no graph allocation
+            free(s->qwen_layers);
+            free(s->qwen_hidden);
         } else {
             metal_graph_free(&s->graph);
         }
@@ -64111,14 +64123,19 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                     s->mtp_draft_valid = false;
                     return DS4_SESSION_SYNC_INTERRUPTED;
                 }
+                float *out_logits = (i == prompt->len - 1) ? s->logits : NULL;
+                float *out_layers = (i == prompt->len - 1) ? s->qwen_layers : NULL;
+                if (e->dflash_ready && s->qwen_layers && s->qwen_hidden) {
+                    qwen_target_forward_layers(e, out_logits, s->qwen_hidden, out_layers, prompt->v[i], (uint32_t)i);
+                }
 #ifndef DS4_NO_GPU
-                if (!is_cpu) {
+                else if (!is_cpu) {
                     if (!qwen_metal_forward_token(s->logits, &e->model, &e->weights, prompt->v[i], (uint32_t)i)) {
                         qwen_forward_token_cpu(s->logits, &e->model, &e->weights, prompt->v[i], (uint32_t)i);
                     }
-                } else
+                }
 #endif
-                {
+                else {
                     qwen_forward_token_cpu(s->logits, &e->model, &e->weights, prompt->v[i], (uint32_t)i);
                 }
                 token_vec_push(&s->checkpoint, prompt->v[i]);
@@ -64131,12 +64148,20 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         // full prefill
         s->checkpoint.len = 0;
         s->checkpoint_valid = false;
+        if (e->dflash_ready && s->qwen_layers && s->qwen_hidden) {
+            for (int i = 0; i < prompt->len; i++) {
+                float *out_logits = (i == prompt->len - 1) ? s->logits : NULL;
+                float *out_layers = (i == prompt->len - 1) ? s->qwen_layers : NULL;
+                qwen_target_forward_layers(e, out_logits, s->qwen_hidden, out_layers, prompt->v[i], (uint32_t)i);
+                if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+            }
+        }
 #ifndef DS4_NO_GPU
-        if (!is_cpu) {
+        else if (!is_cpu) {
             qwen_metal_prefill(s->logits, &e->model, &e->weights, prompt);
-        } else
+        }
 #endif
-        {
+        else {
             qwen_prefill_cpu(s->logits, &e->model, &e->weights, prompt);
         }
         ds4_tokens_copy(&s->checkpoint, prompt);
@@ -64144,6 +64169,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         s->mtp_draft_valid = false;
         if (s->progress) s->progress(s->progress_ud, "prefill_chunk", prompt->len, prompt->len);
         return 0;
+        
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
@@ -65783,7 +65809,9 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         uint32_t pos = (uint32_t)s->checkpoint.len;
         bool is_cpu = (e->backend == DS4_BACKEND_CPU);
 #ifndef DS4_NO_GPU
-        if (!is_cpu) {
+        if (e->dflash_ready && s->qwen_layers && s->qwen_hidden) {
+            qwen_target_forward_layers(e, s->logits, s->qwen_hidden, s->qwen_layers, token, pos);
+        } else if (!is_cpu) {
             if (!qwen_metal_forward_token(s->logits, &e->model, &e->weights, token, pos)) {
                 qwen_forward_token_cpu(s->logits, &e->model, &e->weights, token, pos);
             }
@@ -70316,6 +70344,91 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         (void)max_tokens;
         (void)eos_token;
         if (!accepted || accepted_cap <= 0) return 0;
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+    if (ds4_session_is_qwen(s)) {
+        if (!accepted || accepted_cap <= 0) return 0;
+        ds4_engine *e = s->engine;
+        const ds4_dflash2_weights *dw = &e->dflash2;
+        if (e->dflash_ready && s->qwen_layers && s->qwen_hidden && dw->block_size > 0 && e->backend != DS4_BACKEND_CPU) {
+            const int primary = first_token;
+            int pos = s->checkpoint.len;
+            int remaining = max_tokens - 1;
+            int room = s->ctx_size - pos - 1;
+            int max_draft = e->dflash_draft_n_max > 0 ? e->dflash_draft_n_max : (int)dw->block_size - 1;
+            if (max_draft > (int)dw->block_size - 1) max_draft = (int)dw->block_size - 1;
+            if (max_draft > 7) max_draft = 7;
+            if (max_draft > remaining) max_draft = remaining;
+            if (max_draft > room) max_draft = room;
+            if (max_draft > accepted_cap - 1) max_draft = accepted_cap - 1;
+            if (max_draft < 0) max_draft = 0;
+
+            int drafts[DS4_DFLASH2_MAX_BLOCK];
+            int drafted = 0;
+            if (max_draft > 0 && primary != eos_token) {
+                drafted = dflash2_propose(drafts, max_draft, &e->dflash_model, dw,
+                                          &e->model, &e->weights, s->qwen_layers,
+                                          primary, (uint32_t)(pos > 0 ? pos - 1 : 0));
+            }
+
+            if (drafted <= 0) {
+                qwen_target_forward_layers(e, s->logits, s->qwen_hidden, s->qwen_layers, primary, (uint32_t)pos);
+                token_vec_push(&s->checkpoint, primary);
+                s->checkpoint_valid = true;
+                s->mtp_draft_valid = false;
+                accepted[0] = primary;
+                return 1;
+            }
+
+            const uint32_t n_verify = 1u + (uint32_t)drafted;
+            int verify[DS4_DFLASH2_MAX_BLOCK];
+            verify[0] = primary;
+            for (int d = 0; d < drafted; d++) verify[d + 1] = drafts[d];
+
+            int preds[DS4_DFLASH2_MAX_BLOCK];
+            float *tmp_hidden = xmalloc((size_t)n_verify * 5120 * sizeof(float));
+            float *tmp_layers = xmalloc((size_t)n_verify * 8u * 5120 * sizeof(float));
+            memset(preds, 0xff, sizeof(preds));
+            qwen_target_forward_layers_batch(e, NULL, tmp_hidden, tmp_layers, preds,
+                                             verify, n_verify, (uint32_t)pos);
+
+            int acc = 0;
+            for (int d = 0; d < drafted; d++) {
+                if (preds[d] != drafts[d]) break;
+                acc++;
+                if (drafts[d] == eos_token) break;
+            }
+            const uint32_t committed = 1u + (uint32_t)acc;
+            if (acc < drafted) {
+                (void)qwen_hybrid_restore_gdn_prefix(committed - 1u);
+            }
+
+            const int next_id = preds[committed - 1u];
+            if (next_id >= 0) {
+                for (uint32_t i = 0; i < DS4_N_VOCAB; i++) s->logits[i] = 0.0f;
+                s->logits[next_id] = 1.0f;
+            }
+            memcpy(s->qwen_hidden, tmp_hidden + (size_t)(committed - 1u) * 5120, 5120 * sizeof(float));
+            for (uint32_t j = 0; j < dw->n_target && j < 8u; j++) {
+                memcpy(s->qwen_layers + (size_t)j * 5120,
+                       tmp_layers + ((size_t)(committed - 1u) * 8u + j) * 5120,
+                       5120 * sizeof(float));
+            }
+            free(tmp_hidden);
+            free(tmp_layers);
+
+            accepted[0] = primary;
+            token_vec_push(&s->checkpoint, primary);
+            for (int d = 0; d < acc; d++) {
+                accepted[d + 1] = drafts[d];
+                token_vec_push(&s->checkpoint, drafts[d]);
+            }
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            return (int)committed;
+        }
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;

@@ -12288,7 +12288,8 @@ decode_again:
         int ntok = 0;
         bool toks_evaluated = false;
         if (!s->batched_mode && sampling.temperature <= 0.0f &&
-            ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+            (ds4_engine_mtp_draft_tokens(s->engine) > 1 ||
+             ds4_engine_dflash_ready(s->engine)) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
             !dynamic_steering)
         {
@@ -14358,6 +14359,11 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dspark-strict")) {
             c.engine.dspark = true;
             c.engine.dspark_strict = true;
+        } else if (!strcmp(arg, "--dflash") || !strcmp(arg, "--dflash2") || !strcmp(arg, "--draft-model") || !strcmp(arg, "-hfd")) {
+            c.engine.dflash_path = need_arg(&i, argc, argv, arg);
+            if (c.engine.dflash_draft_n_max == 0) c.engine.dflash_draft_n_max = 7;
+        } else if (!strcmp(arg, "--dflash-n-max") || !strcmp(arg, "--spec-draft-n-max")) {
+            c.engine.dflash_draft_n_max = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
