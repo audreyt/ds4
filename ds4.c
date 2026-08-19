@@ -17662,7 +17662,7 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
                                     const ds4_model *model, const ds4_weights *base_weights,
                                     const qwen_mtp_weights_t *mtp, const float *hidden_in,
                                     int next_token, uint32_t pos, uint32_t slot, int target_hidden) {
-    if (!qwen_mtp_is_valid(mtp) || !hidden_in) return 0;
+    if (!qwen_mtp_is_valid(mtp) || (!hidden_in && !g_mtp_pool.inited)) return 0;
     if (!qwen_mtp_metal_ensure_pool()) return 0;
     if (pos >= g_mtp_pool.kv_cap) return 0;
     const ds4_model *head = qwen_mtp_src(mtp, model);
@@ -17695,7 +17695,10 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
     const bool use_ofou = has_compact_head && has_rerank;
 
     pthread_mutex_lock(&g_mtp_pool.mu);
-    int ok = ds4_gpu_tensor_write(g_mtp_pool.hidden, 0, hidden_in, (uint64_t)n_embd * sizeof(float));
+    int ok = 1;
+    if (hidden_in) {
+        ok = ds4_gpu_tensor_write(g_mtp_pool.hidden, 0, hidden_in, (uint64_t)n_embd * sizeof(float));
+    }
     if (ok && !ds4_gpu_begin_commands()) ok = 0;
     if (!ok) { pthread_mutex_unlock(&g_mtp_pool.mu); return 0; }
 
@@ -17799,6 +17802,9 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
 
     }
 
+    if (ok && need_logits &&
+        !ds4_gpu_tensor_copy(g_mtp_pool.hidden, 0, g_mtp_pool.normed, 0,
+                             (uint64_t)n_embd * sizeof(float))) ok = 0;
     if (ok) {
         if (!ds4_gpu_end_commands()) ok = 0;
     } else {
@@ -40273,18 +40279,19 @@ static int qwen_generate_hybrid(
                 int okd = 0;
 #ifndef DS4_NO_GPU
                 if (!getenv("DS4_QWEN_MTP_CPU")) {
-                    okd = qwen_mtp_draft_one_metal(NULL, &tok, tmp_hidden, model, weights, &mtp_w,
-                                                   cur_hidden, cur_token, cur_pos, (uint32_t)d, d == 0);
+                    okd = qwen_mtp_draft_one_metal(NULL, &tok, NULL, model, weights, &mtp_w,
+                                                   d == 0 ? cur_hidden : NULL, cur_token, cur_pos,
+                                                   (uint32_t)d, d == 0);
                 }
 #endif
                 if (!okd) {
                     if (!qwen_mtp_draft_one_cpu(tmp_logits, tmp_hidden, model, weights, &mtp_w,
                                                 cur_hidden, cur_token, cur_pos, (uint32_t)d, d == 0)) break;
                     tok = sample_argmax(tmp_logits, DS4_N_VOCAB);
+                    memcpy(cur_hidden, tmp_hidden, sizeof(tmp_hidden));
                 }
                 drafts[d] = tok;
                 drafted++;
-                memcpy(cur_hidden, tmp_hidden, sizeof(tmp_hidden));
                 cur_token = tok;
                 cur_pos++;
                 if (vocab_token_is_generation_stop(vocab, tok)) break;
@@ -40341,12 +40348,12 @@ static int qwen_generate_hybrid(
                 break;
             }
         }
-        /* Primary KV at `pos` was written from the target hidden. Only
-           accepted draft slots were written from the head's own hiddens. */
+        /* Primary pairing is already in the head cache. Repair only the
+           accepted prefix after a rejection so rejected KV is overwritten. */
 #ifndef DS4_NO_GPU
-        if (use_mtp && accepted > 0) {
+        if (use_mtp && accepted > 0 && accepted < drafted) {
             const double tr0 = mtp_prof ? now_sec() : 0.0;
-            memcpy(g_mtp_prev_fused, g_mtp_verified_fused, sizeof(g_mtp_prev_fused));
+            memcpy(g_mtp_prev_fused, g_mtp_verified_fused, sizeof(g_mtp_verified_fused));
             for (int d = 0; d < accepted; d++) {
                 qwen_mtp_draft_one_metal(NULL, NULL, NULL, model, weights, &mtp_w,
                                          ver_hidden + (size_t)d * 5120,
