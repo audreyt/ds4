@@ -17110,7 +17110,12 @@ static float g_mtp_verified_fused[5120];
 
 static int qwen_mtp_conv_on(void) {
     const char *e = getenv("DS4_QWEN_MTP_CONV");
-    return !e || strcmp(e, "0") != 0;
+    return e && strcmp(e, "1") == 0;
+}
+
+static int qwen_mtp_target_norm_on(void) {
+    const char *e = getenv("DS4_QWEN_MTP_TARGET_NORM");
+    return e && strcmp(e, "1") == 0;
 }
 
 static void qwen_mtp_reset_conv(void) {
@@ -17440,7 +17445,7 @@ static void qwen_mtp_layer_forward_cpu(float *out, const ds4_model *fallback, co
 }
 
 
-static int qwen_mtp_draft_one_cpu(float *logits_out, float *hidden_out, const ds4_model *model, const ds4_weights *base_weights, const qwen_mtp_weights_t *mtp, const float *hidden_in, int next_token, uint32_t pos, uint32_t slot) {
+static int qwen_mtp_draft_one_cpu(float *logits_out, float *hidden_out, const ds4_model *model, const ds4_weights *base_weights, const qwen_mtp_weights_t *mtp, const float *hidden_in, int next_token, uint32_t pos, uint32_t slot, int target_hidden) {
     const uint32_t n_embd = 5120;
     if (!qwen_mtp_is_valid(mtp) || !hidden_in) return 0;
     float *e_emb = xmalloc((size_t)n_embd * sizeof(float));
@@ -17452,7 +17457,13 @@ static int qwen_mtp_draft_one_cpu(float *logits_out, float *hidden_out, const ds
     const ds4_model *head = qwen_mtp_src(mtp, model);
     embed_token_any(model, base_weights, next_token, e_emb);
     rms_norm_weight(enormed, e_emb, tensor_data(head, mtp->enorm), n_embd, 1e-6f);
-    rms_norm_weight(hnormed, hidden_in, tensor_data(head, mtp->hnorm), n_embd, 1e-6f);
+    const float *h_in = hidden_in;
+    float h_final[5120];
+    if (target_hidden && qwen_mtp_target_norm_on() && base_weights && base_weights->output_norm) {
+        rms_norm_weight(h_final, hidden_in, tensor_data(model, base_weights->output_norm), n_embd, 1e-6f);
+        h_in = h_final;
+    }
+    rms_norm_weight(hnormed, h_in, tensor_data(head, mtp->hnorm), n_embd, 1e-6f);
     matvec_any(eproj, head, mtp->e_proj, enormed);
     matvec_any(hproj, head, mtp->h_proj, hnormed);
     for (uint32_t i=0;i<n_embd;i++) fused[i]=eproj[i]+hproj[i];
@@ -17521,7 +17532,7 @@ static int qwen_mtp_draft_one_cpu(float *logits_out, float *hidden_out, const ds
     } else {
         if (logits_out) matvec_any(logits_out, model, base_weights->output, normed);
     }
-    if (hidden_out) memcpy(hidden_out, to_norm, (size_t)n_embd*sizeof(float));
+    if (hidden_out) memcpy(hidden_out, normed, (size_t)n_embd*sizeof(float));
     free(fused);
     if (tmp_block) free(tmp_block);
     free(block_out);
@@ -17628,7 +17639,7 @@ static void qwen_mtp_metal_reset_kv(void) {
 static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidden_out,
                                     const ds4_model *model, const ds4_weights *base_weights,
                                     const qwen_mtp_weights_t *mtp, const float *hidden_in,
-                                    int next_token, uint32_t pos, uint32_t slot) {
+                                    int next_token, uint32_t pos, uint32_t slot, int target_hidden) {
     if (!qwen_mtp_is_valid(mtp) || !hidden_in) return 0;
     if (!qwen_mtp_metal_ensure_pool()) return 0;
     if (pos >= g_mtp_pool.kv_cap) return 0;
@@ -17671,7 +17682,12 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
                                           n_vocab, next_token, n_embd)) ok = 0;
     if (ok && !ds4_gpu_rms_norm_weight_tensor(g_mtp_pool.enorm, g_mtp_pool.e_emb, map, map_size,
                                               mtp->enorm->abs_offset, n_embd, 1e-6f)) ok = 0;
-    if (ok && !ds4_gpu_rms_norm_weight_tensor(g_mtp_pool.hnorm, g_mtp_pool.hidden, map, map_size,
+    if (ok && target_hidden && qwen_mtp_target_norm_on() && base_weights && base_weights->output_norm) {
+        if (!ds4_gpu_rms_norm_weight_tensor(g_mtp_pool.fused, g_mtp_pool.hidden, base_map, base_size,
+                                            base_weights->output_norm->abs_offset, n_embd, 1e-6f)) ok = 0;
+        if (ok && !ds4_gpu_rms_norm_weight_tensor(g_mtp_pool.hnorm, g_mtp_pool.fused, map, map_size,
+                                                  mtp->hnorm->abs_offset, n_embd, 1e-6f)) ok = 0;
+    } else if (ok && !ds4_gpu_rms_norm_weight_tensor(g_mtp_pool.hnorm, g_mtp_pool.hidden, map, map_size,
                                               mtp->hnorm->abs_offset, n_embd, 1e-6f)) ok = 0;
     if (ok && !qwen_gpu_matmul(g_mtp_pool.eproj, head, mtp->e_proj, n_embd, n_embd, g_mtp_pool.enorm, 1)) ok = 0;
     if (ok && !qwen_gpu_matmul(g_mtp_pool.hproj, head, mtp->h_proj, n_embd, n_embd, g_mtp_pool.hnorm, 1)) ok = 0;
@@ -17822,7 +17838,7 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
             }
         }
     }
-    if (ok && hidden_out && !ds4_gpu_tensor_read(tail, 0, hidden_out,
+    if (ok && hidden_out && !ds4_gpu_tensor_read(g_mtp_pool.normed, 0, hidden_out,
                                                  (uint64_t)n_embd * sizeof(float))) ok = 0;
     pthread_mutex_unlock(&g_mtp_pool.mu);
     return ok;
@@ -17931,7 +17947,7 @@ static int qwen_mtp_draft_one_metal_legacy(float *logits_out, float *hidden_out,
     if (t_next) ds4_gpu_tensor_free(t_next);
     if (!ok) {
         // fallback to CPU draft
-        return qwen_mtp_draft_one_cpu(logits_out, hidden_out, model, base_weights, mtp, hidden_in, next_token, pos, 0);
+        return qwen_mtp_draft_one_cpu(logits_out, hidden_out, model, base_weights, mtp, hidden_in, next_token, pos, 0, 1);
     }
     return 1;
 }
@@ -40129,7 +40145,7 @@ static int qwen_generate_hybrid(
             uint32_t p = (start_i > 0) ? (uint32_t)(i - start_i + 1) : (uint32_t)(i + 1);
             qwen_mtp_draft_one_metal(NULL, NULL, NULL, model, weights, &mtp_w,
                                      hidden_stash + (size_t)i * 5120,
-                                     prompt->v[i + 1], p, 0);
+                                     prompt->v[i + 1], p, 0, 1);
         }
         memcpy(g_mtp_verified_fused, g_mtp_prev_fused, sizeof(g_mtp_verified_fused));
     }
@@ -40179,11 +40195,11 @@ static int qwen_generate_hybrid(
                 int okd = 0;
 #ifndef DS4_NO_GPU
                 okd = qwen_mtp_draft_one_metal(NULL, &tok, tmp_hidden, model, weights, &mtp_w,
-                                               cur_hidden, cur_token, cur_pos, (uint32_t)d);
+                                               cur_hidden, cur_token, cur_pos, (uint32_t)d, d == 0);
 #endif
                 if (!okd) {
                     if (!qwen_mtp_draft_one_cpu(tmp_logits, tmp_hidden, model, weights, &mtp_w,
-                                                cur_hidden, cur_token, cur_pos, (uint32_t)d)) break;
+                                                cur_hidden, cur_token, cur_pos, (uint32_t)d, d == 0)) break;
                     tok = sample_argmax(tmp_logits, DS4_N_VOCAB);
                 }
                 drafts[d] = tok;
@@ -40248,11 +40264,11 @@ static int qwen_generate_hybrid(
         if (use_mtp) {
             memcpy(g_mtp_prev_fused, g_mtp_verified_fused, sizeof(g_mtp_prev_fused));
             qwen_mtp_draft_one_metal(NULL, NULL, NULL, model, weights, &mtp_w,
-                                     hidden, token, (uint32_t)pos, 0);
+                                     hidden, token, (uint32_t)pos, 0, 1);
             for (int d = 0; d < accepted; d++) {
                 qwen_mtp_draft_one_metal(NULL, NULL, NULL, model, weights, &mtp_w,
                                          ver_hidden + (size_t)d * 5120,
-                                         drafts[d], (uint32_t)pos + 1u + (uint32_t)d, 0);
+                                         drafts[d], (uint32_t)pos + 1u + (uint32_t)d, 0, 1);
             }
             memcpy(g_mtp_verified_fused, g_mtp_prev_fused, sizeof(g_mtp_verified_fused));
         }
@@ -42427,7 +42443,7 @@ static int generate_raw_swa_cpu(
                         for (int d=0; d<K; d++) {
                             float tmp_logits[248320];
                             float tmp_hidden[5120];
-                            int ok = qwen_mtp_draft_one_cpu(tmp_logits, tmp_hidden, model, weights, &mtp_w, cur_hidden, cur_token, cur_pos, (uint32_t)d);
+                            int ok = qwen_mtp_draft_one_cpu(tmp_logits, tmp_hidden, model, weights, &mtp_w, cur_hidden, cur_token, cur_pos, (uint32_t)d, d == 0);
                             if (!ok) break;
                             int tok = sample_argmax(tmp_logits, DS4_N_VOCAB);
                             drafts[d]=tok;
@@ -52266,9 +52282,9 @@ static int generate_metal_graph_raw_swa(
                             float tmp_logits[248320];
                             float tmp_hidden[5120];
                             int tok = 0;
-                            int ok = qwen_mtp_draft_one_metal(NULL, &tok, tmp_hidden, model, weights, &mtp_w, cur_hidden, cur_token, cur_pos, (uint32_t)d);
+                            int ok = qwen_mtp_draft_one_metal(NULL, &tok, tmp_hidden, model, weights, &mtp_w, cur_hidden, cur_token, cur_pos, (uint32_t)d, d == 0);
                             if (!ok) {
-                                ok = qwen_mtp_draft_one_cpu(tmp_logits, tmp_hidden, model, weights, &mtp_w, cur_hidden, cur_token, cur_pos, (uint32_t)d);
+                                ok = qwen_mtp_draft_one_cpu(tmp_logits, tmp_hidden, model, weights, &mtp_w, cur_hidden, cur_token, cur_pos, (uint32_t)d, d == 0);
                                 if (!ok) break;
                                 tok = sample_argmax(tmp_logits, DS4_N_VOCAB);
                             }
