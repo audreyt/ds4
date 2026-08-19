@@ -40156,7 +40156,7 @@ static int qwen_generate_hybrid(
             start_i = prompt->len - (int)mtp_cap;
         }
         for (int i = start_i; i < prompt->len - 1; i++) {
-            uint32_t p = (start_i > 0) ? (uint32_t)(i - start_i + 1) : (uint32_t)(i + 1);
+            uint32_t p = (uint32_t)(i - start_i);
             qwen_mtp_draft_one_metal(NULL, NULL, NULL, model, weights, &mtp_w,
                                      hidden_stash + (size_t)i * 5120,
                                      prompt->v[i + 1], p, 0, 1);
@@ -40204,7 +40204,7 @@ static int qwen_generate_hybrid(
             float cur_hidden[5120];
             memcpy(cur_hidden, hidden, sizeof(cur_hidden));
             int cur_token = token;
-            uint32_t cur_pos = (uint32_t)pos;
+            uint32_t cur_pos = (pos > 0) ? (uint32_t)pos - 1u : 0u;
             for (int d = 0; d < K; d++) {
                 float tmp_logits[248320];
                 float tmp_hidden[5120];
@@ -40289,7 +40289,7 @@ static int qwen_generate_hybrid(
             for (int d = 0; d < accepted; d++) {
                 qwen_mtp_draft_one_metal(NULL, NULL, NULL, model, weights, &mtp_w,
                                          ver_hidden + (size_t)d * 5120,
-                                         drafts[d], (uint32_t)pos + 1u + (uint32_t)d, 0, 1);
+                                         drafts[d], (uint32_t)pos + (uint32_t)d, 0, 1);
             }
             memcpy(g_mtp_verified_fused, g_mtp_prev_fused, sizeof(g_mtp_verified_fused));
             if (mtp_prof) t_repair += now_sec() - tr0;
@@ -42466,7 +42466,7 @@ static int generate_raw_swa_cpu(
                         float cur_hidden[5120];
                         memcpy(cur_hidden, hidden, (size_t)5120*sizeof(float));
                         int cur_token = primary;
-                        uint32_t cur_pos = (uint32_t)pos;
+                        uint32_t cur_pos = (pos > 0) ? (uint32_t)pos - 1u : 0u;
                         for (int d=0; d<K; d++) {
                             float tmp_logits[248320];
                             float tmp_hidden[5120];
@@ -52304,7 +52304,7 @@ static int generate_metal_graph_raw_swa(
                         float cur_hidden[5120];
                         memcpy(cur_hidden, hidden, (size_t)5120*sizeof(float));
                         int cur_token = primary;
-                        uint32_t cur_pos = (uint32_t)pos;
+                        uint32_t cur_pos = (pos > 0) ? (uint32_t)pos - 1u : 0u;
                         for (int d=0; d<K; d++) {
                             float tmp_logits[248320];
                             float tmp_hidden[5120];
