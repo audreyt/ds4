@@ -17105,6 +17105,25 @@ static bool qwen_has_mtp(const ds4_model *m) {
 
 static ds4_model g_qwen_mtp_sidecar;
 static int g_qwen_mtp_sidecar_ready; /* 0 unset, 1 loaded, -1 none/fail */
+static float g_mtp_prev_fused[5120];
+static float g_mtp_verified_fused[5120];
+
+static int qwen_mtp_conv_on(void) {
+    const char *e = getenv("DS4_QWEN_MTP_CONV");
+    return !e || strcmp(e, "0") != 0;
+}
+
+static void qwen_mtp_reset_conv(void) {
+    memset(g_mtp_prev_fused, 0, sizeof(g_mtp_prev_fused));
+    memset(g_mtp_verified_fused, 0, sizeof(g_mtp_verified_fused));
+}
+
+static void qwen_mtp_mix_fused(float *mixed, const float *fused) {
+    for (int i = 0; i < 5120; i++) {
+        mixed[i] = 0.9f * fused[i] + 0.1f * g_mtp_prev_fused[i];
+    }
+    memcpy(g_mtp_prev_fused, fused, sizeof(g_mtp_prev_fused));
+}
 
 static const ds4_model *qwen_mtp_src(const qwen_mtp_weights_t *w, const ds4_model *fallback) {
     return (w && w->src) ? w->src : fallback;
@@ -17443,9 +17462,15 @@ static int qwen_mtp_draft_one_cpu(float *logits_out, float *hidden_out, const ds
     bool has_block = mtp->attn_norm && mtp->attn_q && mtp->attn_k && mtp->attn_v && mtp->attn_out && mtp->ffn_norm && mtp->ffn_gate;
     float *to_norm = fused;
     float *tmp_block = NULL;
+    float mixed[5120];
+    const float *attn_in = fused;
+    if (has_block && qwen_mtp_conv_on()) {
+        qwen_mtp_mix_fused(mixed, fused);
+        attn_in = mixed;
+    }
     if (has_block) {
         tmp_block = xmalloc((size_t)n_embd * sizeof(float));
-        qwen_mtp_layer_forward_cpu(tmp_block, model, mtp, fused, pos);
+        qwen_mtp_layer_forward_cpu(tmp_block, model, mtp, attn_in, pos);
         to_norm = tmp_block;
     }
     float *normed = xmalloc((size_t)n_embd * sizeof(float));
@@ -17589,6 +17614,7 @@ static int qwen_mtp_metal_ensure_pool(void) {
 }
 
 static void qwen_mtp_metal_reset_kv(void) {
+    qwen_mtp_reset_conv();
     if (!qwen_mtp_metal_ensure_pool()) return;
     pthread_mutex_lock(&g_mtp_pool.mu);
     if (g_mtp_pool.k_cache && g_mtp_pool.v_cache && g_mtp_pool.kv_cap > 0) {
@@ -17651,9 +17677,23 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
     if (ok && !qwen_gpu_matmul(g_mtp_pool.hproj, head, mtp->h_proj, n_embd, n_embd, g_mtp_pool.hnorm, 1)) ok = 0;
     if (ok && !ds4_gpu_add_tensor(g_mtp_pool.fused, g_mtp_pool.eproj, g_mtp_pool.hproj, n_embd)) ok = 0;
 
+    ds4_gpu_tensor *attn_in = g_mtp_pool.fused;
+    if (ok && has_block && qwen_mtp_conv_on()) {
+        float host_fused[5120];
+        float mixed[5120];
+        if (!ds4_gpu_end_commands()) ok = 0;
+        else if (!ds4_gpu_tensor_read(g_mtp_pool.fused, 0, host_fused, (uint64_t)n_embd * sizeof(float))) ok = 0;
+        else {
+            qwen_mtp_mix_fused(mixed, host_fused);
+            if (!ds4_gpu_tensor_write(g_mtp_pool.eproj, 0, mixed, (uint64_t)n_embd * sizeof(float))) ok = 0;
+            else if (!ds4_gpu_begin_commands()) ok = 0;
+            else attn_in = g_mtp_pool.eproj;
+        }
+    }
+
     ds4_gpu_tensor *tail = g_mtp_pool.fused;
     if (ok && has_block) {
-        if (!ds4_gpu_rms_norm_weight_tensor(g_mtp_pool.normed, g_mtp_pool.fused, map, map_size,
+        if (!ds4_gpu_rms_norm_weight_tensor(g_mtp_pool.normed, attn_in, map, map_size,
                                             mtp->attn_norm->abs_offset, n_embd, 1e-6f)) ok = 0;
         if (ok && !qwen_gpu_matmul(g_mtp_pool.q, head, mtp->attn_q, n_embd, q_out, g_mtp_pool.normed, 1)) ok = 0;
         if (ok && !qwen_gpu_matmul(g_mtp_pool.k, head, mtp->attn_k, n_embd, n_head_kv * head_dim,
@@ -40091,6 +40131,7 @@ static int qwen_generate_hybrid(
                                      hidden_stash + (size_t)i * 5120,
                                      prompt->v[i + 1], p, 0);
         }
+        memcpy(g_mtp_verified_fused, g_mtp_prev_fused, sizeof(g_mtp_verified_fused));
     }
 #endif
     int pos = prompt->len;
@@ -40201,15 +40242,19 @@ static int qwen_generate_hybrid(
                 break;
             }
         }
-        /* Slots pos+1..pos+accepted were written from draft hiddens.
-           Replay them with target hiddens so the next round attends truth. */
+        /* Rewrite committed MTP slots from target hiddens and restore the
+           2-tap prev to the last verified fused residual. */
 #ifndef DS4_NO_GPU
-        if (use_mtp && accepted > 0) {
+        if (use_mtp) {
+            memcpy(g_mtp_prev_fused, g_mtp_verified_fused, sizeof(g_mtp_prev_fused));
+            qwen_mtp_draft_one_metal(NULL, NULL, NULL, model, weights, &mtp_w,
+                                     hidden, token, (uint32_t)pos, 0);
             for (int d = 0; d < accepted; d++) {
                 qwen_mtp_draft_one_metal(NULL, NULL, NULL, model, weights, &mtp_w,
                                          ver_hidden + (size_t)d * 5120,
                                          drafts[d], (uint32_t)pos + 1u + (uint32_t)d, 0);
             }
+            memcpy(g_mtp_verified_fused, g_mtp_prev_fused, sizeof(g_mtp_verified_fused));
         }
 #endif
         if (accepted + 1 < (int)n_ver && !qwen_hybrid_restore_gdn_prefix((uint32_t)accepted)) {
