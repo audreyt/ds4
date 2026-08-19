@@ -17018,12 +17018,45 @@ static void qwen_mtp_top32(int *top32_ids, const float *scores, uint32_t n) {
 
 static int qwen_mtp_rerank_winner(const ds4_model *head, const ds4_tensor *draft_rerank,
                                   const float *normed, uint32_t n_embd,
-                                  const int *candidate_ids, int n_candidates) {
+                                  const int *candidate_ids, int n_candidates,
+                                  const ds4_model *model, const ds4_weights *base_weights,
+                                  const float *hidden_in, int next_token, uint32_t slot,
+                                  int is_compact) {
     if (!draft_rerank || n_candidates <= 0) return 0;
     int best_id = candidate_ids[0];
     float best_score = -1e30f;
     const uint16_t *data_f16 = (draft_rerank->type == DS4_TENSOR_F16) ? tensor_data(head, draft_rerank) : NULL;
     const float *data_f32 = (draft_rerank->type == 0) ? tensor_data(head, draft_rerank) : NULL;
+
+    float lambda = 0.05f;
+    const char *lam_env = getenv("DS4_QWEN_MTP_SELECTOR_LAMBDA");
+    if (lam_env && *lam_env) lambda = strtof(lam_env, NULL);
+    const char *sel_env = getenv("DS4_QWEN_MTP_SELECTOR");
+    bool use_selector = (slot >= 1) && (lambda > 0.0f) && (!sel_env || strcmp(sel_env, "0") != 0) &&
+                        hidden_in && base_weights && base_weights->token_embd &&
+                        (next_token >= 0) && ((uint64_t)next_token < base_weights->token_embd->dim[1]);
+
+    float AH[256];
+    const ds4_tensor *te = (use_selector && base_weights) ? base_weights->token_embd : NULL;
+    const uint16_t *te_f16 = (te && te->type == DS4_TENSOR_F16) ? (const uint16_t *)tensor_data(model, te) : NULL;
+    const uint64_t te_stride = te ? te->dim[0] : 0;
+    const uint64_t n_vocab = te ? te->dim[1] : 0;
+
+    if (use_selector) {
+        float A[256];
+        if (te_f16) {
+            const uint16_t *row_a = te_f16 + (uint64_t)next_token * te_stride;
+            for (int i = 0; i < 256; i++) A[i] = f16_to_f32(row_a[i]);
+        } else {
+            float full[5120];
+            embed_token_any(model, base_weights, next_token, full);
+            for (int i = 0; i < 256; i++) A[i] = full[i];
+        }
+        for (int i = 0; i < 256; i++) {
+            AH[i] = A[i] * sigmoid_stable(hidden_in[i]);
+        }
+    }
+
     for (int k = 0; k < n_candidates; k++) {
         int cand = candidate_ids[k];
         float score = 0.0f;
@@ -17036,6 +17069,23 @@ static int qwen_mtp_rerank_winner(const ds4_model *head, const ds4_tensor *draft
         } else {
             for (uint32_t j = 0; j < n_embd; j++) score += tensor_2d_value(head, draft_rerank, j, cand) * normed[j];
         }
+
+        if (use_selector) {
+            int tok_id = is_compact ? qwen_mtp_map_draft_id(cand) : cand;
+            if (tok_id >= 0 && (uint64_t)tok_id < n_vocab) {
+                float dot_b = 0.0f;
+                if (te_f16) {
+                    const uint16_t *row_b = te_f16 + (uint64_t)tok_id * te_stride;
+                    dot_b = dot_f16_row(row_b, AH, 256);
+                } else {
+                    float full_b[5120];
+                    embed_token_any(model, base_weights, tok_id, full_b);
+                    for (int i = 0; i < 256; i++) dot_b += AH[i] * full_b[i];
+                }
+                score += lambda * dot_b;
+            }
+        }
+
         if (score > best_score) {
             best_score = score;
             best_id = cand;
@@ -17371,7 +17421,7 @@ static void qwen_mtp_layer_forward_cpu(float *out, const ds4_model *fallback, co
 }
 
 
-static int qwen_mtp_draft_one_cpu(float *logits_out, float *hidden_out, const ds4_model *model, const ds4_weights *base_weights, const qwen_mtp_weights_t *mtp, const float *hidden_in, int next_token, uint32_t pos) {
+static int qwen_mtp_draft_one_cpu(float *logits_out, float *hidden_out, const ds4_model *model, const ds4_weights *base_weights, const qwen_mtp_weights_t *mtp, const float *hidden_in, int next_token, uint32_t pos, uint32_t slot) {
     const uint32_t n_embd = 5120;
     if (!qwen_mtp_is_valid(mtp) || !hidden_in) return 0;
     float *e_emb = xmalloc((size_t)n_embd * sizeof(float));
@@ -17413,7 +17463,8 @@ static int qwen_mtp_draft_one_cpu(float *logits_out, float *hidden_out, const ds
         matvec_any(draft_logits, head, mtp->draft_lm_head, normed);
         int top32[32];
         qwen_mtp_top32(top32, draft_logits, QWEN_MTP_DRAFT_REAL);
-        int best_id = qwen_mtp_rerank_winner(head, mtp->draft_rerank, normed, n_embd, top32, 32);
+        int best_id = qwen_mtp_rerank_winner(head, mtp->draft_rerank, normed, n_embd, top32, 32,
+                                             model, base_weights, hidden_in, next_token, slot, 1);
         int mapped_tok = qwen_mtp_map_draft_id(best_id);
         if (logits_out) {
             for (uint32_t i = 0; i < 248320; i++) logits_out[i] = -1e9f;
@@ -17552,7 +17603,6 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
                                     const ds4_model *model, const ds4_weights *base_weights,
                                     const qwen_mtp_weights_t *mtp, const float *hidden_in,
                                     int next_token, uint32_t pos, uint32_t slot) {
-    (void)slot;
     if (!qwen_mtp_is_valid(mtp) || !hidden_in) return 0;
     if (!qwen_mtp_metal_ensure_pool()) return 0;
     if (pos >= g_mtp_pool.kv_cap) return 0;
@@ -17686,7 +17736,8 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
                 ok = 0;
             } else {
                 for (int i = 0; i < 32; i++) top32[i] = (int)top32_u[i];
-                int best_id = qwen_mtp_rerank_winner(head, mtp->draft_rerank, host_normed, n_embd, top32, 32);
+                int best_id = qwen_mtp_rerank_winner(head, mtp->draft_rerank, host_normed, n_embd, top32, 32,
+                                                     model, base_weights, hidden_in, next_token, slot, 1);
                 int mapped_tok = qwen_mtp_map_draft_id(best_id);
                 if (tok_out) *tok_out = mapped_tok;
                 if (logits_out) {
@@ -17702,7 +17753,8 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
             } else {
                 int top32[32];
                 qwen_mtp_top32(top32, host_logits, QWEN_MTP_DRAFT_REAL);
-                int best_id = qwen_mtp_rerank_winner(head, mtp->draft_rerank, host_normed, n_embd, top32, 32);
+                int best_id = qwen_mtp_rerank_winner(head, mtp->draft_rerank, host_normed, n_embd, top32, 32,
+                                                     model, base_weights, hidden_in, next_token, slot, 1);
                 int mapped_tok = qwen_mtp_map_draft_id(best_id);
                 if (tok_out) *tok_out = mapped_tok;
                 if (logits_out) {
@@ -17839,7 +17891,7 @@ static int qwen_mtp_draft_one_metal_legacy(float *logits_out, float *hidden_out,
     if (t_next) ds4_gpu_tensor_free(t_next);
     if (!ok) {
         // fallback to CPU draft
-        return qwen_mtp_draft_one_cpu(logits_out, hidden_out, model, base_weights, mtp, hidden_in, next_token, pos);
+        return qwen_mtp_draft_one_cpu(logits_out, hidden_out, model, base_weights, mtp, hidden_in, next_token, pos, 0);
     }
     return 1;
 }
@@ -40034,7 +40086,7 @@ static int qwen_generate_hybrid(
             start_i = prompt->len - (int)mtp_cap;
         }
         for (int i = start_i; i < prompt->len - 1; i++) {
-            uint32_t p = (start_i > 0) ? (uint32_t)(i - start_i) : (uint32_t)i;
+            uint32_t p = (start_i > 0) ? (uint32_t)(i - start_i + 1) : (uint32_t)(i + 1);
             qwen_mtp_draft_one_metal(NULL, NULL, NULL, model, weights, &mtp_w,
                                      hidden_stash + (size_t)i * 5120,
                                      prompt->v[i + 1], p, 0);
@@ -40090,7 +40142,7 @@ static int qwen_generate_hybrid(
 #endif
                 if (!okd) {
                     if (!qwen_mtp_draft_one_cpu(tmp_logits, tmp_hidden, model, weights, &mtp_w,
-                                                cur_hidden, cur_token, cur_pos)) break;
+                                                cur_hidden, cur_token, cur_pos, (uint32_t)d)) break;
                     tok = sample_argmax(tmp_logits, DS4_N_VOCAB);
                 }
                 drafts[d] = tok;
@@ -42319,7 +42371,7 @@ static int generate_raw_swa_cpu(
                         for (int d=0; d<K; d++) {
                             float tmp_logits[248320];
                             float tmp_hidden[5120];
-                            int ok = qwen_mtp_draft_one_cpu(tmp_logits, tmp_hidden, model, weights, &mtp_w, cur_hidden, cur_token, cur_pos);
+                            int ok = qwen_mtp_draft_one_cpu(tmp_logits, tmp_hidden, model, weights, &mtp_w, cur_hidden, cur_token, cur_pos, (uint32_t)d);
                             if (!ok) break;
                             int tok = sample_argmax(tmp_logits, DS4_N_VOCAB);
                             drafts[d]=tok;
@@ -52160,7 +52212,7 @@ static int generate_metal_graph_raw_swa(
                             int tok = 0;
                             int ok = qwen_mtp_draft_one_metal(NULL, &tok, tmp_hidden, model, weights, &mtp_w, cur_hidden, cur_token, cur_pos, (uint32_t)d);
                             if (!ok) {
-                                ok = qwen_mtp_draft_one_cpu(tmp_logits, tmp_hidden, model, weights, &mtp_w, cur_hidden, cur_token, cur_pos);
+                                ok = qwen_mtp_draft_one_cpu(tmp_logits, tmp_hidden, model, weights, &mtp_w, cur_hidden, cur_token, cur_pos, (uint32_t)d);
                                 if (!ok) break;
                                 tok = sample_argmax(tmp_logits, DS4_N_VOCAB);
                             }
