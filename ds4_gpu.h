@@ -921,6 +921,17 @@ int ds4_gpu_matmul_f16_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+int ds4_gpu_matmul_affine2_g64_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              w_q_offset,
+        uint64_t              w_scales_offset,
+        uint64_t              w_biases_offset,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_embd,
+        uint32_t              n_out);
+
 /* CUDA batch path: fold an input RMS normalization into the FP16 activation
  * conversion used by the following projection. Returns 0 without touching
  * out when the optimized path is unavailable. */

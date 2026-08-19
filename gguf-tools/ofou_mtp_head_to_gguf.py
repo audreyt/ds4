@@ -16,7 +16,7 @@ import sys
 import numpy as np
 
 GGUF_MAGIC = b"GGUF"
-T_F32, T_F16 = 0, 1
+T_F32, T_F16, T_I32 = 0, 1, 26
 ALIGN = 32
 
 NORM_PLAN = [
@@ -359,6 +359,32 @@ def convert(src_path, dest_path, backbone_path="/Users/au/w/ds4/qwen38-nvfp4-gs.
         "type": T_F16,
         "blob": blob,
         "shape": head.shape,
+        "dtype": "F16",
+    })
+
+    # 4b. Packed 2-bit draft_lm_head tensors
+    tensors.append({
+        "name": "mtp.0.draft_lm_head.q",
+        "dims": [320, 98336],
+        "type": T_I32,
+        "blob": np.ascontiguousarray(w_head).astype("<u4").tobytes(),
+        "shape": w_head.shape,
+        "dtype": "I32",
+    })
+    tensors.append({
+        "name": "mtp.0.draft_lm_head.scales",
+        "dims": [80, 98336],
+        "type": T_F16,
+        "blob": f32_to_f16_bytes(np.ascontiguousarray(s_head)),
+        "shape": s_head.shape,
+        "dtype": "F16",
+    })
+    tensors.append({
+        "name": "mtp.0.draft_lm_head.biases",
+        "dims": [80, 98336],
+        "type": T_F16,
+        "blob": f32_to_f16_bytes(np.ascontiguousarray(b_head)),
+        "shape": b_head.shape,
         "dtype": "F16",
     })
 

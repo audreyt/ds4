@@ -15463,6 +15463,22 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand launch");
 }
 
+extern "C" int ds4_gpu_matmul_affine2_g64_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              w_q_offset,
+        uint64_t              w_scales_offset,
+        uint64_t              w_biases_offset,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_embd,
+        uint32_t              n_out) {
+    (void)out; (void)model_map; (void)model_size;
+    (void)w_q_offset; (void)w_scales_offset; (void)w_biases_offset;
+    (void)x; (void)n_embd; (void)n_out;
+    return 0;
+}
+
 extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;

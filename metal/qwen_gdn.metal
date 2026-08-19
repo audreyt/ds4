@@ -469,3 +469,65 @@ kernel void kernel_qwen_copy_f32(
     dst[gid] = src[gid];
 }
 
+struct ds4_affine2_matvec_args {
+    uint32_t n_embd;
+    uint32_t n_out;
+    uint32_t q_row_bytes;
+    uint32_t s_row_bytes;
+    uint32_t b_row_bytes;
+};
+
+kernel void kernel_affine2_g64_matvec(
+    constant ds4_affine2_matvec_args & args,
+    device const char  * w_q,
+    device const char  * w_scales,
+    device const char  * w_biases,
+    device const float * x,
+    device float       * out,
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+
+    const uint row = tgpig.x * 4 + sgitg;
+    if (row >= args.n_out) return;
+
+    device const uint32_t * q_row = (device const uint32_t *)(w_q + (uint64_t)row * args.q_row_bytes);
+    device const half     * s_row = (device const half *)(w_scales + (uint64_t)row * args.s_row_bytes);
+    device const half     * b_row = (device const half *)(w_biases + (uint64_t)row * args.b_row_bytes);
+
+    const uint total_u32 = args.n_embd / 16;
+    float thread_sum = 0.0f;
+
+    for (uint u_idx = tiisg; u_idx < total_u32; u_idx += 32) {
+        const uint g = u_idx / 4;
+        const float scale = float(s_row[g]);
+        const float bias = float(b_row[g]);
+
+        const uint32_t u = q_row[u_idx];
+        device const float * x_ptr = x + u_idx * 16;
+
+        const float4 x0 = *(device const float4 *)(x_ptr + 0);
+        const float4 x1 = *(device const float4 *)(x_ptr + 4);
+        const float4 x2 = *(device const float4 *)(x_ptr + 8);
+        const float4 x3 = *(device const float4 *)(x_ptr + 12);
+
+        const float4 q0 = float4(float(u & 3), float((u >> 2) & 3), float((u >> 4) & 3), float((u >> 6) & 3));
+        const float4 q1 = float4(float((u >> 8) & 3), float((u >> 10) & 3), float((u >> 12) & 3), float((u >> 14) & 3));
+        const float4 q2 = float4(float((u >> 16) & 3), float((u >> 18) & 3), float((u >> 20) & 3), float((u >> 22) & 3));
+        const float4 q3 = float4(float((u >> 24) & 3), float((u >> 26) & 3), float((u >> 28) & 3), float((u >> 30) & 3));
+
+        const float q_dot = dot(q0, x0) + dot(q1, x1) + dot(q2, x2) + dot(q3, x3);
+        const float x_dot = (x0.x + x0.y + x0.z + x0.w) +
+                            (x1.x + x1.y + x1.z + x1.w) +
+                            (x2.x + x2.y + x2.z + x2.w) +
+                            (x3.x + x3.y + x3.z + x3.w);
+
+        thread_sum += scale * q_dot + bias * x_dot;
+    }
+
+    const float total = simd_sum(thread_sum);
+    if (tiisg == 0) {
+        out[row] = total;
+    }
+}
+

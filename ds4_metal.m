@@ -19684,6 +19684,86 @@ int ds4_gpu_qwen_gdn_core_rows_tensor(
     return 1;
 }
 
+int ds4_gpu_matmul_affine2_g64_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              w_q_offset,
+        uint64_t              w_scales_offset,
+        uint64_t              w_biases_offset,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_embd,
+        uint32_t              n_out) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (n_embd == 0 || n_out == 0 || (n_embd % 64) != 0) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t x_bytes = (uint64_t)n_embd * sizeof(float);
+        const uint64_t out_bytes = (uint64_t)n_out * sizeof(float);
+        if (!xbuf || !outbuf ||
+            ds4_gpu_tensor_bytes(x) < x_bytes ||
+            ds4_gpu_tensor_bytes(out) < out_bytes) {
+            fprintf(stderr, "ds4: Metal affine2_g64 matmul received undersized activation buffers\n");
+            return 0;
+        }
+
+        const uint64_t q_row_bytes = ((uint64_t)n_embd / 16u) * sizeof(uint32_t);
+        const uint64_t s_row_bytes = ((uint64_t)n_embd / 64u) * sizeof(uint16_t);
+        const uint64_t b_row_bytes = ((uint64_t)n_embd / 64u) * sizeof(uint16_t);
+
+        const uint64_t q_bytes = q_row_bytes * n_out;
+        const uint64_t s_bytes = s_row_bytes * n_out;
+        const uint64_t b_bytes = b_row_bytes * n_out;
+
+        uint64_t q_inner = 0, s_inner = 0, b_inner = 0;
+        id<MTLBuffer> qbuf = ds4_gpu_wrap_model_range(model_map, model_size, w_q_offset, q_bytes, &q_inner);
+        id<MTLBuffer> sbuf = ds4_gpu_wrap_model_range(model_map, model_size, w_scales_offset, s_bytes, &s_inner);
+        id<MTLBuffer> bbuf = ds4_gpu_wrap_model_range(model_map, model_size, w_biases_offset, b_bytes, &b_inner);
+        if (!qbuf || !sbuf || !bbuf) return 0;
+
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_affine2_g64_matvec");
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        struct {
+            uint32_t n_embd;
+            uint32_t n_out;
+            uint32_t q_row_bytes;
+            uint32_t s_row_bytes;
+            uint32_t b_row_bytes;
+        } args = {
+            .n_embd = n_embd,
+            .n_out = n_out,
+            .q_row_bytes = (uint32_t)q_row_bytes,
+            .s_row_bytes = (uint32_t)s_row_bytes,
+            .b_row_bytes = (uint32_t)b_row_bytes,
+        };
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:qbuf offset:(NSUInteger)q_inner atIndex:1];
+        [enc setBuffer:sbuf offset:(NSUInteger)s_inner atIndex:2];
+        [enc setBuffer:bbuf offset:(NSUInteger)b_inner atIndex:3];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:4];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:5];
+
+        NSUInteger rows_per_tg = 4;
+        NSUInteger tg_count = ((NSUInteger)n_out + rows_per_tg - 1) / rows_per_tg;
+        [enc dispatchThreadgroups:MTLSizeMake(tg_count, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, rows_per_tg, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "affine2_g64 matvec")) return 0;
+        return 1;
+    }
+}
+
 int ds4_gpu_qwen_full_attn_rows_tensor(
         ds4_gpu_tensor       *heads,
         ds4_gpu_tensor       *q,
