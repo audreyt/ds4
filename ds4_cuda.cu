@@ -30064,6 +30064,29 @@ extern "C" int ds4_gpu_matmul_q4_k_pair_tensor(
     (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
     return 0;
 }
+extern "C" int ds4_gpu_matmul_q4_k_pair_swiglu_tensor(
+        ds4_gpu_tensor *mid, const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint32_t weight_type,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x) {
+    (void)mid; (void)model_map; (void)model_size;
+    (void)gate_offset; (void)up_offset; (void)weight_type;
+    (void)in_dim; (void)out_dim; (void)x;
+    return 0;
+}
+extern "C" int ds4_gpu_matmul_q4k_weight_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *weight, uint64_t weight_offset,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x) {
+    (void)out; (void)weight; (void)weight_offset; (void)in_dim; (void)out_dim; (void)x;
+    return 0;
+}
+extern "C" int ds4_gpu_matmul_q8_0_weight_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *weight, uint64_t weight_offset,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x) {
+    (void)out; (void)weight; (void)weight_offset; (void)in_dim; (void)out_dim; (void)x;
+    return 0;
+}
+
+
 
 
 extern "C" int ds4_gpu_qwen_gdn_core_tensor(
@@ -30078,6 +30101,23 @@ extern "C" int ds4_gpu_qwen_gdn_core_tensor(
     (void)conv_w_off; (void)a_off; (void)dt_off; (void)snorm_off; (void)layer;
     return 0;
 }
+extern "C" int ds4_gpu_qwen_gdn_core_rows_tensor(
+        ds4_gpu_tensor *core, ds4_gpu_tensor *conv, ds4_gpu_tensor *state,
+        const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha, const ds4_gpu_tensor *beta,
+        const void *model_map, uint64_t model_size,
+        uint64_t conv_w_off, uint64_t a_off, uint64_t dt_off, uint64_t snorm_off,
+        uint32_t layer, uint32_t n_tok) {
+    (void)core; (void)conv; (void)state; (void)qkv; (void)z; (void)alpha; (void)beta;
+    (void)model_map; (void)model_size; (void)conv_w_off; (void)a_off; (void)dt_off;
+    (void)snorm_off; (void)layer; (void)n_tok;
+    return 0;
+}
+extern "C" void ds4_gpu_qwen_set_gdn_steps(ds4_gpu_tensor *conv_steps, ds4_gpu_tensor *state_steps) {
+    (void)conv_steps; (void)state_steps;
+}
+
+
 extern "C" int ds4_gpu_qwen_full_attn_tensor(
         ds4_gpu_tensor *heads, ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
         ds4_gpu_tensor *gate, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,

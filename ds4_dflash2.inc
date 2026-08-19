@@ -63,9 +63,12 @@ static int dflash2_matvec_gpu(float *out, const ds4_model *m, const ds4_tensor *
 
 static int dflash2_matvecs_gpu(float *out, const ds4_model *m, const ds4_tensor *w,
                                const float *x, uint32_t n_tok) {
-#ifndef DS4_NO_GPU
-    if (!ds4_gpu_model_is_mapped(m->map)) return 0;
-    if (!g_qwen_pool.inited || !w || !m || !m->map || n_tok == 0) return 0;
+    static int nfail;
+    if (!g_qwen_pool.inited || !w || !m || !m->map || n_tok == 0) {
+        if (nfail++ < 3) fprintf(stderr, "ds4: dflash gpu skip pool/w map n=%u inited=%d\n",
+                                n_tok, g_qwen_pool.inited);
+        return 0;
+    }
     if (w->type == DS4_TENSOR_Q5_K) return 0;
     if (w->type == DS4_TENSOR_Q6_K && n_tok != 1) return 0;
     if (w->ndim < 2 || w->dim[0] == 0) return 0;
@@ -85,8 +88,15 @@ static int dflash2_matvecs_gpu(float *out, const ds4_model *m, const ds4_tensor 
         gy = ds4_gpu_tensor_alloc(yb);
         gy_bytes = yb;
     }
-    if (!gx || !gy) return 0;
-    if (!ds4_gpu_begin_commands()) return 0;
+    if (!gx || !gy) {
+        if (nfail++ < 3) fprintf(stderr, "ds4: dflash gpu alloc fail in=%llu out=%llu\n",
+                                (unsigned long long)in_dim, (unsigned long long)out_dim);
+        return 0;
+    }
+    if (!ds4_gpu_begin_commands()) {
+        if (nfail++ < 3) fprintf(stderr, "ds4: dflash gpu begin fail\n");
+        return 0;
+    }
     int ok = ds4_gpu_tensor_write(gx, 0, x, xb);
     if (ok) {
         ok = ds4_gpu_matmul_quant_tensor(gy, m->map, m->size, w->abs_offset,
@@ -94,12 +104,79 @@ static int dflash2_matvecs_gpu(float *out, const ds4_model *m, const ds4_tensor 
     }
     if (!ds4_gpu_end_commands()) ok = 0;
     if (ok && !ds4_gpu_tensor_read(gy, 0, out, yb)) ok = 0;
+    if (!ok && nfail++ < 4) {
+        fprintf(stderr, "ds4: dflash gpu gemm fail type=%u in=%llu out=%llu n=%u\n",
+                w->type, (unsigned long long)in_dim, (unsigned long long)out_dim, n_tok);
+    }
     return ok;
-#else
-    (void)out; (void)m; (void)w; (void)x; (void)n_tok;
-    return 0;
-#endif
+
 }
+
+static void dflash2_matvecs(float *out, const ds4_model *m, const ds4_tensor *w,
+                            const float *x, uint32_t n_tok);
+
+static int dflash2_matvecs_n_gpu(float **outs, const ds4_model *m, const ds4_tensor **ws,
+                                 const float *x, uint32_t n_tok, int n_w) {
+    static int nfail;
+    static ds4_gpu_tensor *gx;
+    static ds4_gpu_tensor *gy[4];
+    static uint64_t gx_bytes, gy_bytes[4];
+    if (!g_qwen_pool.inited || !m || !m->map || !x || n_tok == 0 || n_w <= 0 || n_w > 4) return 0;
+    uint64_t in_dim0 = 0;
+    uint64_t xb = 0;
+    for (int i = 0; i < n_w; i++) {
+        const ds4_tensor *w = ws[i];
+        if (!w || !outs[i] || w->ndim < 2 || w->dim[0] == 0) return 0;
+        if (w->type == DS4_TENSOR_Q5_K) return 0;
+        if (w->type == DS4_TENSOR_Q6_K && n_tok != 1) return 0;
+        if (i == 0) {
+            in_dim0 = w->dim[0];
+            xb = (uint64_t)n_tok * in_dim0 * sizeof(float);
+        } else if (w->dim[0] != in_dim0) {
+            return 0;
+        }
+    }
+    if (!gx || gx_bytes < xb) {
+        if (gx) ds4_gpu_tensor_free(gx);
+        gx = ds4_gpu_tensor_alloc(xb);
+        gx_bytes = xb;
+    }
+    if (!gx) return 0;
+    for (int i = 0; i < n_w; i++) {
+        const uint64_t out_dim = ws[i]->elements / in_dim0;
+        const uint64_t yb = (uint64_t)n_tok * out_dim * sizeof(float);
+        if (!gy[i] || gy_bytes[i] < yb) {
+            if (gy[i]) ds4_gpu_tensor_free(gy[i]);
+            gy[i] = ds4_gpu_tensor_alloc(yb);
+            gy_bytes[i] = yb;
+        }
+        if (!gy[i]) return 0;
+    }
+    if (!ds4_gpu_begin_commands()) {
+        if (nfail++ < 3) fprintf(stderr, "ds4: dflash gpu n-begin fail\n");
+        return 0;
+    }
+    int ok = ds4_gpu_tensor_write(gx, 0, x, xb);
+    for (int i = 0; ok && i < n_w; i++) {
+        const uint64_t out_dim = ws[i]->elements / in_dim0;
+        ok = ds4_gpu_matmul_quant_tensor(gy[i], m->map, m->size, ws[i]->abs_offset,
+                                         ws[i]->type, in_dim0, out_dim, gx, n_tok);
+    }
+    if (!ds4_gpu_end_commands()) ok = 0;
+    for (int i = 0; ok && i < n_w; i++) {
+        const uint64_t yb = (uint64_t)n_tok * (ws[i]->elements / in_dim0) * sizeof(float);
+        if (!ds4_gpu_tensor_read(gy[i], 0, outs[i], yb)) ok = 0;
+    }
+    if (!ok && nfail++ < 4) fprintf(stderr, "ds4: dflash gpu n-gemm fail n_w=%d n=%u\n", n_w, n_tok);
+    return ok;
+}
+
+static void dflash2_matvecs_n(float **outs, const ds4_model *m, const ds4_tensor **ws,
+                              const float *x, uint32_t n_tok, int n_w) {
+    if (dflash2_matvecs_n_gpu(outs, m, ws, x, n_tok, n_w)) return;
+    for (int i = 0; i < n_w; i++) dflash2_matvecs(outs[i], m, ws[i], x, n_tok);
+}
+
 
 static void dflash2_matvec(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
     if (!w) ds4_die("missing DFlash2 weight");
@@ -372,6 +449,163 @@ static void dflash2_conv_finish(
     free(dyn1);
 }
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+int ds4_gpu_dflash2_grouped_conv(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *hidden, const ds4_gpu_tensor *dynamic,
+        const void *model_map, uint64_t model_size, uint64_t base_off,
+        uint32_t L, uint32_t hidden_size, uint32_t kernel, uint32_t group, uint32_t tap);
+int ds4_gpu_dflash2_sdpa(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_ctx, const ds4_gpu_tensor *v_ctx,
+        const ds4_gpu_tensor *k_prop, const ds4_gpu_tensor *v_prop,
+        uint32_t L, uint32_t n_head, uint32_t n_kv, uint32_t head_dim);
+
+static int dflash2_tensure(ds4_gpu_tensor **t, uint64_t *cap, uint64_t bytes) {
+    if (*t && *cap >= bytes) return 1;
+    if (*t) ds4_gpu_tensor_free(*t);
+    *t = ds4_gpu_tensor_alloc(bytes);
+    *cap = bytes;
+    return *t != NULL;
+}
+
+static int dflash2_gpu_gemm(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
+                            const ds4_gpu_tensor *x, uint32_t n_tok) {
+    if (!w || w->ndim < 2 || w->dim[0] == 0) return 0;
+    if (w->type == DS4_TENSOR_Q5_K) return 0;
+    const uint64_t in_dim = w->dim[0];
+    const uint64_t out_dim = w->elements / in_dim;
+    if (ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type,
+                                    in_dim, out_dim, x, n_tok)) return 1;
+    if (n_tok <= 1) return 0;
+    for (uint32_t t = 0; t < n_tok; t++) {
+        ds4_gpu_tensor *xr = ds4_gpu_tensor_view(x, (uint64_t)t * in_dim * sizeof(float),
+                                                 in_dim * sizeof(float));
+        ds4_gpu_tensor *yr = ds4_gpu_tensor_view(out, (uint64_t)t * out_dim * sizeof(float),
+                                                 out_dim * sizeof(float));
+        int row_ok = xr && yr &&
+            ds4_gpu_matmul_quant_tensor(yr, m->map, m->size, w->abs_offset, w->type,
+                                        in_dim, out_dim, xr, 1);
+        ds4_gpu_tensor_free(xr);
+        ds4_gpu_tensor_free(yr);
+        if (!row_ok) return 0;
+    }
+    return 1;
+}
+
+static ds4_gpu_tensor *th;
+static int h_live;
+
+static int dflash2_layer_forward_gpu(
+        float *h,
+        const float *h_ctx,
+        const ds4_model *m,
+        const ds4_dflash2_layer *l,
+        const ds4_dflash2_weights *cfg,
+        uint32_t L,
+        uint32_t ctx_pos) {
+    if (!g_qwen_pool.inited || !m || !m->map || !l || !cfg || L == 0 || L > 8) return 0;
+    if (cfg->head_dim == 0 || cfg->head_dim > 128) return 0;
+    if (!l->attn_conv_base || l->attn_conv_base->type != DS4_TENSOR_F32 ||
+        !l->ffn_conv_base || l->ffn_conv_base->type != DS4_TENSOR_F32) {
+        static int ntype;
+        if (ntype++ < 3) fprintf(stderr, "ds4: dflash gpu skip conv type attn=%u ffn=%u\n",
+                                 l->attn_conv_base ? l->attn_conv_base->type : 99u,
+                                 l->ffn_conv_base ? l->ffn_conv_base->type : 99u);
+        return 0;
+    }
+    const uint32_t H = cfg->n_embd;
+    const uint32_t ff = cfg->n_ff;
+    const uint32_t n_head = cfg->n_head;
+    const uint32_t n_kv = cfg->n_head_kv;
+    const uint32_t hd = cfg->head_dim;
+    const uint32_t q_dim = n_head * hd;
+    const uint32_t kv_dim = n_kv * hd;
+    const uint32_t groups = H / cfg->conv_group;
+    const uint32_t dyn_dim = 2u * cfg->conv_kernel * groups;
+    static ds4_gpu_tensor *thctx, *txn, *tprep, *tdyn, *tq, *tkp, *tvp, *tkc, *tvc, *theads, *tattn, *tfin, *tgate, *tup, *tmid, *tffn;
+    static uint64_t ch, cctx, cxn, cprep, cdyn, cq, ckp, cvp, ckc, cvc, chd, catt, cfin, cg, cu, cm, cf;
+    const uint64_t bH = (uint64_t)L * H * sizeof(float);
+    if (!dflash2_tensure(&th, &ch, bH) ||
+        !dflash2_tensure(&thctx, &cctx, (uint64_t)H * sizeof(float)) ||
+        !dflash2_tensure(&txn, &cxn, bH) ||
+        !dflash2_tensure(&tprep, &cprep, bH) ||
+        !dflash2_tensure(&tdyn, &cdyn, (uint64_t)L * dyn_dim * sizeof(float)) ||
+        !dflash2_tensure(&tq, &cq, (uint64_t)L * q_dim * sizeof(float)) ||
+        !dflash2_tensure(&tkp, &ckp, (uint64_t)L * kv_dim * sizeof(float)) ||
+        !dflash2_tensure(&tvp, &cvp, (uint64_t)L * kv_dim * sizeof(float)) ||
+        !dflash2_tensure(&tkc, &ckc, (uint64_t)kv_dim * sizeof(float)) ||
+        !dflash2_tensure(&tvc, &cvc, (uint64_t)kv_dim * sizeof(float)) ||
+        !dflash2_tensure(&theads, &chd, (uint64_t)L * q_dim * sizeof(float)) ||
+        !dflash2_tensure(&tattn, &catt, bH) ||
+        !dflash2_tensure(&tfin, &cfin, bH) ||
+        !dflash2_tensure(&tgate, &cg, (uint64_t)L * ff * sizeof(float)) ||
+        !dflash2_tensure(&tup, &cu, (uint64_t)L * ff * sizeof(float)) ||
+        !dflash2_tensure(&tmid, &cm, (uint64_t)L * ff * sizeof(float)) ||
+        !dflash2_tensure(&tffn, &cf, bH)) return 0;
+
+    int started = 0;
+    if (!ds4_gpu_commands_active()) {
+        if (!ds4_gpu_begin_commands()) return 0;
+        started = 1;
+        h_live = 0;
+    }
+    int ok = 1;
+    if (!h_live) {
+        ok = ds4_gpu_tensor_write(th, 0, h, bH) &&
+             ds4_gpu_tensor_write(thctx, 0, h_ctx, (uint64_t)H * sizeof(float));
+        h_live = ok;
+    }
+    const char *fail = NULL;
+    #define DFLASH2_STEP(name, expr) do { if (ok && !(expr)) { fail = (name); ok = 0; } } while (0)
+    DFLASH2_STEP("attn_rms", ds4_gpu_rms_norm_weight_rows_tensor(txn, th, m->map, m->size, l->attn_norm->abs_offset, H, L, 1e-6f));
+    DFLASH2_STEP("attn_dyn", dflash2_gpu_gemm(tdyn, m, l->attn_conv_proj, txn, L));
+    DFLASH2_STEP("attn_conv0", ds4_gpu_dflash2_grouped_conv(tprep, txn, tdyn, m->map, m->size, l->attn_conv_base->abs_offset, L, H, cfg->conv_kernel, cfg->conv_group, 0));
+    DFLASH2_STEP("attn_q", dflash2_gpu_gemm(tq, m, l->attn_q, tprep, L));
+    DFLASH2_STEP("attn_k", dflash2_gpu_gemm(tkp, m, l->attn_k, tprep, L));
+    DFLASH2_STEP("attn_v", dflash2_gpu_gemm(tvp, m, l->attn_v, tprep, L));
+    DFLASH2_STEP("ctx_k", dflash2_gpu_gemm(tkc, m, l->attn_k, thctx, 1));
+    DFLASH2_STEP("ctx_v", dflash2_gpu_gemm(tvc, m, l->attn_v, thctx, 1));
+    DFLASH2_STEP("q_rms", l->attn_q_norm && ds4_gpu_rms_norm_weight_rows_tensor(tq, tq, m->map, m->size, l->attn_q_norm->abs_offset, hd, L * n_head, 1e-6f));
+    DFLASH2_STEP("k_rms", l->attn_k_norm && ds4_gpu_rms_norm_weight_rows_tensor(tkp, tkp, m->map, m->size, l->attn_k_norm->abs_offset, hd, L * n_kv, 1e-6f));
+    DFLASH2_STEP("kc_rms", l->attn_k_norm && ds4_gpu_rms_norm_weight_rows_tensor(tkc, tkc, m->map, m->size, l->attn_k_norm->abs_offset, hd, n_kv, 1e-6f));
+    DFLASH2_STEP("q_rope", ds4_gpu_rope_tail_tensor(tq, L, n_head, hd, hd, ctx_pos + 1u, 0, false, 10000000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f));
+    DFLASH2_STEP("k_rope", ds4_gpu_rope_tail_tensor(tkp, L, n_kv, hd, hd, ctx_pos + 1u, 0, false, 10000000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f));
+    DFLASH2_STEP("kc_rope", ds4_gpu_rope_tail_tensor(tkc, 1, n_kv, hd, hd, ctx_pos, 0, false, 10000000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f));
+    DFLASH2_STEP("sdpa", ds4_gpu_dflash2_sdpa(theads, tq, tkc, tvc, tkp, tvp, L, n_head, n_kv, hd));
+    DFLASH2_STEP("attn_o", dflash2_gpu_gemm(tattn, m, l->attn_output, theads, L));
+    DFLASH2_STEP("attn_conv1", ds4_gpu_dflash2_grouped_conv(tfin, tattn, tdyn, m->map, m->size, l->attn_conv_base->abs_offset, L, H, cfg->conv_kernel, cfg->conv_group, 1));
+    DFLASH2_STEP("attn_add", ds4_gpu_add_tensor(th, th, tfin, L * H));
+    DFLASH2_STEP("ffn_rms", ds4_gpu_rms_norm_weight_rows_tensor(txn, th, m->map, m->size, l->ffn_norm->abs_offset, H, L, 1e-6f));
+    DFLASH2_STEP("ffn_dyn", dflash2_gpu_gemm(tdyn, m, l->ffn_conv_proj, txn, L));
+    DFLASH2_STEP("ffn_conv0", ds4_gpu_dflash2_grouped_conv(tprep, txn, tdyn, m->map, m->size, l->ffn_conv_base->abs_offset, L, H, cfg->conv_kernel, cfg->conv_group, 0));
+    DFLASH2_STEP("ffn_gate", dflash2_gpu_gemm(tgate, m, l->ffn_gate, tprep, L));
+    DFLASH2_STEP("ffn_up", dflash2_gpu_gemm(tup, m, l->ffn_up, tprep, L));
+    DFLASH2_STEP("swiglu", ds4_gpu_swiglu_tensor(tmid, tgate, tup, L * ff, 0.0f, 1.0f));
+    DFLASH2_STEP("ffn_down", dflash2_gpu_gemm(tffn, m, l->ffn_down, tmid, L));
+    DFLASH2_STEP("ffn_conv1", ds4_gpu_dflash2_grouped_conv(tfin, tffn, tdyn, m->map, m->size, l->ffn_conv_base->abs_offset, L, H, cfg->conv_kernel, cfg->conv_group, 1));
+    DFLASH2_STEP("ffn_add", ds4_gpu_add_tensor(th, th, tfin, L * H));
+    #undef DFLASH2_STEP
+    if (!ok) {
+        static int nfail;
+        if (nfail++ < 6) fprintf(stderr, "ds4: dflash gpu step fail %s L=%u\n", fail ? fail : "?", L);
+    }
+    if (started) {
+        if (!ds4_gpu_end_commands()) ok = 0;
+        if (ok && !ds4_gpu_tensor_read(th, 0, h, bH)) ok = 0;
+        else if (!ok) (void)ds4_gpu_end_commands();
+        h_live = 0;
+    }
+    return ok;
+}
+
+static int dflash2_gpu_finish_h(float *h, uint32_t L, uint32_t H) {
+    h_live = 0;
+    if (!ds4_gpu_end_commands()) return 0;
+    return ds4_gpu_tensor_read(th, 0, h, (uint64_t)L * H * sizeof(float));
+}
+#endif
+
+
 static void dflash2_layer_forward(
         float *h,
         const float *h_ctx,
@@ -381,6 +615,18 @@ static void dflash2_layer_forward(
         uint32_t L,
         uint32_t ctx_pos) {
     const uint32_t H = cfg->n_embd;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    {
+        const int gpu_ok = dflash2_layer_forward_gpu(h, h_ctx, m, l, cfg, L, ctx_pos);
+        static int nlog;
+        if (nlog < 2) {
+            fprintf(stderr, "ds4: dflash layer gpu=%d L=%u\n", gpu_ok, L);
+            nlog++;
+        }
+        if (gpu_ok) return;
+    }
+#endif
+
     const uint32_t ff = cfg->n_ff;
     const uint32_t n_head = cfg->n_head;
     const uint32_t n_kv = cfg->n_head_kv;
@@ -417,11 +663,14 @@ static void dflash2_layer_forward(
                              0, L, H, cfg->conv_kernel, cfg->conv_group);
         free(dyn0);
     }
-    dflash2_matvecs(q, m, l->attn_q, prep, L);
-    dflash2_matvecs(k_prop, m, l->attn_k, prep, L);
-    dflash2_matvecs(v_prop, m, l->attn_v, prep, L);
-    dflash2_matvec(k_ctx, m, l->attn_k, h_ctx);
-    dflash2_matvec(v_ctx, m, l->attn_v, h_ctx);
+    {
+        const ds4_tensor *qkv_w[3] = { l->attn_q, l->attn_k, l->attn_v };
+        float *qkv_o[3] = { q, k_prop, v_prop };
+        dflash2_matvecs_n(qkv_o, m, qkv_w, prep, L, 3);
+        const ds4_tensor *ctx_w[2] = { l->attn_k, l->attn_v };
+        float *ctx_o[2] = { k_ctx, v_ctx };
+        dflash2_matvecs_n(ctx_o, m, ctx_w, h_ctx, 1, 2);
+    }
 
     for (uint32_t t = 0; t < L; t++) {
         dflash2_rms_head(q + (size_t)t * q_dim, tensor_data(m, l->attn_q_norm), n_head, hd, eps);
@@ -455,8 +704,11 @@ static void dflash2_layer_forward(
     float *up = xmalloc((size_t)L * ff * sizeof(float));
     float *mid = xmalloc((size_t)L * ff * sizeof(float));
     float *ffn = xmalloc((size_t)L * H * sizeof(float));
-    dflash2_matvecs(gate, m, l->ffn_gate, prep, L);
-    dflash2_matvecs(up, m, l->ffn_up, prep, L);
+    {
+        const ds4_tensor *gu_w[2] = { l->ffn_gate, l->ffn_up };
+        float *gu_o[2] = { gate, up };
+        dflash2_matvecs_n(gu_o, m, gu_w, prep, L, 2);
+    }
     for (uint32_t t = 0; t < L; t++) {
         dflash2_swiglu(mid + (size_t)t * ff, gate + (size_t)t * ff, up + (size_t)t * ff, ff);
     }
@@ -515,8 +767,32 @@ static int dflash2_propose(
     for (uint32_t t = 1; t < L; t++) {
         embed_token_any(tm, tw, dw->mask_token_id, h + (size_t)t * H);
     }
-    for (uint32_t il = 0; il < dw->n_layer; il++) {
-        dflash2_layer_forward(h, h_ctx, dm, &dw->layer[il], dw, L, ctx_pos);
+    int gpu_all = 0;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    h_live = 0;
+    if (g_qwen_pool.inited && ds4_gpu_begin_commands()) {
+        int ok = 1;
+        uint32_t fail_il = 0;
+        for (uint32_t il = 0; ok && il < dw->n_layer; il++) {
+            ok = dflash2_layer_forward_gpu(h, h_ctx, dm, &dw->layer[il], dw, L, ctx_pos);
+            if (!ok) fail_il = il;
+            else (void)ds4_gpu_flush_encoder();
+        }
+        if (ok) ok = dflash2_gpu_finish_h(h, L, H);
+        else (void)ds4_gpu_end_commands();
+        gpu_all = ok;
+        static int nbat;
+        if (nbat++ < 3) fprintf(stderr, "ds4: dflash batched gpu_all=%d fail_il=%u n_layer=%u\n",
+                                gpu_all, fail_il, dw->n_layer);
+    } else if (g_qwen_pool.inited) {
+        static int nbeg;
+        if (nbeg++ < 2) fprintf(stderr, "ds4: dflash batched begin fail inited=%d\n", g_qwen_pool.inited);
+    }
+#endif
+    if (!gpu_all) {
+        for (uint32_t il = 0; il < dw->n_layer; il++) {
+            dflash2_layer_forward(h, h_ctx, dm, &dw->layer[il], dw, L, ctx_pos);
+        }
     }
     float *normed = xmalloc((size_t)L * H * sizeof(float));
     for (uint32_t t = 0; t < L; t++) {
@@ -531,28 +807,34 @@ static int dflash2_propose(
     dflash2_embed_row(pred, dm, dw->selector_predecessor, anchor);
     int n_out = 0;
     for (uint32_t t = 1; t < L && n_out < n_draft; t++) {
-        dflash2_matvec(logits, tm, tw->output, normed + (size_t)t * H);
-        dflash2_matvec(hid_r, dm, dw->selector_hidden, normed + (size_t)t * H);
-        int cand[16];
-        float unary[16];
-        dflash2_topk16(logits, DS4_N_VOCAB, dw->selector_top_k, cand, unary);
-        int best = cand[0];
-        float best_s = -1e30f;
-        for (uint32_t k = 0; k < dw->selector_top_k; k++) {
-            if (cand[k] < 0) continue;
-            dflash2_embed_row(succ, dm, dw->selector_successor, cand[k]);
-            float edge = 0.0f;
-            for (uint32_t r = 0; r < dw->selector_rank; r++) {
-                edge += pred[r] * hid_r[r] * succ[r];
-            }
-            const float s = unary[k] + edge;
-            if (s > best_s) {
-                best_s = s;
-                best = cand[k];
+        int best = -1;
+#ifndef DS4_NO_GPU
+        if (g_qwen_pool.inited && g_qwen_pool.norm && g_qwen_pool.logits_gpu &&
+            g_qwen_pool.argmax_gpu && tw->output &&
+            ds4_gpu_tensor_write(g_qwen_pool.norm, 0, normed + (size_t)t * H,
+                                 (uint64_t)H * sizeof(float)) &&
+            ds4_gpu_begin_commands() &&
+            ds4_gpu_matmul_quant_tensor(g_qwen_pool.logits_gpu, tm->map, tm->size,
+                                        tw->output->abs_offset, tw->output->type,
+                                        H, DS4_N_VOCAB, g_qwen_pool.norm, 1) &&
+            ds4_gpu_argmax_tensor(g_qwen_pool.argmax_gpu, g_qwen_pool.logits_gpu, DS4_N_VOCAB) &&
+            ds4_gpu_end_commands()) {
+            int32_t idx = -1;
+            if (ds4_gpu_tensor_read(g_qwen_pool.argmax_gpu, 0, &idx, sizeof(idx)) && idx >= 0)
+                best = (int)idx;
+        } else {
+            (void)ds4_gpu_end_commands();
+        }
+#endif
+        if (best < 0) {
+            dflash2_matvec(logits, tm, tw->output, normed + (size_t)t * H);
+            best = 0;
+            float best_v = logits[0];
+            for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
+                if (logits[i] > best_v) { best_v = logits[i]; best = (int)i; }
             }
         }
         drafts[n_out++] = best;
-        dflash2_embed_row(pred, dm, dw->selector_predecessor, best);
     }
     free(logits); free(hid_r); free(normed); free(h); free(fc_out); free(h_ctx);
     (void)concat;
