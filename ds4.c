@@ -17137,7 +17137,9 @@ static int qwen_mtp_conv_on(void) {
 
 static int qwen_mtp_target_norm_on(void) {
     const char *e = getenv("DS4_QWEN_MTP_TARGET_NORM");
-    return e && strcmp(e, "1") == 0;
+    /* mlx.fast seeds the head from post-output-norm trunk hidden. */
+    if (!e || !e[0]) return 1;
+    return e[0] != '0';
 }
 
 static void qwen_mtp_reset_conv(void) {
@@ -40237,7 +40239,8 @@ static int qwen_generate_hybrid(
     double ema[8];
     for (int i = 0; i < 8; i++) ema[i] = 0.85 * pow(0.98, (double)i);
     uint64_t n_drafted = 0, n_accepted = 0;
-    double t_draft = 0.0, t_verify = 0.0, t_repair = 0.0;
+    double t_draft = 0.0, t_verify = 0.0, t_repair = 0.0, t_round = 0.0;
+    uint64_t n_rounds = 0;
     const int mtp_prof = getenv("DS4_QWEN_MTP_PROFILE") && getenv("DS4_QWEN_MTP_PROFILE")[0] != '0';
     static float ver_hidden[8 * 5120];
     const char *env_k = getenv("DS4_QWEN_MTP_K");
@@ -40248,6 +40251,7 @@ static int qwen_generate_hybrid(
         if (emit) emit(emit_ud, token);
         n_generated++;
         if (n_generated >= n_predict || pos + 1 >= ctx_size) break;
+        const double trd0 = mtp_prof ? now_sec() : 0.0;
 
         int remaining = n_predict - n_generated;
         int offered = remaining;
@@ -40372,6 +40376,7 @@ static int qwen_generate_hybrid(
 
         token = ver_argmax[accepted];
         if (hidden) memcpy(hidden, ver_hidden + (size_t)accepted * 5120, (size_t)5120 * sizeof(float));
+        if (mtp_prof) { t_round += now_sec() - trd0; n_rounds++; }
     }
 
 hybrid_done:
@@ -40385,8 +40390,10 @@ hybrid_done:
                     (unsigned long long)n_drafted, (unsigned long long)n_accepted,
                     n_generated > 0 ? (double)n_accepted / (double)n_generated * (1.0 + (n_drafted > 0 ? (double)n_accepted / (double)n_drafted : 0.0)) : 0.0);
             if (mtp_prof) {
-                fprintf(stderr, "  draft=%.1fms verify=%.1fms repair=%.1fms",
-                        1e3 * t_draft, 1e3 * t_verify, 1e3 * t_repair);
+                fprintf(stderr, "  draft=%.1fms verify=%.1fms repair=%.1fms round=%.1fms other=%.1fms rounds=%llu",
+                        1e3 * t_draft, 1e3 * t_verify, 1e3 * t_repair, 1e3 * t_round,
+                        1e3 * (t_round - t_draft - t_verify - t_repair),
+                        (unsigned long long)n_rounds);
             }
             fprintf(stderr, "\n");
         } else {
