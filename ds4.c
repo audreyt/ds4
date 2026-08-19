@@ -17854,6 +17854,58 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
     }
     if (ok && hidden_out && !ds4_gpu_tensor_read(g_mtp_pool.normed, 0, hidden_out,
                                                  (uint64_t)n_embd * sizeof(float))) ok = 0;
+    if (ok && tok_out && getenv("DS4_QWEN_MTP_DUMP")) {
+        static int dumped;
+        if (!dumped) {
+            dumped = 1;
+            FILE *df = fopen("/tmp/mtp_dump.bin", "wb");
+            if (df) {
+                float h[5120], e[5120], en[5120], hn[5120], ep[5120], hp[5120], fu[5120];
+                float af[5120], bo[5120], no[5120];
+                int32_t meta[3] = { next_token, (int32_t)pos, tok_out ? *tok_out : -1 };
+                int rh = ds4_gpu_tensor_read(g_mtp_pool.hidden, 0, h, sizeof(h));
+                int re = ds4_gpu_tensor_read(g_mtp_pool.e_emb, 0, e, sizeof(e));
+                int ren = ds4_gpu_tensor_read(g_mtp_pool.enorm, 0, en, sizeof(en));
+                int rhn = ds4_gpu_tensor_read(g_mtp_pool.hnorm, 0, hn, sizeof(hn));
+                int rep = ds4_gpu_tensor_read(g_mtp_pool.eproj, 0, ep, sizeof(ep));
+                int rhp = ds4_gpu_tensor_read(g_mtp_pool.hproj, 0, hp, sizeof(hp));
+                int rfu = ds4_gpu_tensor_read(g_mtp_pool.fused, 0, fu, sizeof(fu));
+                int raf = g_mtp_pool.after ? ds4_gpu_tensor_read(g_mtp_pool.after, 0, af, sizeof(af)) : 0;
+                int rbo = g_mtp_pool.block_out ? ds4_gpu_tensor_read(g_mtp_pool.block_out, 0, bo, sizeof(bo)) : 0;
+                int rno = ds4_gpu_tensor_read(g_mtp_pool.normed, 0, no, sizeof(no));
+                fwrite(meta, sizeof(meta), 1, df);
+                if (rh) fwrite(h, sizeof(h), 1, df);
+                if (re) fwrite(e, sizeof(e), 1, df);
+                if (ren) fwrite(en, sizeof(en), 1, df);
+                if (rhn) fwrite(hn, sizeof(hn), 1, df);
+                if (rep) fwrite(ep, sizeof(ep), 1, df);
+                if (rhp) fwrite(hp, sizeof(hp), 1, df);
+                if (rfu) fwrite(fu, sizeof(fu), 1, df);
+                if (raf) fwrite(af, sizeof(af), 1, df);
+                if (rbo) fwrite(bo, sizeof(bo), 1, df);
+                if (rno) fwrite(no, sizeof(no), 1, df);
+                if (g_mtp_pool.k_cache && g_mtp_pool.v_cache) {
+                    uint32_t slots = pos + 1u;
+                    if (slots > 16u) slots = 16u;
+                    uint32_t kv_n = slots * 4u * 256u;
+                    float *kc = (float *)malloc((size_t)kv_n * sizeof(float));
+                    float *vc = (float *)malloc((size_t)kv_n * sizeof(float));
+                    if (kc && vc &&
+                        ds4_gpu_tensor_read(g_mtp_pool.k_cache, 0, kc, (uint64_t)kv_n * sizeof(float)) &&
+                        ds4_gpu_tensor_read(g_mtp_pool.v_cache, 0, vc, (uint64_t)kv_n * sizeof(float))) {
+                        fwrite(&slots, sizeof(slots), 1, df);
+                        fwrite(kc, sizeof(float), kv_n, df);
+                        fwrite(vc, sizeof(float), kv_n, df);
+                    }
+                    free(kc); free(vc);
+                }
+                fclose(df);
+                fprintf(stderr, "ds4: mtp dump token=%d pos=%u draft=%d wrote=%d%d%d%d%d%d%d%d%d%d\n",
+                        next_token, pos, tok_out ? *tok_out : -1,
+                        rh, re, ren, rhn, rep, rhp, rfu, raf, rbo, rno);
+            }
+        }
+    }
     pthread_mutex_unlock(&g_mtp_pool.mu);
     return ok;
 }
