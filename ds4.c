@@ -40251,9 +40251,8 @@ static int qwen_generate_hybrid(
 
         int remaining = n_predict - n_generated;
         int offered = remaining;
-        /* Depth 2 measured fastest on M5 Max: accept holds near 2/3 there and
-           collapses by depth 4, where the extra draft costs more than it saves. */
-        const int depth_cap = (fixed_k >= 0) ? 7 : 2;
+        /* Cap 2 until draft-2 EMA is hot; then offer 5 like mlx.fast D5. */
+        const int depth_cap = (fixed_k >= 0) ? 7 : (ema[1] > 0.85 ? 5 : 2);
         if (offered > depth_cap) offered = depth_cap;
         if (offered > ctx_size - pos - 1) offered = ctx_size - pos - 1;
         if (offered < 0) offered = 0;
