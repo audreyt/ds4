@@ -16828,17 +16828,26 @@ static int qwen_hybrid_metal_forward_tokens(
                                                        lw->ffn_norm->abs_offset, n_embd, n_tok, 1e-6f)) {
             ok = 0; fail = "ffn_rms"; fail_il = il;
         }
-        if (ok && !ds4_gpu_matmul_quant_tensor(g_qwen_pool.batch_gate, model->map, model->size,
+        int fused_ffn = 0;
+        if (ok && ((lw->ffn_gate->type == DS4_TENSOR_NVFP4 && lw->ffn_up->type == DS4_TENSOR_NVFP4) ||
+                   (lw->ffn_gate->type == DS4_TENSOR_Q4_K && lw->ffn_up->type == DS4_TENSOR_Q4_K)) &&
+            ds4_gpu_matmul_q4_k_pair_swiglu_rows_tensor(g_qwen_pool.batch_mid, model->map, model->size,
+                                                        lw->ffn_gate->abs_offset, lw->ffn_up->abs_offset,
+                                                        lw->ffn_gate->type, n_embd, ff_dense,
+                                                        g_qwen_pool.batch_ffn_normed, n_tok)) {
+            fused_ffn = 1;
+        }
+        if (ok && !fused_ffn && !ds4_gpu_matmul_quant_tensor(g_qwen_pool.batch_gate, model->map, model->size,
                                                lw->ffn_gate->abs_offset, lw->ffn_gate->type,
                                                n_embd, ff_dense, g_qwen_pool.batch_ffn_normed, n_tok)) {
             ok = 0; fail = "ffn_gate"; fail_il = il;
         }
-        if (ok && !ds4_gpu_matmul_quant_tensor(g_qwen_pool.batch_up, model->map, model->size,
+        if (ok && !fused_ffn && !ds4_gpu_matmul_quant_tensor(g_qwen_pool.batch_up, model->map, model->size,
                                                lw->ffn_up->abs_offset, lw->ffn_up->type,
                                                n_embd, ff_dense, g_qwen_pool.batch_ffn_normed, n_tok)) {
             ok = 0; fail = "ffn_up"; fail_il = il;
         }
-        if (ok && !ds4_gpu_swiglu_tensor(g_qwen_pool.batch_mid, g_qwen_pool.batch_gate, g_qwen_pool.batch_up,
+        if (ok && !fused_ffn && !ds4_gpu_swiglu_tensor(g_qwen_pool.batch_mid, g_qwen_pool.batch_gate, g_qwen_pool.batch_up,
                                          ff_dense * n_tok, 0.0f, 1.0f)) {
             ok = 0; fail = "swiglu"; fail_il = il;
         }

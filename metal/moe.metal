@@ -3576,6 +3576,127 @@ template [[host_name("kernel_mul_mv_nvfp4_dense_f32_n8")]] kernel void kernel_mu
         constant ds4_metal_args_mul_mv &, device const char *, device const char *, device char *,
         constant float &, threadgroup char *, uint3, ushort, ushort);
 
+/* One pass over gate+up NVFP4 weights for NT verify columns. Writes SwiGLU
+   mid only, so a 3/6-token batch does not stream gate and up twice. */
+template<int NT>
+static inline void kernel_mul_mv_nvfp4_f32_pair_swiglu_n_impl(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1,
+        device       char * dst_mid,
+        float gs_a,
+        float gs_b,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    const int first_row = (int)((tgpig.x * (uint)NSG + sgitg) * N_R0_NVFP4);
+    const int nb = args.ne00 / 64;
+    const short ix = tiisg / 8;
+    const short it = tiisg % 8;
+    const int sub = it / 2;
+
+    float suma[N_R0_NVFP4][NT];
+    float sumb[N_R0_NVFP4][NT];
+#pragma clang loop unroll(full)
+    for (int row = 0; row < N_R0_NVFP4; ++row)
+#pragma clang loop unroll(full)
+        for (int c = 0; c < NT; ++c) {
+            suma[row][c] = 0.0f;
+            sumb[row][c] = 0.0f;
+        }
+
+    const uint64_t nb01 = args.nb01;
+    for (int ib = ix; ib < nb; ib += 4) {
+        const uint64_t y_off = (uint64_t)(ib * 64 + it * 8) * sizeof(float);
+        const uint64_t ib_off = (uint64_t)ib * 36u;
+        float4 y0[NT];
+        float4 y1[NT];
+#pragma clang loop unroll(full)
+        for (int c = 0; c < NT; ++c) {
+            device const float4 *y4 = (device const float4 *)
+                (src1 + (uint64_t)c * args.nb11 + y_off);
+            y0[c] = y4[0];
+            y1[c] = y4[1];
+        }
+#pragma clang loop unroll(full)
+        for (int row = 0; row < N_R0_NVFP4; ++row) {
+            const int r = first_row + row;
+            if (r >= args.ne0) continue;
+            device const uchar *bla = (device const uchar *)(src0_a + (uint64_t)r * nb01 + ib_off);
+            device const uchar *blb = (device const uchar *)(src0_b + (uint64_t)r * nb01 + ib_off);
+            device const uchar *qa = bla + it * 4;
+            device const uchar *qb = blb + it * 4;
+            const float sa = ds4_e4m3_u[bla[32 + sub] & 0x7Fu] * gs_a;
+            const float sb = ds4_e4m3_u[blb[32 + sub] & 0x7Fu] * gs_b;
+            const float4 wa0 = float4(ds4_nvfp4_e2m1[qa[0] & 15], ds4_nvfp4_e2m1[qa[0] >> 4],
+                                      ds4_nvfp4_e2m1[qa[1] & 15], ds4_nvfp4_e2m1[qa[1] >> 4]);
+            const float4 wa1 = float4(ds4_nvfp4_e2m1[qa[2] & 15], ds4_nvfp4_e2m1[qa[2] >> 4],
+                                      ds4_nvfp4_e2m1[qa[3] & 15], ds4_nvfp4_e2m1[qa[3] >> 4]);
+            const float4 wb0 = float4(ds4_nvfp4_e2m1[qb[0] & 15], ds4_nvfp4_e2m1[qb[0] >> 4],
+                                      ds4_nvfp4_e2m1[qb[1] & 15], ds4_nvfp4_e2m1[qb[1] >> 4]);
+            const float4 wb1 = float4(ds4_nvfp4_e2m1[qb[2] & 15], ds4_nvfp4_e2m1[qb[2] >> 4],
+                                      ds4_nvfp4_e2m1[qb[3] & 15], ds4_nvfp4_e2m1[qb[3] >> 4]);
+#pragma clang loop unroll(full)
+            for (int c = 0; c < NT; ++c) {
+                suma[row][c] += sa * (dot(y0[c], wa0) + dot(y1[c], wa1));
+                sumb[row][c] += sb * (dot(y0[c], wb0) + dot(y1[c], wb1));
+            }
+        }
+    }
+    device float *mid = (device float *)dst_mid;
+#pragma clang loop unroll(full)
+    for (int row = 0; row < N_R0_NVFP4; ++row) {
+        const int r = first_row + row;
+        if (r >= args.ne0) continue;
+#pragma clang loop unroll(full)
+        for (int c = 0; c < NT; ++c) {
+            const float g = simd_sum(suma[row][c]);
+            const float u = simd_sum(sumb[row][c]);
+            if (tiisg == 0) mid[(uint64_t)c * args.ne0 + r] = (g / (1.0f + exp(-g))) * u;
+        }
+    }
+}
+
+template<int NT>
+kernel void kernel_mul_mv_nvfp4_dense_f32_pair_swiglu_n(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1,
+        device       char * dst_mid,
+        constant float & gs_a,
+        constant float & gs_b,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_nvfp4_f32_pair_swiglu_n_impl<NT>(
+        args, src0_a, src0_b, src1, dst_mid, gs_a, gs_b, tgpig, tiisg, sgitg);
+    (void)shmem;
+}
+
+template [[host_name("kernel_mul_mv_nvfp4_dense_f32_pair_swiglu_n2")]] kernel void kernel_mul_mv_nvfp4_dense_f32_pair_swiglu_n<2>(
+        constant ds4_metal_args_mul_mv &, device const char *, device const char *, device const char *, device char *,
+        constant float &, constant float &, threadgroup char *, uint3, ushort, ushort);
+template [[host_name("kernel_mul_mv_nvfp4_dense_f32_pair_swiglu_n3")]] kernel void kernel_mul_mv_nvfp4_dense_f32_pair_swiglu_n<3>(
+        constant ds4_metal_args_mul_mv &, device const char *, device const char *, device const char *, device char *,
+        constant float &, constant float &, threadgroup char *, uint3, ushort, ushort);
+template [[host_name("kernel_mul_mv_nvfp4_dense_f32_pair_swiglu_n4")]] kernel void kernel_mul_mv_nvfp4_dense_f32_pair_swiglu_n<4>(
+        constant ds4_metal_args_mul_mv &, device const char *, device const char *, device const char *, device char *,
+        constant float &, constant float &, threadgroup char *, uint3, ushort, ushort);
+template [[host_name("kernel_mul_mv_nvfp4_dense_f32_pair_swiglu_n5")]] kernel void kernel_mul_mv_nvfp4_dense_f32_pair_swiglu_n<5>(
+        constant ds4_metal_args_mul_mv &, device const char *, device const char *, device const char *, device char *,
+        constant float &, constant float &, threadgroup char *, uint3, ushort, ushort);
+template [[host_name("kernel_mul_mv_nvfp4_dense_f32_pair_swiglu_n6")]] kernel void kernel_mul_mv_nvfp4_dense_f32_pair_swiglu_n<6>(
+        constant ds4_metal_args_mul_mv &, device const char *, device const char *, device const char *, device char *,
+        constant float &, constant float &, threadgroup char *, uint3, ushort, ushort);
+template [[host_name("kernel_mul_mv_nvfp4_dense_f32_pair_swiglu_n8")]] kernel void kernel_mul_mv_nvfp4_dense_f32_pair_swiglu_n<8>(
+        constant ds4_metal_args_mul_mv &, device const char *, device const char *, device const char *, device char *,
+        constant float &, constant float &, threadgroup char *, uint3, ushort, ushort);
+
+
 kernel void kernel_mul_mv_nvfp4_dense_f32_pair_swiglu(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0_a,

@@ -30089,6 +30089,16 @@ extern "C" int ds4_gpu_matmul_q4_k_pair_swiglu_tensor(
     (void)in_dim; (void)out_dim; (void)x;
     return 0;
 }
+extern "C" int ds4_gpu_matmul_q4_k_pair_swiglu_rows_tensor(
+        ds4_gpu_tensor *mid, const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint32_t weight_type,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    (void)mid; (void)model_map; (void)model_size;
+    (void)gate_offset; (void)up_offset; (void)weight_type;
+    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
+    return 0;
+}
+
 extern "C" int ds4_gpu_matmul_q4k_weight_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *weight, uint64_t weight_offset,
         uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x) {

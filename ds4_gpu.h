@@ -751,6 +751,17 @@ int ds4_gpu_matmul_q4_k_pair_swiglu_tensor(
         uint64_t              in_dim,
         uint64_t              out_dim,
         const ds4_gpu_tensor *x);
+int ds4_gpu_matmul_q4_k_pair_swiglu_rows_tensor(
+        ds4_gpu_tensor       *mid,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint32_t              weight_type,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
 int ds4_gpu_matmul_q4k_weight_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *weight,
