@@ -311,7 +311,7 @@ Or run the server:
   --ctx 32768
 ```
 
-You can optionally configure maximum draft tokens with `--dflash-n-max N` (default 7).
+You can optionally configure maximum draft tokens with `--dflash-n-max N` (default: GGUF `block_size - 1`, capped by the runtime limit).
 
 ## Speed
 

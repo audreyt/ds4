@@ -14364,7 +14364,6 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.dspark_strict = true;
         } else if (!strcmp(arg, "--dflash") || !strcmp(arg, "--dflash2") || !strcmp(arg, "--draft-model") || !strcmp(arg, "-hfd")) {
             c.engine.dflash_path = need_arg(&i, argc, argv, arg);
-            if (c.engine.dflash_draft_n_max == 0) c.engine.dflash_draft_n_max = 7;
         } else if (!strcmp(arg, "--dflash-n-max") || !strcmp(arg, "--spec-draft-n-max")) {
             c.engine.dflash_draft_n_max = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {

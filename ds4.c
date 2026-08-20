@@ -40580,9 +40580,17 @@ static int qwen_generate_dflash2(
         void *emit_ud) {
     const ds4_dflash2_weights *dw = &e->dflash2;
     const ds4_vocab *vocab = &e->vocab;
+    int max_draft = e->dflash_draft_n_max > 0
+        ? e->dflash_draft_n_max
+        : (int)dw->block_size - 1;
+    if (max_draft > (int)dw->block_size - 1) {
+        max_draft = (int)dw->block_size - 1;
+    }
+    if (max_draft > 7) max_draft = 7;
     fprintf(stderr,
-            "ds4: using Qwen DFlash2 speculative (block=%u target_layers=%u draft_n<=%d)\n",
-            dw->block_size, dw->n_target, e->dflash_draft_n_max);
+            "ds4: using Qwen DFlash2 speculative "
+            "(block=%u target_layers=%u draft_n<=%d)\n",
+            dw->block_size, dw->n_target, max_draft);
 
     const double t0 = now_sec();
 
@@ -40610,9 +40618,6 @@ static int qwen_generate_dflash2(
     int pos = prompt->len;
     int n_generated = 0;
     int proposed = 0, accepted_n = 0;
-    int max_draft = e->dflash_draft_n_max > 0 ? e->dflash_draft_n_max : (int)dw->block_size - 1;
-    if (max_draft > (int)dw->block_size - 1) max_draft = (int)dw->block_size - 1;
-    if (max_draft > 7) max_draft = 7;
 
     while (n_generated < n_predict && pos < ctx_size) {
         const int primary = sample_argmax(logits, DS4_N_VOCAB);
