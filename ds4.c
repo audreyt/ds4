@@ -15479,6 +15479,8 @@ static struct {
     int inited;
 } g_qwen_gdn = {0};
 
+static pthread_mutex_t g_qwen_global_mu = PTHREAD_MUTEX_INITIALIZER;
+
 static int qwen_gdn_ensure(void) {
     if (g_qwen_gdn.inited) return 1;
     g_qwen_gdn.state = calloc((size_t)64 * QWEN_GDN_V_HEADS * QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM, sizeof(float));
@@ -40191,6 +40193,7 @@ static int qwen_generate_hybrid(
         ds4_token_emit_fn emit,
         ds4_generation_done_fn done,
         void *emit_ud) {
+    pthread_mutex_lock(&g_qwen_global_mu);
     qwen_mtp_weights_t mtp_w;
     qwen_mtp_bind(&mtp_w, model);
     const int use_mtp = qwen_mtp_is_valid(&mtp_w);
@@ -40404,6 +40407,7 @@ hybrid_done:
     free(hidden_stash);
     free(logits);
     free(hidden);
+    pthread_mutex_unlock(&g_qwen_global_mu);
     return 0;
 }
 
@@ -62486,6 +62490,11 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
 bool ds4_engine_is_glm_dsa(ds4_engine *e) {
     (void)e;
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
+}
+
+bool ds4_engine_is_qwen(ds4_engine *e) {
+    (void)e;
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN;
 }
 
 bool ds4_engine_dflash_ready(const ds4_engine *e) {
