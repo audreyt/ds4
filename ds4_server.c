@@ -12287,12 +12287,14 @@ decode_again:
         int toks[17];
         int ntok = 0;
         bool toks_evaluated = false;
-        if (sampling.temperature <= 0.0f &&
+        if ((!s->batched_mode || ds4_engine_dflash_ready(s->engine)) &&
+            sampling.temperature <= 0.0f &&
             (ds4_engine_mtp_draft_tokens(s->engine) > 1 ||
              ds4_engine_dflash_ready(s->engine)) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
             !dynamic_steering)
         {
+            if (s->batched_mode) pthread_mutex_lock(&s->inference_mu);
             ntok = ds4_session_eval_speculative_argmax(
                 slot->session,
                 token,
@@ -12302,6 +12304,7 @@ decode_again:
                 (int)(sizeof(toks) / sizeof(toks[0])),
                 err,
                 sizeof(err));
+            if (s->batched_mode) pthread_mutex_unlock(&s->inference_mu);
             if (ntok < 0) {
                 finish = "error";
                 break;
