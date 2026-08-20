@@ -40171,6 +40171,17 @@ struct ds4_engine {
      * caller that doesn't set the option observe the prior behavior). */
     int            placement_ctx_hint;
     int            placement_session_count_hint;
+
+    // Qwen per-engine state for concurrency 4 (was g_qwen_* globals)
+    float         *qwen_cpu_kv_k;
+    float         *qwen_cpu_kv_v;
+    uint32_t       qwen_cpu_kv_cap;
+    pthread_mutex_t qwen_cpu_kv_mu;
+    bool           qwen_cpu_kv_inited;
+    float         *qwen_gdn_state;
+    float         *qwen_gdn_conv;
+    bool           qwen_gdn_inited;
+    pthread_mutex_t qwen_gdn_mu;
 };
 
 #include "ds4_dflash2.inc"
@@ -40193,7 +40204,6 @@ static int qwen_generate_hybrid(
         ds4_token_emit_fn emit,
         ds4_generation_done_fn done,
         void *emit_ud) {
-    pthread_mutex_lock(&g_qwen_global_mu);
     qwen_mtp_weights_t mtp_w;
     qwen_mtp_bind(&mtp_w, model);
     const int use_mtp = qwen_mtp_is_valid(&mtp_w);
@@ -40407,7 +40417,6 @@ hybrid_done:
     free(hidden_stash);
     free(logits);
     free(hidden);
-    pthread_mutex_unlock(&g_qwen_global_mu);
     return 0;
 }
 

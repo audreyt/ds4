@@ -12287,7 +12287,7 @@ decode_again:
         int toks[17];
         int ntok = 0;
         bool toks_evaluated = false;
-        if (!s->batched_mode && sampling.temperature <= 0.0f &&
+        if (sampling.temperature <= 0.0f &&
             (ds4_engine_mtp_draft_tokens(s->engine) > 1 ||
              ds4_engine_dflash_ready(s->engine)) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
