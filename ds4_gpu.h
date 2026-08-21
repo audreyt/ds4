@@ -3003,7 +3003,8 @@ int ds4_gpu_mul_rowwise_scalar_f32_tensor(
         ds4_gpu_tensor       *dst,
         const ds4_gpu_tensor *src,
         const ds4_gpu_tensor *scalar,
-        uint32_t              n);
+        uint32_t              width,
+        uint32_t              rows);
 
 int ds4_gpu_sigmoid_f32_tensor(
         ds4_gpu_tensor       *dst,

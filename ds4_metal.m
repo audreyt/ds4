@@ -20018,7 +20018,7 @@ int ds4_gpu_qwen_gdn_core_rows_tensor(
     @autoreleasepool {
         id<MTLComputePipelineState> conv_p = ds4_gpu_get_pipeline("kernel_qwen_gdn_conv");
         const int use_mlx = (v_heads == 48u && g_qwen_shape_n_layer == 64u);
-        const int use_rows4 = (v_heads == 32u && g_qwen_shape_n_layer == 32u);
+        const int use_rows4 = (v_heads == 32u && (g_qwen_shape_n_layer == 32u || g_qwen_shape_n_layer == 40u));
         id<MTLComputePipelineState> core_p = ds4_gpu_get_pipeline(
             use_mlx ? "kernel_qwen_gdn_core_mlx" :
             use_rows4 ? "kernel_qwen_gdn_core_rows4" : "kernel_qwen_gdn_core");
@@ -22527,25 +22527,26 @@ int ds4_gpu_mul_rowwise_scalar_f32_tensor(
         ds4_gpu_tensor       *dst,
         const ds4_gpu_tensor *src,
         const ds4_gpu_tensor *scalar,
-        uint32_t              n) {
+        uint32_t              width,
+        uint32_t              rows) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!dst || !src || !scalar || n == 0 || !g_bin_mul_scalar_pipeline) return 0;
+    if (!dst || !src || !scalar || width == 0 || rows == 0 || !g_bin_mul_scalar_pipeline) return 0;
     @autoreleasepool {
         id<MTLBuffer> sbuf = ds4_gpu_tensor_buffer(src);
         id<MTLBuffer> scbuf = ds4_gpu_tensor_buffer(scalar);
         id<MTLBuffer> dbuf = ds4_gpu_tensor_buffer(dst);
-        const uint64_t bytes = (uint64_t)n * sizeof(float);
+        const uint64_t bytes = (uint64_t)width * rows * sizeof(float);
         if (!sbuf || !scbuf || !dbuf ||
             ds4_gpu_tensor_bytes(src) < bytes ||
             ds4_gpu_tensor_bytes(dst) < bytes ||
-            ds4_gpu_tensor_bytes(scalar) < sizeof(float)) {
+            ds4_gpu_tensor_bytes(scalar) < (uint64_t)rows * sizeof(float)) {
             fprintf(stderr, "ds4: Metal mul_rowwise_scalar received undersized buffer\n");
             return 0;
         }
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
-        ds4_gpu_bin_args args = ds4_gpu_make_bin_rowwise_scalar_args(n, 1);
+        ds4_gpu_bin_args args = ds4_gpu_make_bin_rowwise_scalar_args(width, rows);
         if (!ds4_gpu_encode_bin_f32_rows(cb, g_bin_mul_scalar_pipeline, &args,
                                          sbuf, ds4_gpu_tensor_offset(src),
                                          scbuf, ds4_gpu_tensor_offset(scalar),
@@ -31630,11 +31631,11 @@ static ds4_gpu_mul_mm_id_args ds4_gpu_make_mul_mm_id_args_src1_size(
         .r3 = 1,
     };
 }
-
 static uint32_t ds4_gpu_routed_mv_nr0(uint32_t type) {
     switch (type) {
     case DS4_METAL_TENSOR_Q8_0:    return 2;
     case DS4_METAL_TENSOR_Q8_K:    return 2;
+    case DS4_METAL_TENSOR_Q6_K:    return 2;
     case DS4_METAL_TENSOR_Q4_K:    return 2;
     case DS4_METAL_TENSOR_MXFP4:   return 2;
     case DS4_METAL_TENSOR_Q2_K:
@@ -38680,7 +38681,6 @@ static bool ds4_gpu_glm_routed_moe_batch_grouped_available(
     if (!fast_default) {
         return false;
     }
-    if (n_tokens < 96u) return false;
 
     return ds4_gpu_get_pipeline(ds4_gpu_mul_mm_id_map0_name(n_expert)) != nil &&
            ds4_gpu_routed_mm_pipeline(gate_type) != nil &&
@@ -40287,12 +40287,8 @@ int ds4_gpu_routed_moe_one_tensor(
         id<MTLComputePipelineState> gate_mv_pipeline = ds4_gpu_routed_mv_pipeline(gate_type);
         id<MTLComputePipelineState> down_mv_pipeline = ds4_gpu_routed_mv_pipeline(down_type);
         if (gate_nr0 == 0 || down_nr0 == 0 || !gate_mv_pipeline || !down_mv_pipeline) {
-            fprintf(stderr, "ds4: unsupported Metal routed MoE quant types gate=%u down=%u\n",
-                    gate_type, down_type);
-            if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 32158);
             return 0;
         }
-
         ds4_gpu_mul_mv_id_args gate_args =
             ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
                                           gate_row_bytes, gate_expert_bytes,
@@ -42829,9 +42825,9 @@ int ds4_gpu_routed_moe_batch_tensor(
         g_moe_mul_mv_addr_q4_k_sum6_pipeline != nil;
     const bool use_single_token_q4_one_tensor =
         gate_type == DS4_METAL_TENSOR_Q4_K &&
-        down_type == DS4_METAL_TENSOR_Q4_K &&
+        (down_type == DS4_METAL_TENSOR_Q4_K || down_type == DS4_METAL_TENSOR_Q6_K) &&
         n_tokens == 1 &&
-        n_expert == 6 &&
+        (n_expert == 6 || n_expert == 8) &&
         n_total_expert >= 128 &&
         (g_ssd_streaming_mode ||
          (gate_tensor_bytes >= q4_selected_min_tensor_bytes &&
@@ -42851,7 +42847,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         gate_type == DS4_METAL_TENSOR_MXFP4 &&
         down_type == DS4_METAL_TENSOR_MXFP4 &&
         n_tokens == 1 &&
-        n_expert == 6 &&
+        (n_expert == 6 || n_expert == 8) &&
         n_total_expert >= 128 &&
         !g_quality_mode &&
         getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
@@ -42944,17 +42940,12 @@ int ds4_gpu_routed_moe_batch_tensor(
 
         const uint32_t gate_nr0 = ds4_gpu_routed_mv_nr0(gate_type);
         const uint32_t down_nr0 = ds4_gpu_routed_mv_nr0(down_type);
-        id<MTLComputePipelineState> gate_mv_pipeline = ds4_gpu_routed_mv_pipeline(gate_type);
-        id<MTLComputePipelineState> down_mv_pipeline = ds4_gpu_routed_mv_pipeline(down_type);
+        id<MTLComputePipelineState> gate_mv_pipeline = nil;
+        id<MTLComputePipelineState> down_mv_pipeline = nil;
         id<MTLComputePipelineState> gate_mm_pipeline = nil;
         id<MTLComputePipelineState> up_mm_pipeline = nil;
         id<MTLComputePipelineState> down_mm_pipeline = nil;
         id<MTLComputePipelineState> pair_swiglu_mm_pipeline = nil;
-        if (gate_nr0 == 0 || down_nr0 == 0 || !gate_mv_pipeline || !down_mv_pipeline) {
-            fprintf(stderr, "ds4: unsupported Metal routed batch MoE quant types gate=%u down=%u\n",
-                    gate_type, down_type);
-            return 0;
-        }
         const bool use_iq2_batch_selected_addr =
             ds4_gpu_stream_prefill_batch_selected_addr_enabled(n_tokens,
                                                                n_total_expert,
@@ -43024,6 +43015,15 @@ int ds4_gpu_routed_moe_batch_tensor(
             !use_iq2_batch_selected_addr &&
             n_tokens >= 32u &&
             ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
+        if (!use_mm_id && !use_q4_batch_expert_table && !use_iq2_batch_selected_addr) {
+            gate_mv_pipeline = ds4_gpu_routed_mv_pipeline(gate_type);
+            down_mv_pipeline = ds4_gpu_routed_mv_pipeline(down_type);
+            if (gate_nr0 == 0 || down_nr0 == 0 || !gate_mv_pipeline || !down_mv_pipeline) {
+                fprintf(stderr, "ds4: unsupported Metal routed batch MoE quant types gate=%u down=%u\n",
+                        gate_type, down_type);
+                return 0;
+            }
+        }
         /*
          * MTP verification is neither normal decode nor large prefill: the
          * target model must verify a tiny suffix (up to DSpark's 5-token
@@ -43076,7 +43076,6 @@ int ds4_gpu_routed_moe_batch_tensor(
         /*
          * Fused gate+up grouped matmul with the SwiGLU epilogue. Both IQ2 and
          * Q4_K use the compact expert work list, the same MMA accumulation
-         * order, and the same epilogue math as separate GEMMs + SwiGLU, so the
          * mid tensor is bit-identical.
          */
         const bool use_mm_id_pair_swiglu =
@@ -43085,11 +43084,11 @@ int ds4_gpu_routed_moe_batch_tensor(
               (ds4_gpu_routed_mm_mpp_mask() & 3) == 3) &&
             g_tp_split_world != 2 &&    /* pair-swiglu mm kernel lacks expert ownership */
             request_mid_f16 &&
-            n_expert == 6 &&
+            (n_expert == 6 || n_expert == 8) &&
             ((gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
               down_type == DS4_METAL_TENSOR_Q2_K) ||
              (gate_type == DS4_METAL_TENSOR_Q4_K &&
-              down_type == DS4_METAL_TENSOR_Q4_K) ||
+              (down_type == DS4_METAL_TENSOR_Q4_K || down_type == DS4_METAL_TENSOR_Q6_K)) ||
              (gate_type == DS4_METAL_TENSOR_MXFP4 &&
               down_type == DS4_METAL_TENSOR_MXFP4)) &&
             getenv("DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU") == NULL &&

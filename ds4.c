@@ -16449,7 +16449,8 @@ static struct {
     ds4_gpu_tensor *gdn_conv_step[8], *gdn_state_step[8];
     ds4_gpu_tensor *layer_stash;
     ds4_gpu_tensor *gdn_conv_steps, *gdn_state_steps;
-
+    ds4_gpu_tensor *batch_moe_logits, *batch_moe_probs, *batch_moe_selected, *batch_moe_weights, *batch_moe_routed, *batch_moe_shared;
+    ds4_gpu_tensor *batch_moe_gate, *batch_moe_up, *batch_moe_mid, *batch_moe_down;
 
 
     uint32_t batch_cap;
@@ -16482,6 +16483,10 @@ static void qwen_metal_pool_free_all(void) {
         &g_qwen_pool.batch_tokens, &g_qwen_pool.batch_argmax, &g_qwen_pool.batch_gdn_core,
         &g_qwen_pool.gdn_conv_snap, &g_qwen_pool.gdn_state_snap,
         &g_qwen_pool.layer_stash, &g_qwen_pool.gdn_conv_steps, &g_qwen_pool.gdn_state_steps,
+        &g_qwen_pool.batch_moe_logits, &g_qwen_pool.batch_moe_probs, &g_qwen_pool.batch_moe_selected,
+        &g_qwen_pool.batch_moe_weights, &g_qwen_pool.batch_moe_routed, &g_qwen_pool.batch_moe_shared,
+        &g_qwen_pool.batch_moe_gate, &g_qwen_pool.batch_moe_up, &g_qwen_pool.batch_moe_mid,
+        &g_qwen_pool.batch_moe_down,
     };
     for (size_t i = 0; i < sizeof(tensors) / sizeof(tensors[0]); i++) {
         if (*tensors[i]) ds4_gpu_tensor_free(*tensors[i]);
@@ -16543,7 +16548,7 @@ static int qwen_metal_ensure_pool(void) {
     if (g_qwen_pool.gdn_state) ds4_gpu_tensor_fill_f32(g_qwen_pool.gdn_state, 0.0f, (uint64_t)n_layer * QWEN_GDN_V_HEADS * QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM);
 
     const uint32_t spec_cap = 8;
-    uint32_t batch_cap = (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) ? 256u : 1024u;
+    uint32_t batch_cap = 1024u; // Qwen MoE batched memory bounds
     {
         const char *seq = getenv("DS4_QWEN_PREFILL_SEQ");
         if (seq && seq[0] && seq[0] != '0') batch_cap = 1;
@@ -16583,14 +16588,29 @@ static int qwen_metal_ensure_pool(void) {
     g_qwen_pool.layer_stash = ds4_gpu_tensor_alloc(8ull * 8ull * (uint64_t)n_embd * sizeof(float));
     g_qwen_pool.gdn_conv_steps = NULL;
     g_qwen_pool.gdn_state_steps = NULL;
+    if (DS4_N_EXPERT) {
+        g_qwen_pool.batch_moe_logits = ds4_gpu_tensor_alloc((uint64_t)batch_cap * DS4_N_EXPERT * sizeof(float));
+        g_qwen_pool.batch_moe_probs = ds4_gpu_tensor_alloc((uint64_t)batch_cap * DS4_N_EXPERT * sizeof(float));
+        g_qwen_pool.batch_moe_selected = ds4_gpu_tensor_alloc((uint64_t)batch_cap * DS4_N_EXPERT_USED * sizeof(int32_t));
+        g_qwen_pool.batch_moe_weights = ds4_gpu_tensor_alloc((uint64_t)batch_cap * DS4_N_EXPERT_USED * sizeof(float));
+        g_qwen_pool.batch_moe_routed = ds4_gpu_tensor_alloc((uint64_t)batch_cap * n_embd * sizeof(float));
+        g_qwen_pool.batch_moe_shared = ds4_gpu_tensor_alloc((uint64_t)batch_cap * n_embd * sizeof(float));
+        g_qwen_pool.batch_moe_gate = ds4_gpu_tensor_alloc((uint64_t)batch_cap * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
+        g_qwen_pool.batch_moe_up = ds4_gpu_tensor_alloc((uint64_t)batch_cap * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
+        g_qwen_pool.batch_moe_mid = ds4_gpu_tensor_alloc((uint64_t)batch_cap * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
+        g_qwen_pool.batch_moe_down = ds4_gpu_tensor_alloc((uint64_t)batch_cap * DS4_N_EXPERT_USED * n_embd * sizeof(float));
+    }
     ds4_gpu_qwen_set_gdn_steps(NULL, NULL);
     ds4_gpu_qwen_set_gdn_snapshot(0);
 
 
     int moe_ok = !DS4_N_EXPERT || (g_qwen_pool.moe_logits && g_qwen_pool.moe_probs &&
         g_qwen_pool.moe_selected && g_qwen_pool.moe_weights && g_qwen_pool.moe_routed &&
-        g_qwen_pool.moe_shared && g_qwen_pool.moe_experts);
-    int ok = moe_ok && g_qwen_pool.cur && g_qwen_pool.next && g_qwen_pool.normed && g_qwen_pool.q && g_qwen_pool.k && g_qwen_pool.v && g_qwen_pool.heads && g_qwen_pool.attn_out && g_qwen_pool.after_attn && g_qwen_pool.ffn_normed && g_qwen_pool.gate && g_qwen_pool.up && g_qwen_pool.mid && g_qwen_pool.ffn_out && g_qwen_pool.logits_gpu && g_qwen_pool.norm && g_qwen_pool.argmax_gpu && g_qwen_pool.gdn_alpha && g_qwen_pool.gdn_beta && g_qwen_pool.gdn_core && g_qwen_pool.k_cache && g_qwen_pool.v_cache && g_qwen_pool.gdn_conv && g_qwen_pool.gdn_state && g_qwen_pool.batch_cur && g_qwen_pool.batch_next && g_qwen_pool.batch_normed && g_qwen_pool.batch_q && g_qwen_pool.batch_k && g_qwen_pool.batch_v && g_qwen_pool.batch_heads && g_qwen_pool.batch_attn_out && g_qwen_pool.batch_after_attn && g_qwen_pool.batch_ffn_normed && g_qwen_pool.batch_gate && g_qwen_pool.batch_up && g_qwen_pool.batch_mid && g_qwen_pool.batch_ffn_out && g_qwen_pool.batch_logits && g_qwen_pool.batch_norm && g_qwen_pool.batch_tokens && g_qwen_pool.batch_argmax && g_qwen_pool.batch_gdn_core && g_qwen_pool.gdn_conv_snap && g_qwen_pool.gdn_state_snap && g_qwen_pool.layer_stash;
+        g_qwen_pool.moe_shared && g_qwen_pool.moe_experts && g_qwen_pool.batch_moe_logits &&
+        g_qwen_pool.batch_moe_probs && g_qwen_pool.batch_moe_selected && g_qwen_pool.batch_moe_weights &&
+        g_qwen_pool.batch_moe_routed && g_qwen_pool.batch_moe_shared && g_qwen_pool.batch_moe_gate &&
+        g_qwen_pool.batch_moe_up && g_qwen_pool.batch_moe_mid && g_qwen_pool.batch_moe_down);
+int ok = moe_ok && g_qwen_pool.cur && g_qwen_pool.next && g_qwen_pool.normed && g_qwen_pool.q && g_qwen_pool.k && g_qwen_pool.v && g_qwen_pool.heads && g_qwen_pool.attn_out && g_qwen_pool.after_attn && g_qwen_pool.ffn_normed && g_qwen_pool.gate && g_qwen_pool.up && g_qwen_pool.mid && g_qwen_pool.ffn_out && g_qwen_pool.logits_gpu && g_qwen_pool.norm && g_qwen_pool.argmax_gpu && g_qwen_pool.gdn_alpha && g_qwen_pool.gdn_beta && g_qwen_pool.gdn_core && g_qwen_pool.k_cache && g_qwen_pool.v_cache && g_qwen_pool.gdn_conv && g_qwen_pool.gdn_state && g_qwen_pool.batch_cur && g_qwen_pool.batch_next && g_qwen_pool.batch_normed && g_qwen_pool.batch_q && g_qwen_pool.batch_k && g_qwen_pool.batch_v && g_qwen_pool.batch_heads && g_qwen_pool.batch_attn_out && g_qwen_pool.batch_after_attn && g_qwen_pool.batch_ffn_normed && g_qwen_pool.batch_gate && g_qwen_pool.batch_up && g_qwen_pool.batch_mid && g_qwen_pool.batch_ffn_out && g_qwen_pool.batch_logits && g_qwen_pool.batch_norm && g_qwen_pool.batch_tokens && g_qwen_pool.batch_argmax && g_qwen_pool.batch_gdn_core && g_qwen_pool.gdn_conv_snap && g_qwen_pool.gdn_state_snap && g_qwen_pool.layer_stash;
 
     if (!ok) {
         qwen_metal_pool_free_all();
@@ -16935,7 +16955,7 @@ static int qwen_gpu_moe_ffn(
     if (lw->ffn_gate_inp_shexp) {
         if (!qwen_gpu_matmul(g_qwen_pool.moe_logits, model, lw->ffn_gate_inp_shexp, n_embd, 1, ffn_normed, 1)) return 0;
         if (!ds4_gpu_sigmoid_f32_tensor(g_qwen_pool.moe_logits, g_qwen_pool.moe_logits, 1)) return 0;
-        if (!ds4_gpu_mul_rowwise_scalar_f32_tensor(gate, g_qwen_pool.moe_shared, g_qwen_pool.moe_logits, n_embd)) return 0;
+        if (!ds4_gpu_mul_rowwise_scalar_f32_tensor(gate, g_qwen_pool.moe_shared, g_qwen_pool.moe_logits, n_embd, 1)) return 0;
         return ds4_gpu_add_tensor(ffn_out, g_qwen_pool.moe_routed, gate, n_embd);
     }
     return ds4_gpu_add_tensor(ffn_out, g_qwen_pool.moe_routed, g_qwen_pool.moe_shared, n_embd);
@@ -17363,11 +17383,10 @@ static int qwen_hybrid_metal_forward_tokens(
     const uint32_t head_dim = DS4_N_HEAD_DIM;
     const uint32_t ff_dense = DS4_N_FF_DENSE ? DS4_N_FF_DENSE : qwen_ff_scratch_dim();
     const uint32_t n_vocab = DS4_N_VOCAB;
-    if (n_tok == 0) return 1;
     if (n_tok == 1) {
         int one = 0;
         int ok1 = qwen_hybrid_metal_forward_token_ex(qs, logits_out, argmax_out ? &one : NULL, hidden_out, layer_out,
-                                                 layer_ids, n_ids, model, weights, tokens[0], pos0);
+                                                     NULL, 0, model, weights, tokens[0], pos0);
         if (ok1 && argmax_out) argmax_out[0] = one;
         return ok1;
     }
@@ -17634,22 +17653,87 @@ static int qwen_hybrid_metal_forward_tokens(
                                                            lw->ffn_norm->abs_offset, n_embd, n_tok, 1e-6f)) {
                 ok = 0;
             }
-            for (uint32_t t = 0; ok && t < n_tok; t++) {
-                ds4_gpu_tensor *row_x = ds4_gpu_tensor_view(g_qwen_pool.batch_ffn_normed,
-                    (uint64_t)t * n_embd * sizeof(float), (uint64_t)n_embd * sizeof(float));
-                ds4_gpu_tensor *row_y = ds4_gpu_tensor_view(g_qwen_pool.batch_ffn_out,
-                    (uint64_t)t * n_embd * sizeof(float), (uint64_t)n_embd * sizeof(float));
-                if (!row_x || !row_y ||
-                    !qwen_gpu_moe_ffn(row_y, row_x, g_qwen_pool.gate, g_qwen_pool.up, g_qwen_pool.mid,
-                                      model, lw, il)) {
+            // 2. Batch Router logits
+            if (ok && !qwen_gpu_matmul(g_qwen_pool.batch_moe_logits, model, lw->ffn_gate_inp,
+                                       n_embd, DS4_N_EXPERT, g_qwen_pool.batch_ffn_normed, n_tok)) { ok = 0; }
+
+            // 3. Batch Router select
+            if (ok) {
+                int routed = 0;
+                if (lw->ffn_exp_probs_b) {
+                    routed = ds4_gpu_glm_router_select_batch_tensor(g_qwen_pool.batch_moe_selected, g_qwen_pool.batch_moe_weights,
+                                                                    g_qwen_pool.batch_moe_probs, model->map, model->size,
+                                                                    lw->ffn_exp_probs_b->abs_offset,
+                                                                    g_qwen_pool.batch_moe_logits,
+                                                                    DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, n_tok);
+                } else {
+                    routed = ds4_gpu_router_select_batch_tensor(g_qwen_pool.batch_moe_selected, g_qwen_pool.batch_moe_weights,
+                                                                g_qwen_pool.batch_moe_probs, model->map, model->size, 0, 0, 0, 0, 0, false, false,
+                                                                g_qwen_pool.batch_moe_logits, g_qwen_pool.batch_tokens,
+                                                                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, n_tok);
+                }
+                if (!routed) ok = 0;
+            }
+
+            // 4. Batch Routed MoE (gate, up, down)
+            if (ok) {
+                uint64_t gin = 0, gout = 0, grow = 0, din = 0, dout = 0, drow = 0;
+                tensor_expert_bytes(model, lw->ffn_gate_exps, 0, &gin, &gout, &grow);
+                tensor_expert_bytes(model, lw->ffn_down_exps, 0, &din, &dout, &drow);
+                
+                if (!ds4_gpu_routed_moe_batch_tensor(g_qwen_pool.batch_moe_routed, // out
+                                                           g_qwen_pool.batch_moe_gate, // gate
+                                                           g_qwen_pool.batch_moe_up, // up
+                                                           g_qwen_pool.batch_moe_mid, // mid
+                                                           g_qwen_pool.batch_moe_down, // experts (down)
+                                                           model->map, model->size,
+                                                           lw->ffn_gate_exps->abs_offset,
+                                                           lw->ffn_up_exps->abs_offset,
+                                                           lw->ffn_down_exps->abs_offset,
+                                                           lw->ffn_gate_exps->type,
+                                                           lw->ffn_down_exps->type,
+                                                           gout * grow, grow,
+                                                           dout * drow, drow,
+                                                           n_embd, DS4_N_FF_EXP, n_embd,
+                                                           g_qwen_pool.batch_moe_selected,
+                                                           g_qwen_pool.batch_moe_weights,
+                                                           DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                                                           DS4_SWIGLU_CLAMP_EXP,
+                                                           g_qwen_pool.batch_ffn_normed, // x
+                                                           il, n_tok, NULL, false)) {
                     ok = 0;
                 }
-                ds4_gpu_tensor_free(row_x);
-                ds4_gpu_tensor_free(row_y);
+            }
+
+            // 5. Shared Expert
+            if (ok) {
+                const uint32_t shexp_dim = (lw->ffn_gate_shexp && n_embd) ? (uint32_t)(lw->ffn_gate_shexp->elements / n_embd) : DS4_N_FF_EXP;
+                // We can reuse batch_gate, batch_up, batch_mid for the shared expert since their dim is ff_dense, which is >= shexp_dim
+                if (!qwen_gpu_matmul(g_qwen_pool.batch_gate, model, lw->ffn_gate_shexp,
+                                     n_embd, shexp_dim, g_qwen_pool.batch_ffn_normed, n_tok)) ok = 0;
+                if (ok && !qwen_gpu_matmul(g_qwen_pool.batch_up, model, lw->ffn_up_shexp,
+                                           n_embd, shexp_dim, g_qwen_pool.batch_ffn_normed, n_tok)) ok = 0;
+                if (ok && !ds4_gpu_swiglu_tensor(g_qwen_pool.batch_mid, g_qwen_pool.batch_gate, g_qwen_pool.batch_up,
+                                                 shexp_dim * n_tok, 0.0f, 1.0f)) ok = 0;
+                if (ok && !qwen_gpu_matmul(g_qwen_pool.batch_moe_shared, model, lw->ffn_down_shexp,
+                                           shexp_dim, n_embd, g_qwen_pool.batch_mid, n_tok)) ok = 0;
+            }
+            // 6. Sigmoid Gate (if available) and Combine
+            if (ok && lw->ffn_gate_inp_shexp) {
+                // Reuse batch_moe_logits since it's large enough (n_tok * DS4_N_EXPERT >= n_tok * 1)
+                if (!qwen_gpu_matmul(g_qwen_pool.batch_moe_logits, model, lw->ffn_gate_inp_shexp,
+                                     n_embd, 1, g_qwen_pool.batch_ffn_normed, n_tok)) ok = 0;
+                if (ok && !ds4_gpu_sigmoid_f32_tensor(g_qwen_pool.batch_moe_logits, g_qwen_pool.batch_moe_logits, n_tok)) ok = 0;
+                // Reuse batch_gate for the multiplied shared expert
+                if (ok && !ds4_gpu_mul_rowwise_scalar_f32_tensor(g_qwen_pool.batch_gate,
+                                                                 g_qwen_pool.batch_moe_shared, g_qwen_pool.batch_moe_logits, n_embd, n_tok)) ok = 0;
+                if (ok && !ds4_gpu_add_tensor(g_qwen_pool.batch_ffn_out, g_qwen_pool.batch_moe_routed, g_qwen_pool.batch_gate, n_embd * n_tok)) ok = 0;
+            } else if (ok) {
+                if (!ds4_gpu_add_tensor(g_qwen_pool.batch_ffn_out, g_qwen_pool.batch_moe_routed, g_qwen_pool.batch_moe_shared, n_embd * n_tok)) ok = 0;
             }
             if (!ok) break;
             if (!ds4_gpu_add_tensor(next, g_qwen_pool.batch_after_attn, g_qwen_pool.batch_ffn_out,
-                                    n_embd * n_tok)) { ok = 0; }
+                                    n_embd * n_tok)) ok = 0;
             ds4_gpu_tensor *tmpb = cur; cur = next; next = tmpb;
             continue;
         }
@@ -17728,7 +17812,6 @@ static int qwen_hybrid_metal_forward_tokens(
             if (!last_ok) ok = 0;
             ds4_gpu_tensor_free(row_cur);
         } else if (n_tok > (g_qwen_pool.spec_cap ? g_qwen_pool.spec_cap : 8u)) {
-            ok = 0;
         } else {
             if (!ds4_gpu_rms_norm_weight_rows_tensor(g_qwen_pool.batch_norm, cur, model->map, model->size,
                                                      weights->output_norm->abs_offset, n_embd, n_tok, 1e-6f)) ok = 0;
@@ -17816,6 +17899,7 @@ static int qwen_metal_prefill_span(
             if (cancel && cancel(cancel_ud)) return -1;
             uint32_t n = (uint32_t)(n_tokens - i);
             if (n > batch) n = batch;
+            if (n < 32u) break;
             const int last = (i + (int)n == n_tokens);
             float *chunk_logits = last ? logits : NULL;
             float *hid = hidden_rows ? hidden_rows + (size_t)i * DS4_N_EMBD : NULL;
