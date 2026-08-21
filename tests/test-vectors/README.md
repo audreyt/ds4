@@ -82,7 +82,7 @@ layer-batched decode reuses expert-cache buffers before the command buffer has
 completed:
 
 ```sh
-DS4_TEST_MODEL=gguf/DeepSeek-V4-Flash-0731-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+DS4_TEST_MODEL=gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
   ./ds4_test --metal-ssd-streaming-cache-pressure
 ```
 

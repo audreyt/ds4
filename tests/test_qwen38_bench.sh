@@ -9,10 +9,10 @@ LOG="/tmp/qwen38_test_$$.log"
 fail(){ echo "FAIL: $*" >&2; exit 1; }
 ok(){ echo "ok: $*"; }
 # 1. Verify quants.h DS4Q_TYPE_Q4_64A=36 COUNT 43 no collision
-python3 << 'PY'
+python3 - "$ROOT/gguf-tools/quants.h" << 'PY'
 import re
-with open("gguf-tools/quants.h") as f: txt=f.read()
-import re
+import sys
+with open(sys.argv[1]) as f: txt=f.read()
 m=re.search(r'DS4Q_TYPE_Q4_64A\s*=\s*(\d+)',txt)
 n=re.search(r'DS4Q_TYPE_COUNT\s*=\s*(\d+)',txt)
 assert m and n, "missing Q4_64A or COUNT"

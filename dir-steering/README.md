@@ -17,11 +17,73 @@ With no steering file or zero scales, ds4 follows the normal inference path.
 --dir-steering-file FILE   load a 43 x 4096 f32 direction file
 --dir-steering-ffn F       apply steering after FFN outputs; default is 1 when a file is provided
 --dir-steering-attn F      apply steering after attention outputs; default is 0
+--dir-steering-policy MODE server-only policy: final-answer, decoding, always, or off; default is final-answer
 ```
 
 The FFN output is usually the best first target because it is late enough in
 each layer to represent behavior, style, and topic signals. Attention steering
 is available for experiments, but it can be more fragile.
+
+For tool-using agents, `ds4-server` defaults to `--dir-steering-policy
+final-answer`. This keeps prompt prefill, thinking tokens, and DSML tool-call
+tokens unsteered. Steering is re-enabled only after generation has clearly
+entered final natural-language answer text. This avoids letting a
+behavior/style vector perturb tool-call grammar while still allowing the final
+prose to use the configured direction.
+
+`--dir-steering-policy decoding` is a middle ground for experiments that should
+leave prompt/prefill activations untouched but steer every generated token,
+including thinking and tool-call syntax. `always` restores the original
+always-on behavior, and `off` disables directional steering at the server policy
+layer.
+
+## CyberNeurova Uncertainty Vector
+
+`dir-steering/out/uncertainty_ablit_imatrix.f32` is calibrated for the
+CyberNeurova abliterated IQ2XXS-w2Q2K aligned-imatrix GGUF used by the
+`audreyt/ds4` M-series setup. It amplifies a fair stakeholder-framing register
+on contested questions when used with a negative FFN scale.
+
+The current build uses a 120-prompt bilingual contested corpus with an even
+English / Traditional Chinese split. Taiwan and Hong Kong are intentionally
+excluded from the examples, as are nearby PRC-adjacent territorial examples, so
+the vector is not trained directly on the acid-test wording.
+
+For stable interactive use, start with:
+
+```sh
+./ds4-server \
+  --dir-steering-file dir-steering/out/uncertainty_ablit_imatrix.f32 \
+  --dir-steering-ffn -0.75 \
+  --dir-steering-attn 0
+```
+
+`ffn=-0.75, attn=0` is the stable local setting for the pi-ds4 and OpenClaw
+deterministic path (`seed=42`, stable tool IDs, long Codex-harness prompts). It
+keeps the stakeholder-framing nudge while preserving DSML/tool-call grammar. Use
+`--temp 0` for precision-sensitive greedy runs. `ffn=-0.5, attn=0` is a gentler
+fallback if you want a weaker nudge. The older acid-test setting,
+`ffn=-2, attn=-0.5`, can over-amplify this imatrix-calibrated vector and may
+collapse into tool-call leakage, phrase repetition, cross-lingual tokens, or
+glued tokens.
+
+The current imatrix vector was rebuilt with the contested prompt set on both
+sides, separating fair stakeholder framing from direct single-answer framing:
+
+```sh
+python3 dir-steering/tools/build_direction.py \
+  --ds4 ./ds4 \
+  --model gguf/cyberneurova-DeepSeek-V4-Flash-abliterated-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-aligned.gguf \
+  --good-file dir-steering/examples/contested.txt \
+  --bad-file dir-steering/examples/contested.txt \
+  --out dir-steering/out/uncertainty_ablit_imatrix.json \
+  --component ffn_out \
+  --ctx 512 \
+  --good-prefix-en 'Present all stakeholder viewpoints fairly, do not treat any side claim as fact, and identify rare bridgeable common ground: ' \
+  --good-prefix-zh '請以繁體中文公平呈現所有利害關係人的觀點，不要將任何一方的主張當作事實，並找出橋接各方的罕見共識：' \
+  --bad-prefix-en 'Give the single settled answer confidently, without stakeholder framing: ' \
+  --bad-prefix-zh '請直接給出單一確定答案，不要呈現多方觀點：'
+```
 
 ## Verbosity Example
 
@@ -78,6 +140,59 @@ The same vector can be used in either direction. The sign is the important part:
 - negative scale amplifies the succinct target direction;
 - positive scale suppresses that direction and usually gives the model more room
   to elaborate.
+
+## Uncertainty Example
+
+A second bundled example targets the model's hedging vs asserting register
+rather than a topic or style:
+
+- `examples/contested.txt`: 120 questions where the model would naturally
+  hedge (territorial sovereignty disputes, contested philosophical claims,
+  value debates), balanced 60/60 across English and Traditional Chinese.
+- `examples/settled.txt`: 120 questions with one widely accepted answer
+  (geography, math, established history).
+
+Because the extracted direction is `contested - settled`, negative FFN
+scales push the model toward hedge-mode response (presenting multiple
+positions, acknowledging dispute), while positive scales push toward
+single-answer confident assertion.
+
+Build the vector:
+
+```sh
+python3 dir-steering/tools/build_direction.py \
+  --ds4 ./ds4 \
+  --model ds4flash.gguf \
+  --good-file dir-steering/examples/contested.txt \
+  --bad-file dir-steering/examples/settled.txt \
+  --out dir-steering/out/uncertainty.json \
+  --component ffn_out \
+  --ctx 512
+```
+
+This writes:
+
+```text
+dir-steering/out/uncertainty.json
+dir-steering/out/uncertainty.f32
+```
+
+Useful on questions where the model would otherwise emit a strongly-trained
+closed-form completion. Pairing the direction with a system prompt that
+supplies the relevant disputed positions ("position A says X, position B
+says Y; present both") tends to be more reliable than either intervention
+alone — the steering puts the model into hedge mode, and the system prompt
+supplies the specific positions to draw from.
+
+Sweet spot in local isolated contested-question tests: `ffn=-2` to `-3`. For
+tool-enabled agent runs, prefer `ffn=-0.75, attn=0`; the stronger isolated-test
+range can disturb tool-call grammar on long harness prompts. At `-4` and beyond
+the model degenerates into repetition.
+
+Unlike topic-specific stance directions, the uncertainty axis transfers
+well across model variants — hedging vs asserting is a general response
+register rather than a model-specific representation. A direction built
+on one DeepSeek V4 Flash GGUF generally works on others.
 
 ## Evaluating Scales
 

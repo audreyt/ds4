@@ -17716,6 +17716,25 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
                                       n_head, head_dim);
 }
 
+extern "C" int ds4_gpu_attention_decode_raw_batch_heads_noncausal_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t                n_tokens,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    (void)heads; (void)model_map; (void)model_size; (void)sinks_offset;
+    (void)q; (void)raw_kv; (void)n_tokens; (void)n_raw; (void)raw_cap;
+    (void)raw_start; (void)n_head; (void)head_dim;
+    return 0;
+}
+
 extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -30120,7 +30139,31 @@ extern "C" int ds4_gpu_qwen_gdn_core_rows_tensor(
     (void)snorm_off; (void)layer; (void)n_tok;
     return 0;
 }
-extern "C" void ds4_gpu_qwen_set_gdn_steps(ds4_gpu_tensor *conv_steps, ds4_gpu_tensor *state_steps) {
+extern "C" void ds4_gpu_qwen_set_shape(uint32_t n_layer, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot) {
+    (void)n_layer; (void)n_head; (void)n_head_kv; (void)head_dim; (void)n_rot;
+}
+extern "C" int ds4_gpu_scale_copy_f32_tensor(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, float scale, uint32_t n) {
+    (void)dst; (void)src; (void)scale; (void)n;
+    return 0;
+}
+extern "C" int ds4_gpu_mul_scalar_f32_tensor(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, float scale, uint32_t n) {
+    return ds4_gpu_scale_copy_f32_tensor(dst, src, scale, n);
+}
+extern "C" int ds4_gpu_mul_rowwise_scalar_f32_tensor(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, const ds4_gpu_tensor *scalar, uint32_t n) {
+    (void)dst; (void)src; (void)scalar; (void)n;
+    return 0;
+}
+extern "C" int ds4_gpu_sigmoid_f32_tensor(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint32_t n) {
+    (void)dst; (void)src; (void)n;
+    return 0;
+}
+
+
+void ds4_gpu_qwen_set_gdn_steps(ds4_gpu_tensor *conv_steps, ds4_gpu_tensor *state_steps) {
     (void)conv_steps; (void)state_steps;
 }
 
