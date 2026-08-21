@@ -58,6 +58,10 @@ typedef struct {
     bool ssd_streaming_full_layers_set;
     bool cuda_tensor_parallel;
     bool show_output;
+    const char *dflash_path;
+    int dflash_draft_n_max;
+    bool dflash_lookup;
+    int dflash_lookup_tokens;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -328,6 +332,14 @@ static bench_config parse_options(int argc, char **argv) {
             c.warm_weights = true;
         } else if (!strcmp(arg, "--show-output")) {
             c.show_output = true;
+        } else if (!strcmp(arg, "--dflash") || !strcmp(arg, "--dflash2") || !strcmp(arg, "--draft-model") || !strcmp(arg, "-hfd")) {
+            c.dflash_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dflash-n-max") || !strcmp(arg, "--spec-draft-n-max")) {
+            c.dflash_draft_n_max = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dflash-lookup")) {
+            c.dflash_lookup = true;
+        } else if (!strcmp(arg, "--dflash-tokens")) {
+            c.dflash_lookup_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -594,6 +606,10 @@ int main(int argc, char **argv) {
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
+        .dflash_path = cfg.dflash_path,
+        .dflash_draft_n_max = cfg.dflash_draft_n_max,
+        .dflash_lookup = cfg.dflash_lookup,
+        .dflash_lookup_tokens = cfg.dflash_lookup_tokens,
     };
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
@@ -737,7 +753,8 @@ int main(int argc, char **argv) {
             ? malloc((size_t)cfg.gen_tokens * sizeof(gen_token_buf[0]))
             : NULL;
         int gen_token_count = 0;
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        const int use_dflash = ds4_engine_dflash_ready(engine);
+        while (gen_done < cfg.gen_tokens) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
@@ -750,17 +767,39 @@ int main(int argc, char **argv) {
                 break;
             }
             const double token_t0 = bench_now_sec();
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
-                rc = 1;
-                break;
+            if (use_dflash) {
+                int toks[17];
+                int ntok = ds4_session_eval_speculative_argmax(
+                        session, token, cfg.gen_tokens - gen_done, eos,
+                        toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                        err, sizeof(err));
+                const double token_t1 = bench_now_sec();
+                if (ntok < 0) {
+                    fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                if (ntok == 0) ntok = 1;
+                if (gen_done == 0) gen_first_sec = token_t1 - token_t0;
+                else gen_steady_sec += token_t1 - token_t0;
+                for (int k = 0; k < ntok && gen_done < cfg.gen_tokens; k++) {
+                    if (gen_token_buf) gen_token_buf[gen_token_count++] = toks[k];
+                    gen_done++;
+                }
+            } else {
+                if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                const double token_t1 = bench_now_sec();
+                if (gen_done == 0) gen_first_sec = token_t1 - token_t0;
+                else gen_steady_sec += token_t1 - token_t0;
+                if (gen_token_buf) gen_token_buf[gen_token_count++] = token;
+                gen_done++;
             }
-            const double token_t1 = bench_now_sec();
-            if (i == 0) gen_first_sec = token_t1 - token_t0;
-            else gen_steady_sec += token_t1 - token_t0;
-            if (gen_token_buf) gen_token_buf[gen_token_count++] = token;
-            gen_done++;
         }
+        if (use_dflash) ds4_engine_dflash_dump_stats(engine);
         const double gen_t1 = bench_now_sec();
         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
             fprintf(stderr, "ds4-bench: gen[ctx=%d] decoded text: \"", frontier);

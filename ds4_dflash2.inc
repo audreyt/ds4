@@ -878,3 +878,162 @@ static void qwen_forward_token_cpu_layers(
 }
 
 
+
+static int dflash2_rfind_combo(const int *hist, int hlen,
+                               const int *drafts, int nd, int sl) {
+    /* Occurrences must end strictly before hlen so tokens follow them; the
+       flush-adjacent position (s == hlen - sl) would read past hist and can
+       never yield a continuation. */
+    if (!hist || !drafts || nd <= 0 || sl < nd || hlen <= sl) return -1;
+    const int hist_part = sl - nd;
+    const int hist_from = hlen - hist_part;
+    for (int s = hlen - sl - 1; s >= 0; s--) {
+        int ok = 1;
+        for (int i = 0; i < sl; i++) {
+            const int want = (i < hist_part) ? hist[hist_from + i] : drafts[i - hist_part];
+            if (hist[s + i] != want) { ok = 0; break; }
+        }
+        if (ok) return s;
+    }
+    return -1;
+}
+
+/* drafts[0..n_drafter) already hold the DFlash2 proposal. May overwrite (A)
+   or extend (B). Returns new drafted count.
+
+   Mode A (copy): longest suffix (<= DS4_DFLASH2_LOOKUP_SUFFIX) of the
+   committed-context tail that occurs strictly inside history leaving at
+   least one known continuation token; fill the block with that continuation.
+   Strong matches (>= DS4_DFLASH2_LOOKUP_NSTRONG) engage freely; weak ones
+   only when their first DS4_DFLASH2_LOOKUP_AGREE fills equal the drafter's
+   first proposals. Fills beyond short_full additionally require trigger
+   (the previous round accepted a full short block).
+
+   Mode B (extend): with a full drafter block and trigger, find a history
+   occurrence whose continuation follows the context tail through the whole
+   proposal, and append it. */
+static int dflash2_apply_lookup(
+        int *drafts,
+        int n_drafter,
+        int short_full,
+        int long_cap,
+        int room,
+        const int *hist,
+        int hlen,
+        int anchor,
+        int trigger,
+        int *lookup_filled,
+        int *long_block,
+        char *mode) {
+    if (lookup_filled) *lookup_filled = 0;
+    if (long_block) *long_block = 0;
+    if (mode) *mode = 'n';
+    int drafted = n_drafter;
+    if (drafted > room) drafted = room;
+    if (drafted < 0) drafted = 0;
+    if (!hist || hlen <= 0 || long_cap <= 0 || room <= 0) {
+        return drafted;
+    }
+    int cap = long_cap;
+    if (cap > room) cap = room;
+    if (cap > (int)DS4_DFLASH2_MAX_BLOCK - 1) cap = (int)DS4_DFLASH2_MAX_BLOCK - 1;
+
+    /* Mode A anchors on the committed context INCLUDING the round's anchor
+       token: verify compares drafts[0] against the target's prediction after
+       the anchor, so the lookup continuation must follow an occurrence of
+       (context tail + anchor), not of the context tail alone. */
+    const int elen = hlen + 1;
+    int best_len = 0;
+    int best_start = -1;
+    int max_suf = DS4_DFLASH2_LOOKUP_SUFFIX;
+    if (max_suf > elen) max_suf = elen;
+    for (int sl = max_suf; sl >= DS4_DFLASH2_LOOKUP_AGREE; sl--) {
+        /* Occurrences entirely inside hist qualify: the match must leave at
+           least one continuation token, otherwise the fill is dead weight
+           (and the flush-adjacent match would always win in copy regimes). */
+        for (int p = hlen - sl - 1; p >= 0; p--) {
+            int ok = 1;
+            for (int i = 0; i < sl; i++) {
+                const int want = (i == sl - 1) ? anchor
+                                               : hist[hlen + 1 - sl + i];
+                if (hist[p + i] != want) { ok = 0; break; }
+            }
+            if (ok) { best_len = sl; best_start = p; break; }
+        }
+        if (best_start >= 0) break;
+    }
+    if (best_start >= 0) {
+        const int follow = hlen - (best_start + best_len);
+        if (follow > 0) {
+            int take = follow;
+            if (take > cap) take = cap;
+            if (!trigger && take > short_full) take = short_full;
+            int use_a = 0;
+            if (best_len >= DS4_DFLASH2_LOOKUP_NSTRONG) {
+                use_a = 1;
+            } else if (n_drafter >= DS4_DFLASH2_LOOKUP_AGREE &&
+                       take >= DS4_DFLASH2_LOOKUP_AGREE) {
+                int agree = 1;
+                for (int i = 0; i < DS4_DFLASH2_LOOKUP_AGREE; i++) {
+                    if (hist[best_start + best_len + i] != drafts[i]) { agree = 0; break; }
+                }
+                if (agree) use_a = 1;
+            }
+            if (use_a) {
+                for (int i = 0; i < take; i++) {
+                    drafts[i] = hist[best_start + best_len + i];
+                }
+                if (lookup_filled) *lookup_filled = take;
+                if (long_block) *long_block = (take > short_full) ? 1 : 0;
+                if (mode) *mode = 'A';
+                return take;
+            }
+        }
+    }
+
+    /* Mode B appends past the short block, so it is a long block and needs
+       a proven short round first. */
+    if (!trigger) return drafted;
+    if (mode) *mode = 'B';
+    if (n_drafter < short_full || drafted < short_full) return drafted;
+    int found_start = -1;
+    int found_len = -1;
+    int maxb = DS4_DFLASH2_LOOKUP_SUFFIX;
+    if (maxb > hlen + n_drafter) maxb = hlen + n_drafter;
+    if (maxb > hlen) maxb = hlen;
+    for (int sl = maxb; sl >= n_drafter; sl--) {
+        const int start = dflash2_rfind_combo(hist, hlen, drafts, n_drafter, sl);
+        if (start >= 0) {
+            found_start = start;
+            found_len = sl;
+            break;
+        }
+    }
+    if (found_start < 0) return drafted;
+    const int follow = hlen - (found_start + found_len);
+    if (follow <= 0) return drafted;
+    int extra = follow;
+    if (extra > cap - drafted) extra = cap - drafted;
+    if (extra <= 0) return drafted;
+    for (int i = 0; i < extra; i++) {
+        drafts[drafted + i] = hist[found_start + found_len + i];
+    }
+    if (lookup_filled) *lookup_filled = extra;
+    if (long_block) *long_block = 1;
+    return drafted + extra;
+}
+
+static void dflash2_note_stats(ds4_engine *e, int proposed, int accepted, int lookup_filled,
+                              int long_block, char mode) {
+    if (!e) return;
+    e->dflash_stat_proposed += proposed;
+    e->dflash_stat_accepted += accepted;
+    e->dflash_stat_lookup += lookup_filled;
+    e->dflash_stat_rounds++;
+    if (e->dflash_lookup && getenv("DS4_DFLASH_STATS") != NULL) {
+        fprintf(stderr,
+                "ds4: DFlash2 round proposed=%d accepted=%d lookup_filled=%d long_block=%d mode=%c\n",
+                proposed, accepted, lookup_filled, long_block, mode);
+    }
+}
+

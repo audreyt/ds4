@@ -811,6 +811,9 @@ static int g_ds4_lock_fd = -1;
 #define DS4_DFLASH2_MAX_LAYERS 8
 #define DS4_DFLASH2_MAX_TARGET 8
 #define DS4_DFLASH2_MAX_BLOCK 16
+#define DS4_DFLASH2_LOOKUP_NSTRONG 8
+#define DS4_DFLASH2_LOOKUP_AGREE 2
+#define DS4_DFLASH2_LOOKUP_SUFFIX 32
 
 #define QK_MXFP4 32
 
@@ -15903,6 +15906,7 @@ typedef struct ds4_qwen_session_state {
     ds4_gpu_tensor *gdn_state;
     uint32_t max_ctx;
 #endif
+    int dflash_prev_accepted;
 } ds4_qwen_session_state;
 
 static void qwen_session_state_free(ds4_qwen_session_state *qs) {
@@ -16063,9 +16067,9 @@ static int qwen_metal_ensure_pool(void) {
     g_qwen_pool.batch_argmax = ds4_gpu_tensor_alloc((uint64_t)batch_cap * sizeof(int32_t));
     g_qwen_pool.gdn_conv_snap = ds4_gpu_tensor_alloc((uint64_t)64 * QWEN_GDN_QKV * QWEN_GDN_CONV_K * sizeof(float));
     g_qwen_pool.gdn_state_snap = ds4_gpu_tensor_alloc((uint64_t)64 * QWEN_GDN_V_HEADS * QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM * sizeof(float));
-    g_qwen_pool.layer_stash = ds4_gpu_tensor_alloc(8ull * 8ull * 5120ull * sizeof(float));
-    g_qwen_pool.gdn_conv_steps = ds4_gpu_tensor_alloc(8ull * 64ull * QWEN_GDN_QKV * QWEN_GDN_CONV_K * sizeof(float));
-    g_qwen_pool.gdn_state_steps = ds4_gpu_tensor_alloc(8ull * 64ull * QWEN_GDN_V_HEADS * QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM * sizeof(float));
+    g_qwen_pool.layer_stash = ds4_gpu_tensor_alloc((uint64_t)DS4_DFLASH2_MAX_BLOCK * 8ull * 5120ull * sizeof(float));
+    g_qwen_pool.gdn_conv_steps = ds4_gpu_tensor_alloc((uint64_t)DS4_DFLASH2_MAX_BLOCK * 64ull * QWEN_GDN_QKV * QWEN_GDN_CONV_K * sizeof(float));
+    g_qwen_pool.gdn_state_steps = ds4_gpu_tensor_alloc((uint64_t)DS4_DFLASH2_MAX_BLOCK * 64ull * QWEN_GDN_V_HEADS * QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM * sizeof(float));
     ds4_gpu_qwen_set_gdn_steps(g_qwen_pool.gdn_conv_steps, g_qwen_pool.gdn_state_steps);
 
 
@@ -16600,7 +16604,7 @@ static int qwen_hybrid_restore_gdn_snap(void) {
 }
 static int qwen_hybrid_restore_gdn_prefix(ds4_qwen_session_state *qs, uint32_t t) {
     if (!g_qwen_pool.inited || !g_qwen_pool.gdn_conv_steps || !g_qwen_pool.gdn_state_steps) return 0;
-    if (t >= 8u) return 0;
+    if (t >= (uint64_t)DS4_DFLASH2_MAX_BLOCK) return 0; /* verify block width */
     ds4_gpu_tensor *gdn_conv = (qs && qs->gdn_conv) ? qs->gdn_conv : g_qwen_pool.gdn_conv;
     ds4_gpu_tensor *gdn_state = (qs && qs->gdn_state) ? qs->gdn_state : g_qwen_pool.gdn_state;
     const uint64_t conv_bytes = 64ull * QWEN_GDN_QKV * QWEN_GDN_CONV_K * sizeof(float);
@@ -16651,12 +16655,20 @@ static int qwen_hybrid_metal_forward_tokens(
     const int skip_head = getenv("DS4_QWEN_SKIP_HEAD") != NULL;
 
     pthread_mutex_lock(&g_qwen_pool.mu);
-    int32_t ids[8];
+    int32_t ids_small[DS4_DFLASH2_MAX_BLOCK];
+    int32_t *ids = ids_small;
+    int ids_heap = 0;
+    if (n_tok > DS4_DFLASH2_MAX_BLOCK) {
+        ids = xmalloc((size_t)n_tok * sizeof(ids[0]));
+        ids_heap = 1;
+    }
     for (uint32_t t = 0; t < n_tok; t++) ids[t] = tokens[t];
     if (!ds4_gpu_tensor_write(g_qwen_pool.batch_tokens, 0, ids, (uint64_t)n_tok * sizeof(int32_t))) {
+        if (ids_heap) free(ids);
         pthread_mutex_unlock(&g_qwen_pool.mu);
         return 0;
     }
+    if (ids_heap) free(ids);
     int ok = 1;
     const char *fail = NULL;
     uint32_t fail_il = 0;
@@ -16896,7 +16908,7 @@ static int qwen_hybrid_metal_forward_tokens(
         if (layer_out && layer_ids && g_qwen_pool.layer_stash && ok) {
             for (uint32_t j = 0; ok && j < n_ids && j < 8u; j++) {
                 if (layer_ids[j] == il) {
-                    for (uint32_t t = 0; ok && t < n_tok && t < 8u; t++) {
+                    for (uint32_t t = 0; ok && t < n_tok && t < (uint64_t)DS4_DFLASH2_MAX_BLOCK; t++) {
                         if (!ds4_gpu_tensor_copy(g_qwen_pool.layer_stash,
                                                  ((uint64_t)t * 8u + j) * n_embd * sizeof(float),
                                                  next,
@@ -16950,8 +16962,8 @@ static int qwen_hybrid_metal_forward_tokens(
                 n_tok, 1e3 * (t_enc - t0), 1e3 * (t_wait - t_enc), ok, fail ? fail : "-", fail_il);
     }
     if (ok && argmax_out && g_qwen_pool.batch_argmax) {
-        int32_t idx[8];
-        uint32_t nt = n_tok < 8u ? n_tok : 8u;
+        int32_t idx[DS4_DFLASH2_MAX_BLOCK];
+        uint32_t nt = n_tok < (uint32_t)DS4_DFLASH2_MAX_BLOCK ? n_tok : (uint32_t)DS4_DFLASH2_MAX_BLOCK;
         if (!ds4_gpu_tensor_read(g_qwen_pool.batch_argmax, 0, idx, (uint64_t)nt * sizeof(int32_t))) ok = 0;
         else for (uint32_t t = 0; t < nt; t++) argmax_out[t] = (int)idx[t];
     }
@@ -16962,7 +16974,7 @@ static int qwen_hybrid_metal_forward_tokens(
         !ds4_gpu_tensor_read(cur, 0, hidden_out,
                              (uint64_t)n_tok * n_embd * sizeof(float))) ok = 0;
     if (ok && layer_out && layer_ids && g_qwen_pool.layer_stash) {
-        uint32_t nt = n_tok < 8u ? n_tok : 8u;
+        uint32_t nt = n_tok < (uint32_t)DS4_DFLASH2_MAX_BLOCK ? n_tok : (uint32_t)DS4_DFLASH2_MAX_BLOCK;
         if (!ds4_gpu_tensor_read(g_qwen_pool.layer_stash, 0, layer_out,
                                  (uint64_t)nt * 8u * n_embd * sizeof(float))) ok = 0;
     }
@@ -40137,6 +40149,12 @@ struct ds4_engine {
     ds4_model dflash_model;
     ds4_weights dflash_weights;
     int dflash_draft_n_max;
+    bool dflash_lookup;
+    int dflash_lookup_tokens;
+    int dflash_stat_proposed;
+    int dflash_stat_accepted;
+    int dflash_stat_lookup;
+    int dflash_stat_rounds;
     ds4_dflash2_weights dflash2;
     bool dflash_ready;
     ds4_vocab vocab;
@@ -40566,6 +40584,11 @@ static int qwen_generate_dflash2(
     int pos = prompt->len;
     int n_generated = 0;
     int proposed = 0, accepted_n = 0;
+    int prev_accepted = 0;
+    int lookup_n = 0;
+    const int short_full = max_draft;
+    token_vec hist = {0};
+    for (int i = 0; i < prompt->len; i++) token_vec_push(&hist, prompt->v[i]);
 
     while (n_generated < n_predict && pos < ctx_size) {
         const int primary = sample_argmax(logits, DS4_N_VOCAB);
@@ -40579,13 +40602,24 @@ static int qwen_generate_dflash2(
 
         int drafts[DS4_DFLASH2_MAX_BLOCK];
         int drafted = 0;
+        int lookup_filled = 0, long_block = 0;
+        char lmode = 'n';
         if (K > 0) {
             const double td0 = now_sec();
             drafted = dflash2_propose(drafts, K, &e->dflash_model, dw,
                                       &e->model, &e->weights, layers,
                                       primary, (uint32_t)(pos > 0 ? pos - 1 : 0));
             const double td1 = now_sec();
+            if (e->dflash_lookup) {
+                const int trigger = prev_accepted >= short_full;
+                int lroom = remaining < room ? remaining : room;
+            drafted = dflash2_apply_lookup(
+                    drafts, drafted, short_full, e->dflash_lookup_tokens, lroom,
+                    hist.v, hist.len, primary, trigger,
+                    &lookup_filled, &long_block, &lmode);
+            }
             proposed += drafted;
+            lookup_n += lookup_filled;
             static int ndraft;
             if (++ndraft <= 4) {
                 fprintf(stderr, "ds4: draft k=%d n=%d %.1f ms\n",
@@ -40615,6 +40649,8 @@ static int qwen_generate_dflash2(
         if (accepted < drafted) {
             (void)qwen_hybrid_restore_gdn_prefix(NULL, committed - 1u);
         }
+        dflash2_note_stats(e, drafted, accepted, lookup_filled, long_block, lmode);
+        prev_accepted = accepted;
         static int nprof;
         if (++nprof <= 4) {
             fprintf(stderr, "ds4: verify n=%u acc=%d first=%.1f ms total=%.1f ms\n",
@@ -40640,6 +40676,7 @@ static int qwen_generate_dflash2(
 
 
         if (emit) emit(emit_ud, primary);
+        token_vec_push(&hist, primary);
         n_generated++;
         pos++;
         accepted_n += accepted;
@@ -40647,6 +40684,7 @@ static int qwen_generate_dflash2(
         int stop = 0;
         for (int d = 0; d < accepted; d++) {
             if (emit) emit(emit_ud, drafts[d]);
+            token_vec_push(&hist, drafts[d]);
             n_generated++;
             pos++;
             if (n_generated >= n_predict || pos >= ctx_size) { stop = 1; break; }
@@ -40655,9 +40693,16 @@ static int qwen_generate_dflash2(
         if (stop) break;
     }
     const double t1 = now_sec();
-    fprintf(stderr, "ds4: DFlash2 stats proposed=%d accepted=%d generation: %.2f t/s\n",
-            proposed, accepted_n,
-            (t1 - t0) > 0.0 ? (double)n_generated / (t1 - t0) : 0.0);
+    if (e->dflash_lookup) {
+        fprintf(stderr, "ds4: DFlash2 stats proposed=%d accepted=%d lookup=%d generation: %.2f t/s\n",
+                proposed, accepted_n, lookup_n,
+                (t1 - t0) > 0.0 ? (double)n_generated / (t1 - t0) : 0.0);
+    } else {
+        fprintf(stderr, "ds4: DFlash2 stats proposed=%d accepted=%d generation: %.2f t/s\n",
+                proposed, accepted_n,
+                (t1 - t0) > 0.0 ? (double)n_generated / (t1 - t0) : 0.0);
+    }
+    token_vec_free(&hist);
 
     free(layers); free(hidden); free(logits);
     if (done) done(emit_ud);
@@ -61329,6 +61374,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (e->dflash_draft_n_max < 0) e->dflash_draft_n_max = 0;
     if (e->dflash_draft_n_max > (int)DS4_DFLASH2_MAX_BLOCK - 1)
         e->dflash_draft_n_max = (int)DS4_DFLASH2_MAX_BLOCK - 1;
+    e->dflash_lookup = opt->dflash_lookup;
+    {
+        const char *lu = getenv("DS4_DFLASH_LOOKUP");
+        if (lu && lu[0] == '1' && lu[1] == 0) e->dflash_lookup = true;
+    }
+    e->dflash_lookup_tokens = opt->dflash_lookup_tokens > 0 ? opt->dflash_lookup_tokens : 15;
+    if (e->dflash_lookup_tokens > (int)DS4_DFLASH2_MAX_BLOCK - 1)
+        e->dflash_lookup_tokens = (int)DS4_DFLASH2_MAX_BLOCK - 1;
 
     e->backend = opt->backend;
     e->quality = opt->quality;
@@ -62565,6 +62618,21 @@ bool ds4_engine_is_qwen(ds4_engine *e) {
 
 bool ds4_engine_dflash_ready(const ds4_engine *e) {
     return e && e->dflash_ready;
+}
+
+void ds4_engine_dflash_dump_stats(ds4_engine *e) {
+    if (!e || !e->dflash_ready || e->dflash_stat_rounds == 0) return;
+    if (e->dflash_lookup) {
+        fprintf(stderr, "ds4: DFlash2 stats proposed=%d accepted=%d lookup=%d\n",
+                e->dflash_stat_proposed, e->dflash_stat_accepted, e->dflash_stat_lookup);
+    } else {
+        fprintf(stderr, "ds4: DFlash2 stats proposed=%d accepted=%d\n",
+                e->dflash_stat_proposed, e->dflash_stat_accepted);
+    }
+    e->dflash_stat_proposed = 0;
+    e->dflash_stat_accepted = 0;
+    e->dflash_stat_lookup = 0;
+    e->dflash_stat_rounds = 0;
 }
 
 void ds4_engine_close(ds4_engine *e) {
@@ -64233,6 +64301,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         // full prefill
         s->checkpoint.len = 0;
         s->checkpoint_valid = false;
+        s->qwen.dflash_prev_accepted = 0;
 #ifndef DS4_NO_GPU
         if (!is_cpu && !qwen_session_state_reset_recurrent(&s->qwen)) {
             snprintf(err, errlen, "failed to reset Qwen recurrent state");
@@ -70458,17 +70527,27 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             int max_draft = e->dflash_draft_n_max > 0 ? e->dflash_draft_n_max : (int)dw->block_size - 1;
             if (max_draft > (int)dw->block_size - 1) max_draft = (int)dw->block_size - 1;
             if (max_draft > 7) max_draft = 7;
+            const int short_full = max_draft;
             if (max_draft > remaining) max_draft = remaining;
             if (max_draft > room) max_draft = room;
             if (max_draft > accepted_cap - 1) max_draft = accepted_cap - 1;
-            if (max_draft < 0) max_draft = 0;
-
             int drafts[DS4_DFLASH2_MAX_BLOCK];
             int drafted = 0;
+            int lookup_filled = 0, long_block = 0;
+            char lmode = 'n';
             if (max_draft > 0 && primary != eos_token) {
                 drafted = dflash2_propose(drafts, max_draft, &e->dflash_model, dw,
                                           &e->model, &e->weights, s->qwen.layers,
                                           primary, (uint32_t)(pos > 0 ? pos - 1 : 0));
+            }
+            if (e->dflash_lookup) {
+                const int trigger = s->qwen.dflash_prev_accepted >= short_full;
+                int lroom = remaining < room ? remaining : room;
+                if (lroom > accepted_cap - 1) lroom = accepted_cap - 1;
+                drafted = dflash2_apply_lookup(
+                        drafts, drafted, short_full, e->dflash_lookup_tokens, lroom,
+                        s->checkpoint.v, s->checkpoint.len, primary, trigger,
+                        &lookup_filled, &long_block, &lmode);
             }
 
             if (drafted <= 0) {
@@ -70504,6 +70583,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             if (acc < drafted) {
                 (void)qwen_hybrid_restore_gdn_prefix(&s->qwen, committed - 1u);
             }
+            dflash2_note_stats(e, drafted, acc, lookup_filled, long_block, lmode);
+            s->qwen.dflash_prev_accepted = acc;
 
             const int next_id = preds[committed - 1u];
             if (next_id >= 0) {

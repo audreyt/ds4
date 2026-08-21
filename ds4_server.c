@@ -14390,6 +14390,10 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.dflash_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dflash-n-max") || !strcmp(arg, "--spec-draft-n-max")) {
             c.engine.dflash_draft_n_max = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dflash-lookup")) {
+            c.engine.dflash_lookup = true;
+        } else if (!strcmp(arg, "--dflash-tokens")) {
+            c.engine.dflash_lookup_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {

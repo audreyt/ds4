@@ -178,13 +178,15 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         if (tool != DS4_HELP_BENCH) {
             opt(fp, c, "--mtp FILE", "Optional speculative draft GGUF: legacy MTP or experimental converted DSpark/DeepSpec on Metal.");
         }
-        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
+        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER || tool == DS4_HELP_BENCH) {
             opt(fp, c, "--mtp-draft N", "Maximum speculative draft tokens. Legacy default: 1; DSpark uses GGUF block size.");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for legacy fast MTP acceptance. Default: 3");
             opt(fp, c, "--glm-mtp", "Enable integrated greedy GLM MTP speculation.");
             opt(fp, c, "--glm-mtp-timing", "Enable GLM MTP and print acceptance/timing counters.");
             opt(fp, c, "--dflash FILE", "Load a Qwen DFlash2 draft GGUF and run block-diffusion speculative decode.");
             opt(fp, c, "--dflash-n-max N", "Maximum DFlash2 draft tokens per round. Default: GGUF block_size-1.");
+            opt(fp, c, "--dflash-lookup", "Enable continuous-draft context lookup to extend the DFlash2 verify block.");
+            opt(fp, c, "--dflash-tokens N", "Lookup verify cap excluding the anchor. Default: 15. Hard max: 15.");
 
             opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp. Immediate no-draft skip is off; scheduler window=8 min-avg=2.0. One-token proposals use ordinary decode.");
             opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Default: Metal 0.6; CUDA/ROCm 0.7");

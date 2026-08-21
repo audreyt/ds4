@@ -1862,6 +1862,10 @@ static cli_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--spec-draft-n-max") || !strcmp(arg, "--dflash-n-max")) {
             c.engine.dflash_draft_n_max = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dflash-lookup")) {
+            c.engine.dflash_lookup = true;
+        } else if (!strcmp(arg, "--dflash-tokens")) {
+            c.engine.dflash_lookup_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--glm-mtp")) {
             c.engine.glm_mtp = true;
         } else if (!strcmp(arg, "--glm-mtp-timing")) {
