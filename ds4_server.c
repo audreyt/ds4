@@ -12250,6 +12250,8 @@ decode_again:
                                                   anthropic_live_continuation);
     bool saw_final_answer_text = false;
     server_apply_decode_directional_steering(s, slot);
+    bool have_greedy_next = false;
+    int greedy_next = -1;
 
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
@@ -12272,12 +12274,18 @@ decode_again:
         }
         decode_sampling sampling =
             effective_decode_sampling(&j->req, dsml_state);
-        int token = ds4_session_sample(slot->session,
+        int token;
+        if (have_greedy_next) {
+            token = greedy_next;
+            have_greedy_next = false;
+        } else {
+            token = ds4_session_sample(slot->session,
                                        sampling.temperature,
                                        sampling.top_k,
                                        sampling.top_p,
                                        sampling.min_p,
                                        &rng);
+        }
         if (ds4_token_is_stop_for_think_mode(s->engine, token,
                                              j->req.think_mode)) {
             finish = "stop";
@@ -12367,10 +12375,26 @@ decode_again:
                         &starts_final_answer);
                     server_apply_directional_steering(s, slot, steer_token);
                 }
-                int eval_rc = dynamic_steering
-                    ? server_eval_token_no_mtp(s, slot, token,
-                                               err, sizeof(err))
-                    : server_eval_token(s, slot, token, err, sizeof(err));
+                int eval_rc;
+                const bool can_eval_argmax =
+                    !s->batched_mode &&
+                    sampling.temperature <= 0.0f &&
+                    !dynamic_steering &&
+                    ds4_engine_is_qwen(s->engine) &&
+                    (completion + 1 < max_tokens);
+
+                if (can_eval_argmax) {
+                    pthread_mutex_lock(&s->inference_mu);
+                    greedy_next = ds4_session_eval_argmax(slot->session, token, err, sizeof(err));
+                    pthread_mutex_unlock(&s->inference_mu);
+                    eval_rc = (greedy_next < 0) ? 1 : 0;
+                    if (eval_rc == 0) have_greedy_next = true;
+                } else if (dynamic_steering) {
+                    eval_rc = server_eval_token_no_mtp(s, slot, token,
+                                               err, sizeof(err));
+                } else {
+                    eval_rc = server_eval_token(s, slot, token, err, sizeof(err));
+                }
                 if (eval_rc != 0) {
                     finish = "error";
                     free(piece);

@@ -16027,15 +16027,17 @@ static int qwen_metal_ensure_pool(void) {
     if (g_qwen_pool.gdn_conv) ds4_gpu_tensor_fill_f32(g_qwen_pool.gdn_conv, 0.0f, 64ull * QWEN_GDN_QKV * QWEN_GDN_CONV_K);
     if (g_qwen_pool.gdn_state) ds4_gpu_tensor_fill_f32(g_qwen_pool.gdn_state, 0.0f, 64ull * QWEN_GDN_V_HEADS * QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM);
 
-    uint32_t batch_cap = 64;
+    uint32_t batch_cap = 256;
     {
         const char *seq = getenv("DS4_QWEN_PREFILL_SEQ");
         if (seq && seq[0] && seq[0] != '0') batch_cap = 1;
         else {
-            const char *env = getenv("DS4_QWEN_BATCH");
+            const char *env = getenv("DS4_QWEN_PREFILL_BATCH");
+            if (!env || !env[0]) env = getenv("DS4_QWEN_BATCH");
             if (env && env[0]) {
                 long v = strtol(env, NULL, 10);
                 if (v <= 1) batch_cap = 1;
+                else if (v > 1024) batch_cap = 1024;
                 else batch_cap = (uint32_t)v;
             }
         }
@@ -16290,7 +16292,19 @@ static int qwen_pack_gdn_inproj(const ds4_model *model, const ds4_weights *weigh
 }
 
 static int qwen_gpu_matvec_ok(const ds4_tensor *w) {
-    return w && w->type != DS4_TENSOR_Q6_K && w->type != DS4_TENSOR_Q5_K;
+    if (!w || w->type == DS4_TENSOR_Q5_K) return 0;
+    switch (w->type) {
+    case DS4_TENSOR_F16:
+    case DS4_TENSOR_F32:
+    case DS4_TENSOR_Q8_0:
+    case DS4_TENSOR_Q4_K:
+    case DS4_TENSOR_Q6_K:
+    case DS4_TENSOR_NVFP4:
+    case DS4_TENSOR_Q4_64A:
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 static int qwen_gpu_matmul(
@@ -56818,6 +56832,25 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
+    if (ds4_session_is_qwen(s)) {
+        ds4_engine *e = s->engine;
+        const uint32_t pos = (uint32_t)s->checkpoint.len;
+        const bool is_cpu = (e->backend == DS4_BACKEND_CPU);
+        int top = -1;
+#ifndef DS4_NO_GPU
+        if (!is_cpu) {
+            if (qwen_hybrid_metal_forward_token_ex(&s->qwen, NULL, &top, NULL, NULL, NULL, 0,
+                                                   &e->model, &e->weights, token, pos)) {
+                token_vec_push(&s->checkpoint, token);
+                s->checkpoint_valid = true;
+                s->mtp_draft_valid = false;
+                return top;
+            }
+        }
+#endif
+        if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
+        return ds4_session_argmax(s);
+    }
     if (ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);

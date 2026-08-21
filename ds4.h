@@ -391,6 +391,11 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
  * used by the TP worker right after session create (no-op on CPU/GLM). */
 void ds4_session_gpu_warmup(ds4_session *s);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+/* Execute a forward pass specifically for greedy decoding (temperature 0).
+ * Only the top token is returned; the session's full logits array is NOT
+ * updated and MUST NOT be read. */
+int ds4_session_eval_argmax(ds4_session *s, int token,
+                            char *err, size_t errlen);
 int ds4_session_eval_no_mtp(ds4_session *s, int token,
                             char *err, size_t errlen);
 
