@@ -16,6 +16,13 @@ struct ds4_qwen_gdn_conv_args {
 struct ds4_qwen_gdn_core_args {
     uint32_t layer;
     uint32_t n_tok;
+    uint32_t v_heads;
+    uint32_t qkv_dim;
+    uint32_t z_dim;
+    uint32_t n_layers;
+    uint32_t snapshot;
+    uint32_t pre_normalized;
+    uint32_t split_output;
 };
 
 

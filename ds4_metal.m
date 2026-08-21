@@ -19611,7 +19611,7 @@ int ds4_gpu_qwen_gdn_core_tensor(
 
 
 
-        struct { uint32_t layer; uint32_t n_tok; } gargs = { layer, 1u };
+        struct { uint32_t layer; uint32_t n_tok; uint32_t v_heads; uint32_t qkv_dim; uint32_t z_dim; uint32_t n_layers; uint32_t snapshot; uint32_t pre_normalized; uint32_t split_output; } gargs = { layer, 1u, 0u, 0u, 0u, 0u, 0u, 0u, 0u };
 
         enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:core_p];
@@ -19768,7 +19768,7 @@ int ds4_gpu_qwen_gdn_core_rows_tensor(
         [enc dispatchThreads:MTLSizeMake(10240, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
-        struct { uint32_t layer; uint32_t n_tok; } gargs = { layer, n_tok };
+        struct { uint32_t layer; uint32_t n_tok; uint32_t v_heads; uint32_t qkv_dim; uint32_t z_dim; uint32_t n_layers; uint32_t snapshot; uint32_t pre_normalized; uint32_t split_output; } gargs = { layer, n_tok, 0u, 0u, 0u, 0u, n_tok > 1u ? 1u : 0u, 0u, 0u };
         enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:core_p];
         [enc setBytes:&gargs length:sizeof(gargs) atIndex:0];
