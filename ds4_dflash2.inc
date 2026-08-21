@@ -393,7 +393,7 @@ static int dflash2_bind(ds4_dflash2_weights *w, const ds4_model *m) {
     if (block == 0 || block > DS4_DFLASH2_MAX_BLOCK) return 0;
     if (n_embd == 0 || n_embd != DS4_N_EMBD ||
         n_head == 0 || n_kv == 0 || head_dim == 0 ||
-        (uint64_t)n_head * head_dim != n_embd) {
+        (classic && (uint64_t)n_head * head_dim != n_embd)) {
         return 0;
     }
     if (!classic && (conv_g == 0 || (n_embd % conv_g) != 0)) return 0;
