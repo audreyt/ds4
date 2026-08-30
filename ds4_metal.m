@@ -37499,10 +37499,14 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             !gate_pair_q2 && !gate_pair_q5 && down_scalar_q4 &&
             g_glm_q4_k_addr_pair_swiglu_f32_pipeline != nil &&
             g_glm_q4_k_addr_down_f32_pipeline != nil;
+        /* Single-row spans reach this path from the GLM wide speculative
+         * cycle's replay/commit passes; the addr kernels index per row and
+         * serve one row exactly like two or three, while the direct-offset
+         * fallback needs whole expert tensors mapped (a full layer's expert
+         * stream per layer under --ssd-streaming). */
         BOOL use_stream_expert_addr_table =
             g_ssd_streaming_mode &&
             !ds4_gpu_glm_streaming_prefill_full_layer_active() &&
-            n_tokens > 1 &&
             (stream_addr_q2 || stream_addr_q4) &&
             layer_index < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER &&
             n_total_expert <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&

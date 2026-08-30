@@ -36556,11 +36556,13 @@ static void glm_debug_dump_prefill_logits(const float *logits) {
 }
 
 static bool glm_graph_indexed_prefill_trace_enabled(void) {
-    return false;
+    const char *e = getenv("DS4_GLM_INDEXED_PREFILL_TRACE");
+    return e && e[0] && strcmp(e, "0") != 0;
 }
 
 static bool glm_graph_indexed_prefill_trace_all(void) {
-    return false;
+    const char *e = getenv("DS4_GLM_INDEXED_PREFILL_TRACE_ALL");
+    return e && e[0] && strcmp(e, "0") != 0;
 }
 
 static uint32_t glm_graph_indexed_prefill_trace_slow_ms(void) {
@@ -36572,11 +36574,13 @@ static uint32_t glm_graph_indexed_prefill_drain_interval(void) {
 }
 
 static bool glm_graph_full_prefill_trace_enabled(void) {
-    return false;
+    const char *e = getenv("DS4_GLM_FULL_PREFILL_TRACE");
+    return e && e[0] && strcmp(e, "0") != 0;
 }
 
 static bool glm_graph_full_prefill_trace_all(void) {
-    return false;
+    const char *e = getenv("DS4_GLM_FULL_PREFILL_TRACE_ALL");
+    return e && e[0] && strcmp(e, "0") != 0;
 }
 
 static uint32_t glm_graph_full_prefill_trace_slow_ms(void) {
@@ -40719,7 +40723,20 @@ static bool glm_graph_stream_prefill_expert_addr_supported(
         uint32_t                 il,
         uint32_t                 n_tokens) {
     if (il < DS4_N_LEADING_DENSE) return true;
+    /*
+     * Single-token spans reach this path from the GLM wide speculative
+     * cycle (post-verify replay/commit passes). Metal's selected-address
+     * expert path handles one row exactly like two or three, so a
+     * full-layer fallback here costs a whole layer's expert stream per
+     * layer per step under --ssd-streaming. The relaxation is scoped to
+     * Apple builds, where this path is Metal; ROCm and plain CUDA keep
+     * the fallback until their pointer kernels cover the same layouts.
+     */
+#if defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    (void)n_tokens;
+#else
     if (n_tokens <= 1) return false;
+#endif
 #ifdef DS4_ROCM_BUILD
     /*
      * ROCm selected-address batch prefill has pointer kernels for the
