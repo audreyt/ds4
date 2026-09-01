@@ -6,6 +6,9 @@ GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
 GLM53_REPO="antirez/glm-5.3-flash-gguf"
 GLM53_FULL_REPO="antirez/glm-5.3-gguf"
 REPO="antirez/deepseek-v4-gguf"
+HEADROOM128_REPO="apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128"
+HEADROOM128_FILE="DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128.gguf"
+HEADROOM128_DSPARK_SUPPORT_FILE="DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128-DSpark-support.gguf"
 DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 DS4F_Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
 DS4F_MXFP4_FILE="DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf"
@@ -44,6 +47,9 @@ usage() {
 DwarfStar GGUF downloader
 
 Usage:
+  ./download_model.sh headroom128 [--token TOKEN]
+  ./download_model.sh preferred [--token TOKEN]
+  ./download_model.sh headroom128-dspark-support [--token TOKEN]
   ./download_model.sh ds4f-q2 [--token TOKEN]
   ./download_model.sh ds4f-q2-q4 [--token TOKEN]
   ./download_model.sh ds4f-q4 [--token TOKEN]
@@ -70,6 +76,12 @@ Usage:
 
 Targets:
 
+  headroom128 / preferred
+       Preferred Flash GGUF for 96/128 GB machines on this fork.
+       apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128
+       (~81 GiB). Abliterated 0731 DS4 headroom build; links ./ds4flash.gguf.
+       This is not Vision-Exp; do not pass --vision with it.
+
   ds4f-q2
        2-bit routed experts, about 81 GB on disk.
        Recommended model for 96 and 128 GB RAM machines.
@@ -90,8 +102,13 @@ Targets:
        expert work, while CUDA decode keeps Q8 activations.
 
   ds4f-dspark
-       Optional DSpark speculative decoding support GGUF for Flash 0731, about
+       Official antirez DSpark support GGUF for stock Flash 0731 quants, about
        6 GB. Enable it with --dspark and --mtp-model when running ds4 or ds4-server.
+
+  headroom128-dspark-support
+       Matching DSpark support GGUF for headroom128 from the same apetersson
+       repo, about 5.6 GiB. Enable with --dspark and --mtp-model. Do not use
+       with Vision-Exp.
 
   ds4f-vision-q2
        DeepSeek V4 Flash Vision Experimental with 2-bit routed experts, about
@@ -182,7 +199,10 @@ Then the default commands work:
   ./ds4 -p "Hello"
   ./ds4-server --ctx 100000
 
-After downloading DSpark support, enable it explicitly:
+After downloading Headroom128 DSpark support, enable it explicitly:
+  ./ds4 --dspark --mtp-model <download directory>/$HEADROOM128_DSPARK_SUPPORT_FILE
+
+After downloading official 0731 DSpark support, enable it explicitly:
   ./ds4 --dspark --mtp-model <download directory>/$DS4F_DSPARK_FILE
 
 PRO and GLM files are downloaded with the official Hugging Face downloader
@@ -204,6 +224,16 @@ FORCE_HF_DOWNLOAD=0
 FLATTEN_DOWNLOADS=0
 
 case "$MODEL" in
+    headroom128|preferred)
+        REPO=$HEADROOM128_REPO
+        MODEL_FILE=$HEADROOM128_FILE
+        MODEL=headroom128
+        ;;
+    headroom128-dspark-support)
+        REPO=$HEADROOM128_REPO
+        MODEL_FILE=$HEADROOM128_DSPARK_SUPPORT_FILE
+        LINK_MODEL=0
+        ;;
     ds4f-q2) MODEL_FILE=$DS4F_Q2_FILE ;;
     ds4f-q2-q4) MODEL_FILE=$DS4F_Q2_Q4_FILE ;;
     ds4f-q4) MODEL_FILE=$DS4F_Q4_FILE ;;
@@ -461,10 +491,14 @@ else
     download_one "$MODEL_FILE"
 fi
 
-if [ "$MODEL" = "ds4f-dspark" ]; then
+if [ "$MODEL" = "ds4f-dspark" ] || [ "$MODEL" = "headroom128-dspark-support" ]; then
     echo
     echo "DSpark support downloaded. Enable it explicitly:"
-    echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp-model $OUT_DIR/$DS4F_DSPARK_FILE"
+    if [ "$MODEL" = "headroom128-dspark-support" ]; then
+        echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp-model $OUT_DIR/$HEADROOM128_DSPARK_SUPPORT_FILE"
+    else
+        echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp-model $OUT_DIR/$DS4F_DSPARK_FILE"
+    fi
 elif [ "$MODEL" = "ds4f-vision-dspark" ]; then
     echo
     echo "Vision Experimental DSpark support downloaded. Use it only with the matching checkpoint:"
@@ -477,6 +511,14 @@ elif [ "$LINK_MODEL" -eq 1 ]; then
     cd "$ROOT"
     ln -sfn "$OUT_DIR/$MODEL_FILE" ds4flash.gguf
     echo "Linked ./ds4flash.gguf -> $OUT_DIR/$MODEL_FILE"
+fi
+
+if [ "$MODEL" = "headroom128" ]; then
+    echo
+    echo "Headroom128 has a matching DSpark support GGUF. Download it with:"
+    echo "  ./download_model.sh headroom128-dspark-support"
+    echo "Then enable DSpark explicitly:"
+    echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp-model $OUT_DIR/$HEADROOM128_DSPARK_SUPPORT_FILE"
 fi
 
 echo

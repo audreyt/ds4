@@ -116,14 +116,19 @@ majority of all the model space: the other components (shared experts,
 projections, routing) are left untouched to guarantee quality.
 
 Download one main model. **Prefer the imatrix versions.**
+This fork's 96/128 GB Flash pin is abliterated 0731 Headroom128, not Vision-Exp:
 
 ```sh
-./download_model.sh ds4f-q2      # 96/128 GB RAM machines
+./download_model.sh headroom128  # preferred 0731 Flash on this fork (~81 GiB)
+./download_model.sh ds4f-q2      # official aligned 0731, 96/128 GB RAM
 ./download_model.sh ds4f-q2-q4   # q2 with the last 6 expert layers at q4
 ./download_model.sh ds4f-q4      # >= 256 GB RAM machines
 ./download_model.sh ds4f-mxfp4   # native MXFP4 experts, about 156 GB
 ./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO 0813 q2 imatrix
 ```
+
+Do not pass `--vision` with Headroom128. Vision-Exp is a different checkpoint
+(`ds4f-vision-q2` plus the 316-tensor encoder GGUF).
 
 The MXFP4 GGUF preserves DeepSeek's released MXFP4 routed-expert weights rather
 than requantizing them. It runs on Metal and CUDA; Blackwell CUDA devices use
