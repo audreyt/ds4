@@ -9,6 +9,13 @@ REPO="antirez/deepseek-v4-gguf"
 HEADROOM128_REPO="apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128"
 HEADROOM128_FILE="DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128.gguf"
 HEADROOM128_DSPARK_SUPPORT_FILE="DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128-DSpark-support.gguf"
+VISION_ABLITERATED_REPO="audreyt/DeepSeek-V4-Flash-Vision-Exp-Abliterated-GGUF"
+VISION_ABLITERATED_FILE="DeepSeek-V4-Flash-Vision-Exp-Abliterated-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf"
+VISION_ABLITERATED_REV="367a1fefb91ba1f76eb151abc15c68172e1f1cb7"
+VISION_ABLITERATED_BYTES=86720111776
+VISION_ENCODER_REPO="antirez/deepseek-v4-gguf"
+VISION_ENCODER_REV="f71f23d552d664e523b422157b2befbf74040380"
+VISION_ENCODER_BYTES=932857760
 DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 DS4F_Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
 DS4F_MXFP4_FILE="DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf"
@@ -47,8 +54,8 @@ usage() {
 DwarfStar GGUF downloader
 
 Usage:
-  ./download_model.sh headroom128 [--token TOKEN]
   ./download_model.sh preferred [--token TOKEN]
+  ./download_model.sh headroom128 [--token TOKEN]
   ./download_model.sh headroom128-dspark-support [--token TOKEN]
   ./download_model.sh ds4f-q2 [--token TOKEN]
   ./download_model.sh ds4f-q2-q4 [--token TOKEN]
@@ -60,6 +67,7 @@ Usage:
   ./download_model.sh ds4f-vision-mxfp4 [--token TOKEN]
   ./download_model.sh ds4f-vision-encoder [--token TOKEN]
   ./download_model.sh ds4f-vision-dspark [--token TOKEN]
+  ./download_model.sh ds4f-vision-abliterated [--token TOKEN]  (alias: preferred, vision-abliterated)
   ./download_model.sh pro-q2-imatrix [--token TOKEN]
   ./download_model.sh pro-q4-layers00-30 [--token TOKEN]
   ./download_model.sh pro-q4-layers31-output [--token TOKEN]
@@ -76,8 +84,21 @@ Usage:
 
 Targets:
 
-  headroom128 / preferred
-       Preferred Flash GGUF for 96/128 GB machines on this fork.
+  preferred
+       Preferred GGUF for 96/128 GB machines on this fork — Vision-Exp
+       abliterated IQ2 plus its vision encoder. About 80.76 GiB language
+       plus 0.9 GiB encoder (~81.63 GiB total).
+       audreyt/DeepSeek-V4-Flash-Vision-Exp-Abliterated-GGUF
+         DeepSeek-V4-Flash-Vision-Exp-Abliterated-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf
+       antirez/deepseek-v4-gguf
+         DeepSeek-V4-Flash-Vision-Encoder.gguf (316 tensors, 932857760 bytes)
+       Links ./ds4flash.gguf to the language GGUF. Run with:
+         ./ds4 --vision gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf
+         ./ds4-server --vision gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf
+       Pi users get this automatically via audreyt/pi-ds4.
+
+  headroom128
+       Legacy 0731 Flash GGUF for 96/128 GB machines.
        apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128
        (~81 GiB). Abliterated 0731 DS4 headroom build; links ./ds4flash.gguf.
        This is not Vision-Exp; do not pass --vision with it.
@@ -129,6 +150,11 @@ Targets:
   ds4f-vision-dspark
        Matching DSpark speculative decoding support for Vision Experimental,
        about 5.6 GiB. It is not compatible with the 0731 language checkpoint.
+
+  ds4f-vision-abliterated / preferred / vision-abliterated
+       Preferred Vision-Exp abliterated IQ2 (same quant as ds4f-vision-q2 but
+       with abliteration). About 80.76 GiB language + 0.9 GiB encoder.
+       Downloads both files and links ./ds4flash.gguf. Pi's default.
 
   pro-q2-imatrix
        DeepSeek V4 PRO 0813 q2 imatrix quant, as a single GGUF file. About
@@ -224,7 +250,13 @@ FORCE_HF_DOWNLOAD=0
 FLATTEN_DOWNLOADS=0
 
 case "$MODEL" in
-    headroom128|preferred)
+    preferred)
+        MODEL=preferred
+        MODEL_FILE=$VISION_ABLITERATED_FILE
+        # preferred is Vision-Exp abliterated IQ2 + encoder. Needs cross-repo handling.
+        # Handled specially below; this marks the preferred path.
+        ;;
+    headroom128)
         REPO=$HEADROOM128_REPO
         MODEL_FILE=$HEADROOM128_FILE
         MODEL=headroom128
@@ -263,6 +295,11 @@ case "$MODEL" in
         MODEL_FILE=$DS4F_VISION_DSPARK_FILE
         FORCE_HF_DOWNLOAD=1
         LINK_MODEL=0
+        ;;
+    ds4f-vision-abliterated|vision-abliterated)
+        MODEL=preferred
+        MODEL_FILE=$VISION_ABLITERATED_FILE
+        # alias to preferred (abliterated vision)
         ;;
     pro-q2-imatrix) MODEL_FILE=$PRO_Q2_IMATRIX_FILE ;;
     pro-q4-layers00-30) MODEL_FILE=$PRO_Q4_LAYERS00_30_FILE; LINK_MODEL=0 ;;
@@ -482,6 +519,77 @@ download_one() {
 
     mv "$part" "$out"
 }
+
+# Preferred is Vision-Exp abliterated IQ2 + encoder. Cross-repo pinned download with size verification.
+if [ "$MODEL" = "preferred" ]; then
+    file_size() {
+        stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null || echo 0
+    }
+    curl_hf_preferred() {
+        dest="$1"
+        url="$2"
+        if [ -n "${HF_TOKEN:-}" ]; then
+            curl -fL --progress-meter -C - -H "Authorization: Bearer $HF_TOKEN" -o "$dest" "$url"
+        else
+            curl -fL --progress-meter -C - -o "$dest" "$url"
+        fi
+    }
+    # Language GGUF: audreyt repo, pinned rev, size-checked
+    LANG_PATH="$OUT_DIR/$VISION_ABLITERATED_FILE"
+    ENC_PATH="$OUT_DIR/$DS4F_VISION_ENCODER_FILE"
+    mkdir -p "$OUT_DIR"
+    if [ -s "$LANG_PATH" ] && [ "$(file_size "$LANG_PATH")" = "$VISION_ABLITERATED_BYTES" ]; then
+        echo "Already downloaded: $LANG_PATH"
+    else
+        if [ -e "$LANG_PATH" ]; then
+            echo "Removing size-mismatched language GGUF ($(file_size "$LANG_PATH") != $VISION_ABLITERATED_BYTES)" >&2
+            rm -f "$LANG_PATH"
+        fi
+        echo "Downloading $VISION_ABLITERATED_FILE"
+        echo "from https://huggingface.co/$VISION_ABLITERATED_REPO"
+        echo "If the download stops, run the same command again to resume it."
+        URL="https://huggingface.co/$VISION_ABLITERATED_REPO/resolve/$VISION_ABLITERATED_REV/$VISION_ABLITERATED_FILE"
+        curl_hf_preferred "$LANG_PATH.part" "$URL"
+        mv "$LANG_PATH.part" "$LANG_PATH"
+        if [ "$(file_size "$LANG_PATH")" != "$VISION_ABLITERATED_BYTES" ]; then
+            echo "Language GGUF size $(file_size "$LANG_PATH") != $VISION_ABLITERATED_BYTES" >&2
+            exit 1
+        fi
+    fi
+    # Encoder: antirez repo, pinned rev, size-checked
+    if [ -s "$ENC_PATH" ] && [ "$(file_size "$ENC_PATH")" = "$VISION_ENCODER_BYTES" ]; then
+        echo "Already downloaded: $ENC_PATH"
+    else
+        if [ -e "$ENC_PATH" ]; then
+            echo "Removing size-mismatched encoder ($(file_size "$ENC_PATH") != $VISION_ENCODER_BYTES)" >&2
+            rm -f "$ENC_PATH"
+        fi
+        echo "Downloading $DS4F_VISION_ENCODER_FILE"
+        echo "from https://huggingface.co/$VISION_ENCODER_REPO"
+        echo "If the download stops, run the same command again to resume it."
+        URL="https://huggingface.co/$VISION_ENCODER_REPO/resolve/$VISION_ENCODER_REV/$DS4F_VISION_ENCODER_FILE"
+        curl_hf_preferred "$ENC_PATH.part" "$URL"
+        mv "$ENC_PATH.part" "$ENC_PATH"
+        if [ "$(file_size "$ENC_PATH")" != "$VISION_ENCODER_BYTES" ]; then
+            echo "Encoder size $(file_size "$ENC_PATH") != $VISION_ENCODER_BYTES" >&2
+            exit 1
+        fi
+    fi
+    echo "Encoder ready (server must run with --vision gguf/$DS4F_VISION_ENCODER_FILE)"
+    cd "$ROOT"
+    ln -sfn "$OUT_DIR/$VISION_ABLITERATED_FILE" ds4flash.gguf
+    echo "Linked ./ds4flash.gguf -> $OUT_DIR/$VISION_ABLITERATED_FILE"
+    echo
+    echo "Vision-Exp abliterated language + encoder ready. Run with:"
+    echo "  ./ds4 --vision gguf/$DS4F_VISION_ENCODER_FILE"
+    echo "  ./ds4-server --vision gguf/$DS4F_VISION_ENCODER_FILE --ctx 100000"
+    echo
+    echo "Note: legacy Headroom128 files (if present) are kept. Remove them manually if you need space:"
+    echo "  rm -f gguf/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128.gguf gguf/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128-DSpark-support.gguf"
+    echo
+    echo "Done."
+    exit 0
+fi
 
 if [ -n "$MODEL_FILES" ]; then
     for file in $MODEL_FILES; do

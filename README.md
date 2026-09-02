@@ -115,20 +115,26 @@ experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
 majority of all the model space: the other components (shared experts,
 projections, routing) are left untouched to guarantee quality.
 
-Download one main model. **Prefer the imatrix versions.**
-This fork's 96/128 GB Flash pin is abliterated 0731 Headroom128, not Vision-Exp:
+Download one main model. **Preferred is Vision-Exp abliterated IQ2 plus its encoder** (pi default — out-of-box `pi` has abliterated vision):
 
 ```sh
-./download_model.sh headroom128  # preferred 0731 Flash on this fork (~81 GiB)
-./download_model.sh ds4f-q2      # official aligned 0731, 96/128 GB RAM
-./download_model.sh ds4f-q2-q4   # q2 with the last 6 expert layers at q4
-./download_model.sh ds4f-q4      # >= 256 GB RAM machines
-./download_model.sh ds4f-mxfp4   # native MXFP4 experts, about 156 GB
-./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO 0813 q2 imatrix
+./download_model.sh preferred  # Vision-Exp abliterated IQ2 + encoder (~81.63 GiB, pi default)
+./download_model.sh ds4f-vision-abliterated  # same as preferred
+./download_model.sh ds4f-vision-q2           # Vision-Exp non-abliterated, 96/128 GB (~81 GiB + 0.9 GiB encoder)
+./download_model.sh headroom128              # legacy 0731 abliterated Flash, 96/128 GB (~81 GiB, no vision)
+./download_model.sh ds4f-q2                  # official aligned 0731, 96/128 GB RAM
+./download_model.sh ds4f-q2-q4               # q2 with the last 6 expert layers at q4
+./download_model.sh ds4f-q4                  # >= 256 GB RAM machines
+./download_model.sh ds4f-mxfp4               # native MXFP4 experts, about 156 GB
+./download_model.sh pro-q2-imatrix           # 512 GB RAM machines, PRO 0813 q2 imatrix
 ```
 
-Do not pass `--vision` with Headroom128. Vision-Exp is a different checkpoint
-(`ds4f-vision-q2` plus the 316-tensor encoder GGUF).
+`preferred` downloads both
+`DeepSeek-V4-Flash-Vision-Exp-Abliterated-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf`
+(80.76 GiB, `audreyt/DeepSeek-V4-Flash-Vision-Exp-Abliterated-GGUF` @ `367a1fef`)
+and `DeepSeek-V4-Flash-Vision-Encoder.gguf` (0.89 GiB, 316 tensors, `antirez/deepseek-v4-gguf` @ `f71f23d`), links
+`./ds4flash.gguf` to the language GGUF, and expects `--vision gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf` at runtime.
+Legacy `headroom128` is still available but is not Vision-Exp; do not pass `--vision` with it.
 
 The MXFP4 GGUF preserves DeepSeek's released MXFP4 routed-expert weights rather
 than requantizing them. It runs on Metal and CUDA; Blackwell CUDA devices use
@@ -224,8 +230,15 @@ select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 ## DeepSeek V4 Flash Vision Experimental
 
 Vision-Exp is a separate DeepSeek checkpoint, not the 0731 text model. It uses
-a matching language GGUF and a 0.9 GiB vision encoder. The Q2 model is the
-recommended version for 96 and 128 GB systems:
+a matching language GGUF and a 0.9 GiB vision encoder. The **preferred** model
+on this fork is the abliterated Vision-Exp IQ2 (out-of-box `pi` has abliterated vision):
+
+```sh
+./download_model.sh preferred  # or ds4f-vision-abliterated
+./ds4 --vision gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf
+```
+
+The non-abliterated Q2 is also available for comparison:
 
 ```sh
 ./download_model.sh ds4f-vision-q2
