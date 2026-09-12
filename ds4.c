@@ -39171,6 +39171,8 @@ typedef struct {
     ds41_prefill_row batch, *rows_view;
     ds41_prefill_row carry;
     ds4_gpu_tensor *prefill_tokens;
+    ds4_gpu_tensor *steering_dirs;
+    float steering_attn_scale, steering_ffn_scale;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
@@ -39216,8 +39218,59 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     free(g->prefill_ids);
     free(g->rows_view);
     ds4_gpu_tensor_free(g->prefill_tokens);
+    ds4_gpu_tensor_free(g->steering_dirs);
     memset(g, 0, sizeof(*g));
     g->table[0].fd = g->table[1].fd = -1;
+}
+
+/* Directional steering for the V4.1 graph. The file holds one normalized
+ * hidden-width direction per layer (40 x 5120 for V4.1 Flash); rows without
+ * a calibrated direction must be zero. The attention scale edits the
+ * single-stream attention block output. The FFN scale edits the post-layer
+ * residual across all four hyper-connection copies, which by linearity of
+ * y - scale * v * dot(v, y) equals editing their mean: the site the GLP
+ * refusal vectors are calibrated for. Linearity also keeps both edits
+ * TP-safe, matching the partial sums either side of the exchange. */
+static bool ds41_steering_apply(ds41_gpu_graph *g, ds4_gpu_tensor *x,
+                                uint32_t il, uint32_t rows, float scale) {
+    if (!g || !g->steering_dirs || scale == 0.0f) return true;
+    return ds4_gpu_directional_steering_project_tensor(x, g->steering_dirs,
+        il, DS4_N_EMBD, rows, scale) != 0;
+}
+
+static bool ds41_steering_attn(ds41_gpu_graph *g, ds4_gpu_tensor *x,
+                               uint32_t il, uint32_t rows) {
+    return ds41_steering_apply(g, x, il, rows, g ? g->steering_attn_scale : 0.0f);
+}
+
+static bool ds41_steering_ffn(ds41_gpu_graph *g, ds4_gpu_tensor *x,
+                              uint32_t il, uint32_t rows) {
+    return ds41_steering_apply(g, x, il, rows, g ? g->steering_ffn_scale : 0.0f);
+}
+
+static bool ds41_graph_load_steering(ds41_gpu_graph *g, const char *path,
+                                     float attn_scale, float ffn_scale) {
+    if (attn_scale == 0.0f && ffn_scale == 0.0f) return true;
+    if (!path || !path[0]) {
+        fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
+        return false;
+    }
+    const uint64_t n = (uint64_t)DS4_N_LAYER * DS4_N_EMBD;
+    float *dirs = xmalloc((size_t)n * sizeof(dirs[0]));
+    bool ok = read_f32_binary_file(path, dirs, n);
+    if (ok) {
+        g->steering_dirs = ds4_gpu_tensor_alloc(n * sizeof(dirs[0]));
+        ok = g->steering_dirs != NULL &&
+            ds4_gpu_tensor_write(g->steering_dirs, 0, dirs, n * sizeof(dirs[0])) != 0;
+    }
+    free(dirs);
+    if (!ok) {
+        fprintf(stderr, "ds4: failed to load directional steering vectors from %s\n", path);
+        return false;
+    }
+    g->steering_attn_scale = attn_scale;
+    g->steering_ffn_scale = ffn_scale;
+    return true;
 }
 
 static uint64_t ds41_graph_bytes(uint32_t ctx) {
@@ -39744,8 +39797,10 @@ static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
                                  const ds4_layer_weights *l, uint32_t il) {
-    return ds41_graph_before_attention(g, m, l, il) && ds41_attention(g, m, l, il, false) &&
-        ds41_graph_after_attention(g, m, l);
+    if (!ds41_graph_before_attention(g, m, l, il) ||
+        !ds41_attention(g, m, l, il, false) ||
+        !ds41_steering_attn(g, g->block, il, 1)) return false;
+    return ds41_graph_after_attention(g, m, l);
 }
 
 static bool ds41_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
@@ -40020,8 +40075,9 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
 
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
-    return ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
-        ds41_graph_after_moe(g);
+    if (!ds41_graph_before_moe(g, m, l, il) || !ds41_moe(g, m, l, il, (uint32_t)token) ||
+        !ds41_graph_after_moe(g)) return false;
+    return ds41_steering_ffn(g, g->residual, il, DS4_N_HC);
 }
 
 static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
@@ -40653,6 +40709,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                                                    g->batch.low, count, true);
                 }
                 DS41_STAGE("attention output");
+                if (ok) ok = ds41_steering_attn(g, g->batch.block, il, count);
                 if (ok && batch_hc) ok = ds41_after_attention_batch(&active, m, l, count);
                 DS41_STAGE("hc/ffn norm");
                 for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
@@ -40673,14 +40730,16 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                         ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, count, DS4_V41_BF16) &&
                         ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                             active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-                        ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16);
+                        ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16) &&
+                        ds41_steering_ffn(g, active.residual, il, 4u * count);
                 }
                 for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
 #define DS41_USE_MOE_ROW(name, width) row.name = g->rows_view[t].name;
                     DS41_PREFILL_ROWS(DS41_USE_MOE_ROW)
 #undef DS41_USE_MOE_ROW
                     ok = ds4_gpu_add_tensor(row.block, row.routed, row.shared, DS4_N_EMBD) &&
-                        ds41_bf16(row.block, DS4_N_EMBD) && ds41_graph_after_moe(&row);
+                        ds41_bf16(row.block, DS4_N_EMBD) && ds41_graph_after_moe(&row) &&
+                        ds41_steering_ffn(&row, row.residual, il, DS4_N_HC);
                 }
             }
             DS41_STAGE("hc expand");
@@ -60181,7 +60240,13 @@ static int ds4_engine_collect_sequential_imatrix(
             !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes,
                 ds41_graph_bytes((uint32_t)ctx_size)), false) ||
             !ds41_graph_alloc(&d, &e->model, &e->weights, e->model_path,
-                              (uint32_t)ctx_size, e->ssd_streaming)) return 1;
+                              (uint32_t)ctx_size, e->ssd_streaming) ||
+            !ds41_graph_load_steering(&d, e->directional_steering_file,
+                                      e->directional_steering_attn_scale,
+                                      e->directional_steering_ffn_scale)) {
+            ds41_graph_free(&d);
+            return 1;
+        }
     } else
 #endif
     if (!glm_graph_alloc(&g, &e->model, &e->weights, ctx_size,
@@ -65656,11 +65721,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
             !load_slice && !opt->dspark && !opt->glm_mtp &&
             !opt->first_token_test && !opt->metal_graph_test &&
             (!opt->mtp_path || !opt->mtp_path[0]) &&
-            (!opt->directional_steering_file || !opt->directional_steering_file[0]) &&
             e->power_percent == 100 && opt->context_size <= 1048576;
         if (!supported) {
             fprintf(stderr, "ds4: V4.1 requires Metal inference, with optional tensor parallelism; "
-                            "DSpark, steering and legacy diagnostics are not supported (maximum context 1048576)\n");
+                            "DSpark and legacy diagnostics are not supported (maximum context 1048576)\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -67641,6 +67705,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         s->ds41_graph_ready = true;
         s->ds41_graph.quality = e->quality;
+        if (!ds41_graph_load_steering(&s->ds41_graph, e->directional_steering_file,
+                                      e->directional_steering_attn_scale,
+                                      e->directional_steering_ffn_scale)) {
+            ds4_session_free(s);
+            return 1;
+        }
         if (e->tp.active) {
             s->ds41_graph.tp_world = 2;
             s->ds41_graph.tp_rank = (uint32_t)e->tp.rank;

@@ -15,6 +15,9 @@ With no steering file or zero scales, ds4 follows the normal inference path.
 The file shape depends on the model:
 
 - DeepSeek V4 Flash: `43 x 4096`.
+- DeepSeek V4.1 Flash: `40 x 5120`. The FFN scale edits the post-layer
+  residual across the hyper-connection copies (the GLP refusal-vector site);
+  the attention scale edits the attention block output.
 - GLM 5.3 Flash: `45 x 4096`. The separate MTP predictor layer is omitted.
 
 GLM 5.2 steering is not implemented.

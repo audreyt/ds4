@@ -22,6 +22,7 @@ from pathlib import Path
 
 MODEL_PROFILES = {
     "deepseek-v4-flash": (43, 4096),
+    "deepseek-v41-flash": (40, 5120),
     "glm-5.3-flash": (45, 4096),
 }
 
