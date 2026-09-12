@@ -2,6 +2,7 @@
 #include "ds4_image.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +56,21 @@ int main(int argc, char **argv) {
             ds4_engine_close(engine);
             return 1;
         }
+        const size_t count = (size_t)next.token_count * (size_t)ds4_engine_embd_dim(engine);
+        bool valid = next.data != NULL && count != 0;
+        for (size_t j = 0; valid && j < count; j++)
+            valid = isfinite(next.data[j]);
+        if (valid && embedding.data) {
+            valid = next.token_count == embedding.token_count &&
+                memcmp(next.data, embedding.data, count * sizeof(float)) == 0;
+        }
+        if (!valid) {
+            fprintf(stderr, "vision embedding is nonfinite, empty, or not repeatable\n");
+            ds4_vision_embedding_free(&next);
+            ds4_vision_embedding_free(&embedding);
+            ds4_engine_close(engine);
+            return 1;
+        }
         if (repeats > 1u) {
             fprintf(stderr, "vision encode %u/%u: %.3f s\n",
                     i + 1u, repeats, wall_seconds() - start);
@@ -69,7 +85,7 @@ int main(int argc, char **argv) {
         ds4_engine_close(engine);
         return 1;
     }
-    size_t values = (size_t)embedding.token_count * 4096u;
+    size_t values = (size_t)embedding.token_count * (size_t)ds4_engine_embd_dim(engine);
     if (fwrite(embedding.data, sizeof(float), values, fp) != values ||
         fclose(fp) != 0) {
         fprintf(stderr, "cannot write %s\n", argv[4]);

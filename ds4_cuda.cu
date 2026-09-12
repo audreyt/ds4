@@ -234,6 +234,11 @@ static_assert(DS4_MAX_GPUS == 16, "DS4_MAX_GPUS stack tables sized for 16");
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
 int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
+static bool g_device_is_spark = false;
+
+extern "C" int ds4_gpu_device_is_spark(void) {
+    return g_n_gpus == 1 && g_device_is_spark;
+}
 
 /* Per-pair pinned-host bounce buffers, indexed [src][dst]. Lazily grown
  * to the largest copy seen for that pair. Each pair is its own allocation
@@ -2598,6 +2603,8 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         if (!cuda_ok(cudaSetDevice(c->device_id), "init set device")) return 0;
         cudaDeviceProp prop;
         if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
+            if (i == 0) g_device_is_spark =
+                prop.integrated && prop.major == 12 && prop.minor == 1;
             fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d\n",
                     prop.name, prop.major, prop.minor, c->device_id);
         }
@@ -2830,6 +2837,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_stream_selected_cache_release();
     cuda_stream_selected_stage_release();
     g_n_gpus = 0;
+    g_device_is_spark = false;
     g_cublas_ready = 0;
 
     /* Per-device selective cache teardown (selective model cache). */
@@ -4989,49 +4997,6 @@ __device__ __forceinline__ static int32_t dot_i8_block(const int8_t *a, const in
     int32_t dot = 0;
     for (uint64_t i = 0; i < n; i++) dot += (int32_t)a[i] * (int32_t)b[i];
     return dot;
-}
-
-__global__ static DS4_CUDA_UNUSED void matmul_q8_0_kernel(
-        float *out,
-        const unsigned char *w,
-        const float *x,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t n_tok) {
-    uint64_t row = (uint64_t)blockIdx.x;
-    uint64_t tok = (uint64_t)blockIdx.y;
-    if (row >= out_dim || tok >= n_tok) return;
-    const uint64_t blocks = (in_dim + 31) / 32;
-    const unsigned char *wr = w + row * blocks * 34;
-    const float *xr = x + tok * in_dim;
-    float acc = 0.0f;
-
-    for (uint64_t b = threadIdx.x; b < blocks; b += blockDim.x) {
-        uint64_t i0 = b * 32;
-        uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
-        float amax = 0.0f;
-        for (uint64_t i = 0; i < bn; i++) amax = fmaxf(amax, fabsf(xr[i0 + i]));
-        float d = amax / 127.0f;
-        float id = d != 0.0f ? 1.0f / d : 0.0f;
-        const __half *scale_h = (const __half *)(wr + b * 34);
-        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
-        int dot = 0;
-        for (uint64_t i = 0; i < bn; i++) {
-            int q = (int)lrintf(xr[i0 + i] * id);
-            q = q > 127 ? 127 : (q < -128 ? -128 : q);
-            dot += (int)qs[i] * q;
-        }
-        acc += __half2float(*scale_h) * d * (float)dot;
-    }
-
-    __shared__ float partial[256];
-    partial[threadIdx.x] = acc;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
 }
 
 __global__ static void quantize_q8_0_f32_kernel(
@@ -14716,10 +14681,12 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
               CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
               in_dim, out_dim, 1u, aligned_bytes)
         : NULL;
-    if (aligned && n_tok == 1u) {
+    if (aligned && (n_tok == 1u ||
+                    (n_tok <= 8u && ds4_gpu_device_is_spark() &&
+                     !g_q8_dequant_gemm_enabled))) {
         const int rc = ds4_mmq_q8_0_aligned_dense_vec(
             aligned, (const float *)x->ptr, (float *)out->ptr,
-            (int)out_dim, 1, (int)in_dim, cuda_decode_stream());
+            (int)out_dim, (int)n_tok, (int)in_dim, cuda_decode_stream());
         if (rc == 0) return 1;
     }
     if (aligned && n_tok >= 512u && out_dim >= 2048u &&
@@ -24191,7 +24158,9 @@ static int routed_moe_launch(
             const cudaStream_t aligned_stream =
                 n_tokens == 1u ? cuda_decode_stream() : (cudaStream_t)0;
             int rc;
-            if (n_tokens == 1u) {
+            if (n_tokens == 1u ||
+                (n_tokens <= 8u && ds4_gpu_device_is_spark() &&
+                 !g_q8_dequant_gemm_enabled && expert_in_dim % 1024u == 0)) {
                 rc = ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
                     gate_aligned, up_aligned,
                     (const float *)x->ptr,
@@ -28137,6 +28106,7 @@ __global__ static void glm_dense_attn_causal_softmax_f16_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
 
     float local_sum = 0.0f;
     for (uint32_t col = threadIdx.x; col < visible; col += blockDim.x) {
@@ -28491,7 +28461,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
     return cuda_ok(cudaGetLastError(), "glm attn lora causal launch");
 }
 
-extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_tensor(
         ds4_gpu_tensor       *lora_out,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *qk_low,
@@ -28557,6 +28527,25 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
                 attn_factor, beta_fast, beta_slow, scale);
     }
     return cuda_ok(cudaGetLastError(), "glm attn lora selected launch");
+}
+
+extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+        ds4_gpu_tensor *lora_out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache,
+        const ds4_gpu_tensor *selected,
+        uint32_t n_tokens, uint32_t n_selected, uint32_t cache_cap,
+        bool cache_f16, uint32_t n_head, uint32_t kv_lora_dim,
+        uint32_t qk_nope, uint32_t qk_rope, uint32_t n_ctx_orig,
+        float freq_base, float freq_scale, float ext_factor,
+        float attn_factor, float beta_fast, float beta_slow) {
+    return ds4_gpu_glm_attention_indexed_batch_lora_tensor(
+        lora_out, q, qk_low, kv_lora_cache, k_rope_cache, selected,
+        n_tokens, n_selected, cache_cap, cache_f16, n_head, kv_lora_dim,
+        qk_nope, qk_rope, n_ctx_orig, freq_base, freq_scale, ext_factor,
+        attn_factor, beta_fast, beta_slow);
 }
 
 extern "C" int ds4_gpu_glm_attention_indexed_batch_typed_tensor(
