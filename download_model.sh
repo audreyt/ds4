@@ -15,6 +15,8 @@ DS41_VISION_FILE="DeepSeek-V4.1-Flash-Vision.gguf"
 DS41_1017_REPO="audreyt/deepseek-v4.1-flash-1017-gguf"
 DS41_1017_Q2_FILE="DeepSeek-V4.1-Flash-1017-Q2.gguf"
 DS41_1017_VISION_FILE="DeepSeek-V4.1-Flash-1017-Vision.gguf"
+DS41_ABL_REPO="audreyt/DeepSeek-V4.1-Flash-Abliterated-GGUF"
+DS41_ABL_Q2_FILE="DeepSeek-V4.1-Flash-Abliterated-Q2-imatrix.gguf"
 HEADROOM128_REPO="apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128"
 HEADROOM128_FILE="DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128.gguf"
 HEADROOM128_DSPARK_SUPPORT_FILE="DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128-DSpark-support.gguf"
@@ -85,6 +87,7 @@ Usage:
   ./download_model.sh ds41f-vision [--token TOKEN]
   ./download_model.sh ds41f-1017-q2 [--token TOKEN]
   ./download_model.sh ds41f-1017-vision [--token TOKEN]
+  ./download_model.sh ds41f-abliterated-q2 [--token TOKEN]
   ./download_model.sh pro-q2-imatrix [--token TOKEN]
   ./download_model.sh pro-q4-layers00-30 [--token TOKEN]
   ./download_model.sh pro-q4-layers31-output [--token TOKEN]
@@ -200,6 +203,12 @@ Targets:
   ds41f-1017-vision
        1017 vision encoder, about 0.9 GiB. Pairs with either 1017 Q2
        (ds41f-q2 or ds41f-1017-q2). Does not update ./ds4flash.gguf.
+
+  ds41f-abliterated-q2
+       Abliterated V4.1 Flash imatrix Q2, about 341 GiB on disk. Same layout
+       and memory profile as ds41f-q2, with community refusal ablation baked
+       in (Heretic, attention out-projs). Metal only, SSD streaming on one
+       128 GB Mac. Small measured quality cost vs stock; see the model card.
 
   pro-q2-imatrix
        DeepSeek V4 PRO 0813 q2 imatrix quant, as a single GGUF file. About
@@ -394,6 +403,11 @@ case "$MODEL" in
         MODEL_FILE=$DS41_1017_VISION_FILE
         FORCE_HF_DOWNLOAD=1
         LINK_MODEL=0
+        ;;
+    ds41f-abliterated-q2)
+        REPO=$DS41_ABL_REPO
+        MODEL_FILE=$DS41_ABL_Q2_FILE
+        FORCE_HF_DOWNLOAD=1
         ;;
     pro-q2-imatrix) MODEL_FILE=$PRO_Q2_IMATRIX_FILE ;;
     pro-q4-layers00-30) MODEL_FILE=$PRO_Q4_LAYERS00_30_FILE; LINK_MODEL=0 ;;
