@@ -229,8 +229,11 @@ static float ds4q_make_qkx3_quants(int n, int nmax, const float *x, const float 
         iscale = (rmin + rdelta * is + nmax) / (max - min);
         float sum_l = 0, sum_l2 = 0, sum_xl = 0;
         for (int i = 0; i < n; i++) {
-            int l = ds4q_nearest_int(iscale * (x[i] - min));
-            l = DS4Q_MAX(0, DS4Q_MIN(nmax, l));
+            // A collapsed weighted fit (near-zero importance on the only
+            // nonzero values) can move min next to max, pushing iscale past
+            // nearest_int's range. Those values clamp to 0 or nmax anyway.
+            float v = iscale * (x[i] - min);
+            int l = v <= 0.0f ? 0 : v >= nmax ? nmax : ds4q_nearest_int(v);
             Laux[i] = l;
             float w = weights ? weights[i] : x[i] * x[i];
             sum_l += w * l;

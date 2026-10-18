@@ -92,6 +92,15 @@ class ConversionTests(unittest.TestCase):
             weights = np.linspace(.01, 2, 256, dtype=np.float32)
             self.assertEqual(self.q.encode(actual, qt, weights), self.q.encode(expected, qt, weights))
 
+    def test_weighted_q2_k_collapsed_fit(self):
+        # A barely-routed expert gave its one nonzero value ~1e-29 importance;
+        # the weighted fit collapsed and the next search step overflowed.
+        values = np.zeros((1, 256), np.float32)
+        values[0, 3] = -0.125
+        weights = np.full(256, 1e-3, np.float32)
+        weights[3] = 1e-29
+        self.assertEqual(len(self.q.encode(values, QTYPE_Q2_K, weights)), qtype_nbytes(QTYPE_Q2_K, (256, 1)))
+
     def test_engram_pack(self):
         rng = np.random.default_rng(17)
         weights = rng.integers(0, 255, (16385, 256), dtype=np.uint8)
