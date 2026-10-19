@@ -160,6 +160,20 @@ Pass `--quant q4` to the audit as well when checking a Q4 file.
 The audit checks the complete layout, all non-expert tensors, sampled experts
 and native Engram rows. It does not replace [inference quality tests](quality-testing/deepseek-v4.1-flash-20260910/README.md).
 
+The vision encoder is a separate BF16 sidecar. Convert it from the same snapshot
+with the same revision; `--vision` refuses a sidecar whose revision differs from
+the language GGUF's:
+
+```sh
+python3 gguf-tools/deepseek41_vision.py \
+  --hf models/DeepSeek-V4.1-Flash \
+  --source-revision df42c109f1defefcbfcedbe7d905718a12266e40 \
+  --out gguf/DeepSeek-V4.1-Flash-Vision.gguf
+```
+
+Replace `--out FILE` with `--validate FILE --verify-payload` to check an existing
+sidecar byte for byte against the snapshot.
+
 ## Convert A DSpark Support Checkpoint
 
 The DSpark Flash checkpoint is published as Hugging Face safetensors and stores

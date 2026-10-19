@@ -2,12 +2,14 @@
 """Copy the released DeepSeek V4.1 Flash vision encoder into a separate GGUF.
 
 All 266 tensors remain BF16, byte for byte. Visual router biases are already
-part of the language GGUF produced by deepseek41_quantize.py.
+part of the language GGUF produced by deepseek41_quantize.py. ds4 loads the
+sidecar only with a language GGUF converted from the same --source-revision.
 """
 
 import argparse
 import json
 from pathlib import Path
+import re
 import sys
 
 from deepseek4_vision import create_gguf, print_summary, validate_gguf
@@ -16,7 +18,6 @@ from glm53_quantize import (
     kv_f32, kv_string, kv_u32, qtype_nbytes,
 )
 
-SOURCE_REVISION = "df42c109f1defefcbfcedbe7d905718a12266e40"
 SOURCE_URL = "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash"
 
 
@@ -72,7 +73,7 @@ def build_plan(db):
     return plan
 
 
-def sidecar_metadata(hf_dir):
+def sidecar_metadata(hf_dir, source_revision):
     config = json.loads((Path(hf_dir) / "config.json").read_text())
     if config.get("model_type") != "deepseek_v41" or config.get("image_token_id") != 129264:
         raise ValueError("expected the DeepSeek V4.1 Flash checkpoint")
@@ -92,7 +93,7 @@ def sidecar_metadata(hf_dir):
         kv_string("general.name", "DeepSeek V4.1 Flash Vision Encoder"),
         kv_u32("general.alignment", GGUF_ALIGNMENT),
         kv_string("general.source.url", SOURCE_URL),
-        kv_string("general.source.revision", SOURCE_REVISION),
+        kv_string("general.source.revision", source_revision),
         kv_string(f"{prefix}.checkpoint_variant", "v4.1-flash"),
         kv_f32(f"{prefix}.rope.freq_base", 10000),
         kv_f32(f"{prefix}.attention.layer_norm_rms_epsilon", 1e-6),
@@ -111,6 +112,8 @@ def sidecar_metadata(hf_dir):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hf", required=True, help="official V4.1 Flash snapshot")
+    parser.add_argument("--source-revision", required=True,
+                        help="Hugging Face commit of the --hf snapshot")
     output = parser.add_mutually_exclusive_group(required=True)
     output.add_argument("--out", help="write this vision GGUF")
     output.add_argument("--validate", metavar="GGUF")
@@ -118,9 +121,11 @@ def main():
     parser.add_argument("--verify-payload", action="store_true")
     parser.add_argument("--expected-sha256")
     args = parser.parse_args()
+    if not re.fullmatch(r"[0-9a-f]{40}", args.source_revision):
+        parser.error("source revision must be a full commit hash")
     if (args.verify_payload or args.expected_sha256) and not args.validate:
         parser.error("--verify-payload and --expected-sha256 require --validate")
-    records = sidecar_metadata(args.hf)
+    records = sidecar_metadata(args.hf, args.source_revision)
     db = SourceDB(args.hf, validate_inventory, lambda _: None)
     try:
         plan = build_plan(db)

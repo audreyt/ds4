@@ -6637,17 +6637,13 @@ static void deepseek4_vision_weights_bind(
         ds4_deepseek4_vision_weights *w,
         const ds4_model *m) {
     const bool v41 = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
-    const char *revision = v41 ? "df42c109f1defefcbfcedbe7d905718a12266e40" :
-                                "e46e16bf6035c6f317eb2ac7458eb0362926d402";
     const uint32_t projection = v41 ? 5120u : 4096u;
-    ds4_str arch = {0}, source_revision = {0}, variant = {0};
+    ds4_str arch = {0}, variant = {0};
     if (!model_get_string(m, "general.architecture", &arch) ||
         !ds4_streq(arch, "deepseek4-vision")) {
         ds4_die("--vision file is not a DeepSeek V4 vision encoder GGUF");
     }
-    if (!model_get_string(m, "general.source.revision", &source_revision) ||
-        !ds4_streq(source_revision, revision) ||
-        !model_get_string(m, "deepseek4-vision.checkpoint_variant", &variant) ||
+    if (!model_get_string(m, "deepseek4-vision.checkpoint_variant", &variant) ||
         !ds4_streq(variant, v41 ? "v4.1-flash" : "vision-exp")) {
         ds4_die("DeepSeek vision sidecar does not match the language checkpoint");
     }
@@ -65775,6 +65771,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
         } else {
             deepseek4_vision_weights_bind(
                     &e->deepseek4_vision_weights, &e->vision_model);
+            /* Pair the encoder with the language GGUF by checkpoint revision:
+             * V4.1 Flash revisions such as 1017 keep this encoder layout but
+             * ship retrained encoder weights. Vision-Exp language loading
+             * already pins its own revision. */
+            ds4_str vision_revision = {0}, language_revision = {0};
+            if (!model_get_string(&e->vision_model, "general.source.revision",
+                                  &vision_revision) ||
+                !model_get_string(&e->model, "general.source.revision",
+                                  &language_revision) ||
+                !ds4_str_eq(vision_revision, language_revision)) {
+                ds4_die("DeepSeek vision sidecar does not match the language checkpoint");
+            }
             e->vision_start_token = DS4_N_VOCAB +
                                     DS4_DEEPSEEK4_IMAGE_START;
             e->vision_image_token = DS4_N_VOCAB +
