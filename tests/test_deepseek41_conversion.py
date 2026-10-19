@@ -101,6 +101,15 @@ class ConversionTests(unittest.TestCase):
         weights[3] = 1e-29
         self.assertEqual(len(self.q.encode(values, QTYPE_Q2_K, weights)), qtype_nbytes(QTYPE_Q2_K, (256, 1)))
 
+    def test_weighted_iq2_xxs_collapsed_fit(self):
+        # A lone value with ~1e-20 importance among ~1e-12 weights collapses the
+        # IQ2_XXS fit the same way and used to abort in nearest_int.
+        values = np.zeros((1, 256), np.float32)
+        values[0, 199] = -0.09935260564088821
+        weights = np.full(256, 6.848545710570753e-13, np.float32)
+        weights[199] = 2.717186207129834e-20
+        self.assertEqual(len(self.q.encode(values, QTYPE_IQ2_XXS, weights)), qtype_nbytes(QTYPE_IQ2_XXS, (256, 1)))
+
     def test_engram_pack(self):
         rng = np.random.default_rng(17)
         weights = rng.integers(0, 255, (16385, 256), dtype=np.uint8)

@@ -314,8 +314,11 @@ static float ds4q_make_qp_quants(int n, int nmax, const float *x, uint8_t *L, co
             float slx = sumlx - w * x[i] * L[i];
             float sl2 = suml2 - w * L[i] * L[i];
             if (slx > 0 && sl2 > 0) {
-                int new_l = ds4q_nearest_int(x[i] * sl2 / slx);
-                new_l = DS4Q_MIN(nmax, new_l);
+                // When one value carries nearly all the weight, removing it
+                // leaves slx at rounding noise and the quotient can pass
+                // nearest_int's range. Such levels clamp to nmax anyway.
+                float v = x[i] * sl2 / slx;
+                int new_l = v >= nmax ? nmax : ds4q_nearest_int(v);
                 if (new_l != L[i]) {
                     slx += w * x[i] * new_l;
                     sl2 += w * new_l * new_l;
@@ -967,8 +970,11 @@ static void ds4q_write_iq2_xxs_block(const float *x, uint8_t *y, const float *qu
             for (int k = 0; k < 4; k++) {
                 uint16_t u = 0;
                 for (int i = 0; i < 8; i++) {
-                    int l = ds4q_nearest_int(0.5f * (id * xval[8 * k + i] - 1));
-                    l = DS4Q_MAX(0, DS4Q_MIN(k_max_q - 1, l));
+                    // A collapsed fit leaves eff_max near zero, so id * xval
+                    // can pass nearest_int's range (or be NaN for zero xval
+                    // once id overflows). Those levels clamp to 0 or k_max_q-1.
+                    float v = 0.5f * (id * xval[8 * k + i] - 1);
+                    int l = !(v > 0) ? 0 : v >= k_max_q - 1 ? k_max_q - 1 : ds4q_nearest_int(v);
                     Laux[8 * k + i] = (uint8_t)l;
                     u |= (uint16_t)(l << (2 * i));
                 }
@@ -998,8 +1004,8 @@ static void ds4q_write_iq2_xxs_block(const float *x, uint8_t *y, const float *qu
             for (int k = 0; k < 4; k++) {
                 uint16_t u = 0;
                 for (int i = 0; i < 8; i++) {
-                    int l = ds4q_nearest_int(0.5f * (id * xval[8 * k + i] - 1));
-                    l = DS4Q_MAX(0, DS4Q_MIN(k_max_q - 1, l));
+                    float v = 0.5f * (id * xval[8 * k + i] - 1);
+                    int l = !(v > 0) ? 0 : v >= k_max_q - 1 ? k_max_q - 1 : ds4q_nearest_int(v);
                     u |= (uint16_t)(l << (2 * i));
                 }
                 int grid_index = map[u];
@@ -1049,8 +1055,9 @@ static void ds4q_write_iq2_xxs_block(const float *x, uint8_t *y, const float *qu
     memcpy(y + d_off, &hd, sizeof(hd));
     float id = 1 / d;
     for (int ib = 0; ib < QK_K / block_size; ib++) {
-        int l = ds4q_nearest_int(0.5f * (id * scales[ib] - 1));
-        l = DS4Q_MAX(0, DS4Q_MIN(15, l));
+        // A denormal d makes id infinite, and inf * 0 is NaN for empty blocks.
+        float v = 0.5f * (id * scales[ib] - 1);
+        int l = !(v > 0) ? 0 : v >= 15 ? 15 : ds4q_nearest_int(v);
         q2[2 * ib + 1] |= (uint32_t)l << 28;
     }
     memcpy(y + qs_off, q2, QK_K / 4);
