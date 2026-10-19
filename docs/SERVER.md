@@ -60,6 +60,12 @@ preallocates independent KV states and queues requests when all slots are busy.
 Choose context and slot count together: a context that fits once may not fit
 four times. Idle slots can be cached before reuse; active requests are not evicted.
 
+Where the model supports it, the slots share one prefill workspace instead of
+each keeping its own, so an extra slot costs only its caches. That matters most
+for Qwen3.8 Flash Next, whose transients are sized by the prefill chunk rather
+than by the context: at the default chunk they run to several GiB per session.
+The startup line reports both figures.
+
 | Backend/model | Decode execution |
 | --- | --- |
 | Metal, resident Flash | Native shared-expert/QKV batching where supported |
@@ -68,6 +74,7 @@ four times. Idle slots can be cached before reuse; active requests are not evict
 | Metal SSD streaming, V4.1 Flash | Ordered fallback |
 | Metal, GLM 5.2 | Ordered fallback |
 | Metal, GLM 5.3 | Native batching through 2051 visible tokens; ordered fallback afterward |
+| Metal, Qwen3.8 Flash Next | Native batching of the shared work; recurrent state, caches and PLE history stay per session |
 | CUDA, supported multi-GPU Flash TP layout | Native grouped decode and mixed prefill/decode |
 | Single-GPU CUDA, including Spark | Ordered fallback |
 
@@ -78,7 +85,10 @@ use the ordered fallback.
 
 Long prefills yield to active decoders in bounded intervals, normally 128
 tokens. `--mixed-prefill-quantum N` changes that interval for testing.
-Session-batched serving uses ordinary target decoding, not MTP/DSpark.
+Session-batched serving uses ordinary target decoding, except Qwen3.8 on
+Metal, where `--mtp` also batches speculative decoding. Its
+`--mtp-exact-sampling` mode uses ordinary batches for nonzero-temperature
+requests. Other models do not use MTP/DSpark while session batching is active.
 For the eight-L40S example, see [CUDA GPUs](CUDA_MULTI_GPU.md#serve-multiple-users).
 
 ## Images

@@ -32,6 +32,9 @@ static void usage(const char *prog) {
             "[--max-cases N] "
             "[--continued-prefill N] "
             "[--session-batch N] "
+#ifdef DS4_TEST_HOOKS
+            "[--mtp-model FILE] [--verify-batch 1..6] "
+#endif
             "[--tensor-parallel --role coordinator --listen HOST PORT "
             "[--transport auto|rdma|tcp]]\n",
             prog);
@@ -140,6 +143,8 @@ typedef struct {
 
 typedef struct {
     double logprob;
+    unsigned char *bytes;
+    int len;
     api_alt *alts;
     int n_alts;
     int cap_alts;
@@ -306,6 +311,7 @@ static void api_alt_free(api_alt *alt) {
 }
 
 static void api_pos_free(api_pos *pos) {
+    free(pos->bytes);
     for (int i = 0; i < pos->n_alts; i++) api_alt_free(&pos->alts[i]);
     free(pos->alts);
     memset(pos, 0, sizeof(*pos));
@@ -418,6 +424,13 @@ static bool api_parse_pos(const char **pp, api_pos *pos) {
         p++;
         if (strcmp(key, "logprob") == 0) {
             if (!json_number(&p, &pos->logprob)) return false;
+        } else if (strcmp(key, "bytes") == 0) {
+            free(pos->bytes);
+            pos->bytes = NULL;
+            pos->len = 0;
+            p = json_ws(p);
+            if (strncmp(p, "null", 4) == 0) p += 4;
+            else if (!json_bytes_array(&p, &pos->bytes, &pos->len)) return false;
         } else if (strcmp(key, "top_logprobs") == 0) {
             if (!api_parse_alt_array(&p, pos)) return false;
         } else {
@@ -480,10 +493,32 @@ static bool api_ref_load(const char *path, api_ref *ref) {
     return ok;
 }
 
+/* Equal token counts do not establish equal token boundaries. In particular,
+ * some APIs replace partial UTF-8 token bytes with replacement characters. */
+static bool api_ref_matches_target(ds4_engine *engine, const api_ref *ref,
+                                   const ds4_tokens *target) {
+    if (ref->n_pos != target->len) return false;
+    for (int i = 0; i < target->len; i++) {
+        const api_pos *pos = &ref->pos[i];
+        if (!pos->bytes || pos->len <= 0) return false;
+        size_t len = 0;
+        char *text = ds4_token_text(engine, target->v[i], &len);
+        bool same = text && len == (size_t)pos->len &&
+                    !memcmp(text, pos->bytes, len);
+        free(text);
+        if (!same) return false;
+    }
+    return true;
+}
+
 static int api_alt_token_id(ds4_engine *engine, const api_alt *alt) {
     if (!alt || !alt->bytes || alt->len <= 0) return -1;
     for (int i = 0; i < alt->len; i++) {
         if (alt->bytes[i] == 0) return -1;
+        /* A provider may have lost the original bytes of a split Unicode
+         * token. Do not mistake its replacement character for a token ID. */
+        if (i + 2 < alt->len && alt->bytes[i] == 0xef &&
+            alt->bytes[i + 1] == 0xbf && alt->bytes[i + 2] == 0xbd) return -1;
     }
     char *text = malloc((size_t)alt->len + 1);
     if (!text) die("out of memory");
@@ -506,9 +541,31 @@ static int api_alt_token_id(ds4_engine *engine, const api_alt *alt) {
     return id;
 }
 
+static int api_top1_update(ds4_engine *engine, const api_pos *pos,
+                           int greedy, api_metrics *metrics) {
+    double best = -INFINITY;
+    for (int j = 0; j < pos->n_alts; j++) {
+        if (pos->alts[j].logprob > best) best = pos->alts[j].logprob;
+    }
+
+    /* Only exact maxima qualify, even if none map. Prefer greedy among tied
+     * maxima so a position counts once and any mapped maximum can match. */
+    int ref = -1;
+    for (int j = 0; j < pos->n_alts; j++) {
+        if (pos->alts[j].logprob != best) continue;
+        const int tok = api_alt_token_id(engine, &pos->alts[j]);
+        if (tok >= 0 && (ref < 0 || tok == greedy)) ref = tok;
+    }
+    if (ref >= 0) {
+        metrics->top1_count++;
+        if (ref == greedy) metrics->top1_match++;
+    }
+    return ref;
+}
+
 static bool local_logits(ds4_session *session, float *logits, int n_vocab,
                          double *logsum, int *argmax) {
-    if (ds4_session_copy_logits(session, logits, n_vocab) != n_vocab) return false;
+    if (session && ds4_session_copy_logits(session, logits, n_vocab) != n_vocab) return false;
     float max_logit = -INFINITY;
     int best = -1;
     for (int i = 0; i < n_vocab; i++) {
@@ -637,6 +694,10 @@ int main(int argc, char **argv) {
     int max_cases = 0;
     int continued_prefill = 0;
     int session_count = 1;
+#ifdef DS4_TEST_HOOKS
+    const char *mtp_path = NULL;
+    int verify_batch = 0;
+#endif
     ds4_dist_options dist = {0};
     ds4_tp_options tp = {0};
 
@@ -661,6 +722,17 @@ int main(int argc, char **argv) {
         }
         if (tp_parse == DS4_TP_CLI_MATCHED) continue;
 
+#ifdef DS4_TEST_HOOKS
+        if (!strcmp(arg, "--mtp-model")) {
+            mtp_path = need_arg(&i, argc, argv, arg);
+            continue;
+        }
+        if (!strcmp(arg, "--verify-batch")) {
+            verify_batch = parse_positive_int(need_arg(&i, argc, argv, arg), arg);
+            if (verify_batch > 6) die("--verify-batch must be between 1 and 6");
+            continue;
+        }
+#endif
         if (!strcmp(arg, "--quality")) {
             quality = true;
         } else if (!strcmp(arg, "--rendered-prompt")) {
@@ -710,19 +782,27 @@ int main(int argc, char **argv) {
         }
     }
     if (ctx_size < 1024) ctx_size = 1024;
-
     char tp_err[256] = {0};
     if (!ds4_tp_adopt_distributed_options(&tp, &dist,
                                           tp_err, sizeof(tp_err))) {
         fprintf(stderr, "score_official: %s\n", tp_err);
         return 2;
     }
+#ifdef DS4_TEST_HOOKS
+    if (verify_batch && (!mtp_path || session_count != 1 ||
+                         dist.role != DS4_DISTRIBUTED_NONE))
+        die("--verify-batch requires --mtp-model and one session without pipeline execution");
+#endif
     if (tp.role == DS4_TP_WORKER || dist.role == DS4_DISTRIBUTED_WORKER) {
         die("score_official: start workers with ./ds4");
     }
 
     ds4_engine_options opt = {
         .model_path = model_path,
+#ifdef DS4_TEST_HOOKS
+        .mtp_path = mtp_path,
+        .dspark = mtp_path != NULL,
+#endif
 #ifdef __APPLE__
         .backend = DS4_BACKEND_METAL,
 #else
@@ -731,6 +811,8 @@ int main(int argc, char **argv) {
         .n_threads = 0,
         .context_size = ctx_size,
         .placement_ctx_hint = ctx_size,
+        .placement_session_count_hint = session_count,
+        .share_session_prefill_workspace = session_count > 1,
         .ssd_streaming_cache_experts = ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = ssd_streaming_cache_bytes,
         .ssd_streaming_preload_experts = ssd_streaming_preload_experts,
@@ -830,6 +912,10 @@ int main(int argc, char **argv) {
     const int n_vocab = ds4_engine_vocab_size(engine);
     float *logits = malloc((size_t)n_vocab * sizeof(logits[0]));
     if (!logits) die("out of memory");
+#ifdef DS4_TEST_HOOKS
+    float *verify_logits = verify_batch ? malloc((size_t)(verify_batch + 1) * n_vocab * sizeof(float)) : NULL;
+    if (verify_batch && !verify_logits) die("out of memory");
+#endif
 
     FILE *mf = fopen(manifest_path, "rb");
     if (!mf) {
@@ -880,11 +966,19 @@ int main(int argc, char **argv) {
 
         ds4_tokens prompt = {0};
         ds4_tokens target = {0};
-        if (rendered_prompt)
+        if (rendered_prompt) {
             ds4_tokenize_rendered_chat(engine, prompt_text, &prompt);
-        else
+        } else {
             ds4_encode_chat_prompt(engine, NULL, prompt_text, DS4_THINK_NONE, &prompt);
+        }
         ds4_tokenize_text(engine, cont_text, &target);
+        if (getenv("DS4_SCORE_DEBUG")) {
+            fprintf(stderr, "%s prompt ids (%d):", id, prompt.len);
+            for (int i = 0; i < prompt.len; i++) fprintf(stderr, " %d", prompt.v[i]);
+            fprintf(stderr, "\n%s target ids (%d):", id, target.len);
+            for (int i = 0; i < target.len; i++) fprintf(stderr, " %d", target.v[i]);
+            fprintf(stderr, "\n");
+        }
 
         if (prompt.len + target.len + 1 >= ctx_size) {
             fprintf(stderr, "%s exceeds ctx=%d\n", id, ctx_size);
@@ -899,6 +993,10 @@ int main(int argc, char **argv) {
                         "%s warning: API token count %d != local target tokens %d; "
                         "API logprob agreement skipped\n",
                         id, ref.n_pos, target.len);
+            } else if (!api_ref_matches_target(engine, &ref, &target)) {
+                fprintf(stderr,
+                        "%s warning: API output bytes do not match local token boundaries; "
+                        "API logprob agreement skipped\n", id);
             } else {
                 api_aligned = true;
             }
@@ -926,7 +1024,24 @@ int main(int argc, char **argv) {
         for (int i = 0; i < target.len; i++) {
             double logsum = 0.0;
             int greedy = -1;
-            if (!local_logits(session, logits, n_vocab, &logsum, &greedy)) {
+            ds4_session *logit_session = session;
+#ifdef DS4_TEST_HOOKS
+            if (verify_batch) {
+                const int row = i % verify_batch;
+                if (!row) {
+                    const int rows = target.len - i < verify_batch ? target.len - i : verify_batch;
+                    if (ds4_session_copy_logits(session, verify_logits, n_vocab) != n_vocab ||
+                        ds4_test_ds41_verify_tokens(session, target.v + i, rows,
+                            verify_logits + n_vocab, err, sizeof(err))) {
+                        fprintf(stderr, "%s verify failed at token %d: %s\n", id, i, err);
+                        return 1;
+                    }
+                }
+                memcpy(logits, verify_logits + (size_t)row * n_vocab, (size_t)n_vocab * sizeof(float));
+                logit_session = NULL;
+            }
+#endif
+            if (!local_logits(logit_session, logits, n_vocab, &logsum, &greedy)) {
                 fprintf(stderr,
                         "%s logits copy failed or returned a non-finite value "
                         "at target token %d\n",
@@ -952,6 +1067,11 @@ int main(int argc, char **argv) {
 
             if (api_aligned) {
                 const api_pos *ap = &ref.pos[i];
+                const int ref_tok = api_top1_update(engine, ap, greedy, &cm);
+                if (getenv("DS4_SCORE_DEBUG")) {
+                    fprintf(stderr, "  pos %d: target=%d ref_top=%d target_lp=%.3f ref_lp=%.3f greedy=%d\n",
+                            i, target.v[i], ref_tok, target_lp, ap->logprob, greedy);
+                }
                 if (isfinite(ap->logprob)) {
                     const double delta = target_lp - ap->logprob;
                     cm.target_count++;
@@ -976,10 +1096,6 @@ int main(int argc, char **argv) {
                         if (tok < 0) continue;
                         const double lp = local_logprob(logits, n_vocab, tok, logsum);
                         if (!isfinite(lp)) continue;
-                        if (j == 0) {
-                            cm.top1_count++;
-                            if (tok == greedy) cm.top1_match++;
-                        }
                         cm.top_mapped++;
                         cm.top_logprob_count++;
                         const double delta = lp - ap->alts[j].logprob;
@@ -1009,6 +1125,9 @@ int main(int argc, char **argv) {
                 }
             }
 
+#ifdef DS4_TEST_HOOKS
+            if (verify_batch) continue;
+#endif
             if (eval_with_companions(sessions, session_count, target.v[i], (unsigned)i,
                                      err, sizeof(err)) != 0) {
                 fprintf(stderr, "%s eval failed at target token %d: %s\n", id, i, err);
@@ -1108,6 +1227,9 @@ int main(int argc, char **argv) {
     fclose(out);
     fclose(mf);
     free(logits);
+#ifdef DS4_TEST_HOOKS
+    free(verify_logits);
+#endif
     for (int i = 0; i < session_count; i++) {
         ds4_session_free(sessions[i]);
         ds4_tokens_free(&companion_prompt[i]);

@@ -442,6 +442,8 @@ int main(void) {
         .backend = DS4_BACKEND_METAL,
         .n_threads = 1,
         .context_size = context_size,
+        .placement_session_count_hint = session_count,
+        .share_session_prefill_workspace = true,
     };
     const char *steering_file =
         getenv("DS4_TEST_DIRECTIONAL_STEERING_FILE");

@@ -136,6 +136,7 @@ def request_one(
     provider_allow_fallbacks: bool,
     provider_require_parameters: bool,
     temperature: float = 0,
+    system: str | None = None,
 ) -> dict:
     payload = {
         "model": model,
@@ -143,6 +144,8 @@ def request_one(
         "temperature": temperature,
         "stream": False,
     }
+    if system is not None:
+        payload["messages"].insert(0, {"role": "system", "content": system})
     if top_logprobs > 0:
         payload["logprobs"] = True
         payload["top_logprobs"] = top_logprobs
@@ -184,6 +187,7 @@ def fetch_with_retry(
     provider_allow_fallbacks: bool,
     provider_require_parameters: bool,
     temperature: float = 0,
+    system: str | None = None,
 ) -> dict:
     delay = 1.0
     for attempt in range(6):
@@ -202,6 +206,7 @@ def fetch_with_retry(
                 provider_allow_fallbacks,
                 provider_require_parameters,
                 temperature,
+                system,
             )
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "replace")
@@ -222,6 +227,9 @@ def main() -> int:
     ap.add_argument("--out", default="gguf-tools/quality-testing/data")
     ap.add_argument("--prompts", default="gguf-tools/quality-testing/prompts.jsonl")
     ap.add_argument("--model", default=MODEL)
+    ap.add_argument("--system", default=None,
+                    help="explicit system message, including an empty string; "
+                         "some providers insert a default when this is omitted")
     ap.add_argument("--endpoint", default=ENDPOINT)
     ap.add_argument("--api-key-env", default=None)
     ap.add_argument("--count", type=int, default=100)
@@ -278,6 +286,12 @@ def main() -> int:
     (out / "prompts").mkdir(parents=True, exist_ok=True)
     (out / "continuations").mkdir(parents=True, exist_ok=True)
     (out / "responses").mkdir(parents=True, exist_ok=True)
+    system_path = out / "request_system.json"
+    if args.resume and (system_path.exists() or any((out / "responses").glob("*.json"))):
+        saved_system = json.loads(system_path.read_text()) if system_path.exists() else None
+        if saved_system != args.system:
+            raise RuntimeError("saved system message differs from --system; use a new output directory")
+    system_path.write_text(json.dumps(args.system, ensure_ascii=False) + "\n", encoding="utf-8")
 
     manifest = out / "manifest.tsv"
     rows = []
@@ -322,6 +336,7 @@ def main() -> int:
                     args.allow_provider_fallbacks,
                     provider_require_parameters,
                     args.temperature,
+                    args.system,
                 )
                 choice = response["choices"][0]
                 content = choice.get("message", {}).get("content")
@@ -369,6 +384,7 @@ def main() -> int:
         "schema": "ds4-official-continuations-v1",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "model": args.model,
+        "system": args.system,
         "endpoint": args.endpoint,
         "observed_models": sorted(observed_models),
         "observed_providers": sorted(observed_providers),
