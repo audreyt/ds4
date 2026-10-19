@@ -74,7 +74,7 @@ On one 128 GB Mac, use SSD streaming. Leave the expert cache budget automatic:
 
 ```sh
 ./download_model.sh ds41f-q2
-./ds4 -m gguf/DeepSeek-V4.1-Flash-Q2.gguf \
+./ds4 -m gguf/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf \
   --ssd-streaming --ctx 32768
 ```
 
@@ -116,12 +116,14 @@ continuation test, with unchanged overall top-token agreement. See the
 [QA results](../QA_BEFORE_RELEASES.md#17-deepseek-v41-flash) for details
 and remaining differences.
 
-For images, download the matching encoder and add it to the same command:
+For images, add an encoder from the same checkpoint revision; `--vision`
+refuses any other. `ds41f-q2` is the 1017 checkpoint, so it pairs with
+`ds41f-1017-vision`; `ds41f-vision` pairs with `ds41f-q4`:
 
 ```sh
-./download_model.sh ds41f-vision
-./ds4-agent -m gguf/DeepSeek-V4.1-Flash-Q2.gguf \
-  --ssd-streaming --vision gguf/DeepSeek-V4.1-Flash-Vision.gguf
+./download_model.sh ds41f-1017-vision
+./ds4-agent -m gguf/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf \
+  --ssd-streaming --vision gguf/DeepSeek-V4.1-Flash-1017-Vision.gguf
 ```
 
 Vision works with SSD streaming, full residency and two-Mac TP. Pass the encoder
@@ -132,12 +134,12 @@ to build the GGUFs from safetensors.
 
 ### V4.1 Flash 1017
 
-`ds41f-1017-q2` and `ds41f-1017-vision` download the same Q2 recipe converted
-from `deepseek-ai/DeepSeek-V4.1-Flash-1017` (revision `1bae0e10`), hosted at
+`ds41f-1017-q2` is this fork's conversion of the same
+`deepseek-ai/DeepSeek-V4.1-Flash-1017` revision (`1bae0e10`) with its own
+imatrix, and `ds41f-1017-vision` is the 1017 encoder used by both 1017 Q2
+files. Both are hosted at
 [audreyt/deepseek-v4.1-flash-1017-gguf](https://huggingface.co/audreyt/deepseek-v4.1-flash-1017-gguf).
-Size and memory options match `ds41f-q2`. `--vision` requires the encoder and
-the language GGUF to come from the same checkpoint revision, so use the 1017
-encoder with the 1017 GGUF:
+Size and memory options match `ds41f-q2`:
 
 ```sh
 ./download_model.sh ds41f-1017-q2
