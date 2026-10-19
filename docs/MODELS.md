@@ -123,6 +123,22 @@ or the [server image API](SERVER.md#images). V4 Flash vision encoders do not
 work with V4.1. See [conversion](../gguf-tools/README.md#convert-deepseek-v41-flash)
 to build the GGUFs from safetensors.
 
+### V4.1 Flash 1017
+
+`ds41f-1017-q2` and `ds41f-1017-vision` download the same Q2 recipe converted
+from `deepseek-ai/DeepSeek-V4.1-Flash-1017` (revision `1bae0e10`), hosted at
+[audreyt/deepseek-v4.1-flash-1017-gguf](https://huggingface.co/audreyt/deepseek-v4.1-flash-1017-gguf).
+Size and memory options match `ds41f-q2`. `--vision` requires the encoder and
+the language GGUF to come from the same checkpoint revision, so use the 1017
+encoder with the 1017 GGUF:
+
+```sh
+./download_model.sh ds41f-1017-q2
+./download_model.sh ds41f-1017-vision
+./ds4-agent -m gguf/DeepSeek-V4.1-Flash-1017-Q2.gguf \
+  --ssd-streaming --vision gguf/DeepSeek-V4.1-Flash-1017-Vision.gguf
+```
+
 ## GLM 5.3 Flash
 
 | Target | Approximate file size | Use |

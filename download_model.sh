@@ -10,6 +10,9 @@ DS41_REPO="antirez/deepseek-v4.1-flash-gguf"
 DS41_Q2_FILE="DeepSeek-V4.1-Flash-Q2.gguf"
 DS41_Q4_FILE="DeepSeek-V4.1-Flash-Q4.gguf"
 DS41_VISION_FILE="DeepSeek-V4.1-Flash-Vision.gguf"
+DS41_1017_REPO="audreyt/deepseek-v4.1-flash-1017-gguf"
+DS41_1017_Q2_FILE="DeepSeek-V4.1-Flash-1017-Q2.gguf"
+DS41_1017_VISION_FILE="DeepSeek-V4.1-Flash-1017-Vision.gguf"
 HEADROOM128_REPO="apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128"
 HEADROOM128_FILE="DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128.gguf"
 HEADROOM128_DSPARK_SUPPORT_FILE="DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128-DSpark-support.gguf"
@@ -75,6 +78,8 @@ Usage:
   ./download_model.sh ds41f-q2 [--token TOKEN]
   ./download_model.sh ds41f-q4 [--token TOKEN]
   ./download_model.sh ds41f-vision [--token TOKEN]
+  ./download_model.sh ds41f-1017-q2 [--token TOKEN]
+  ./download_model.sh ds41f-1017-vision [--token TOKEN]
   ./download_model.sh pro-q2-imatrix [--token TOKEN]
   ./download_model.sh pro-q4-layers00-30 [--token TOKEN]
   ./download_model.sh pro-q4-layers31-output [--token TOKEN]
@@ -177,6 +182,14 @@ Targets:
        occupy 294 GiB; Engram tables stay on disk. Metal only: use SSD streaming
        on smaller Macs or full residency on a 512 GB Mac. Downloads two parts
        and joins them automatically; allow another 37 GiB of free disk space.
+
+  ds41f-1017-q2
+       DeepSeek V4.1 Flash 1017 calibrated Q2, about 341 GiB on disk, from
+       $DS41_1017_REPO. Same layout and memory needs as ds41f-q2.
+
+  ds41f-1017-vision
+       Matching 1017 vision encoder, about 0.9 GiB. Pairs only with the 1017
+       language GGUF. Does not update ./ds4flash.gguf.
 
   pro-q2-imatrix
        DeepSeek V4 PRO 0813 q2 imatrix quant, as a single GGUF file. About
@@ -339,6 +352,17 @@ case "$MODEL" in
         FORCE_HF_DOWNLOAD=1
         LINK_MODEL=0
         ;;
+    ds41f-1017-q2)
+        REPO=$DS41_1017_REPO
+        MODEL_FILE=$DS41_1017_Q2_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    ds41f-1017-vision)
+        REPO=$DS41_1017_REPO
+        MODEL_FILE=$DS41_1017_VISION_FILE
+        FORCE_HF_DOWNLOAD=1
+        LINK_MODEL=0
+        ;;
     pro-q2-imatrix) MODEL_FILE=$PRO_Q2_IMATRIX_FILE ;;
     pro-q4-layers00-30) MODEL_FILE=$PRO_Q4_LAYERS00_30_FILE; LINK_MODEL=0 ;;
     pro-q4-layers31-output) MODEL_FILE=$PRO_Q4_LAYERS31_OUTPUT_FILE; LINK_MODEL=0 ;;
@@ -489,6 +513,14 @@ artifact_identity() {
         "$DS41_VISION_FILE")
             expected_bytes=970555552
             expected_sha=cc283f032b3e8b8d78aeb5fccaa14e97b859b0c53aae3cd6bffa690ddf0e9e15
+            ;;
+        "$DS41_1017_Q2_FILE")
+            expected_bytes=365713686528
+            expected_sha=753ba9c55ed56e0ca0bf8c87876367349027452629f8f4975cdb09d50189ac07
+            ;;
+        "$DS41_1017_VISION_FILE")
+            expected_bytes=970555552
+            expected_sha=51e4525b67cdaf1f34c569118b268e06466233e9d5dc13442fc65170dbb3fd21
             ;;
         *) return 1 ;;
     esac

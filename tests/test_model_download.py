@@ -12,12 +12,16 @@ Q2 = "DeepSeek-V4.1-Flash-Q2.gguf"
 Q4 = "DeepSeek-V4.1-Flash-Q4.gguf"
 PART1, PART2 = Q4 + ".part1", Q4 + ".part2"
 VISION = "DeepSeek-V4.1-Flash-Vision.gguf"
+Q2_1017 = "DeepSeek-V4.1-Flash-1017-Q2.gguf"
+VISION_1017 = "DeepSeek-V4.1-Flash-1017-Vision.gguf"
 ARTIFACTS = {
     Q2: (365713686528, "1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42"),
     Q4: (518596067328, "a5e2e2c3ada4b2e98d9f9e4b50f6d9c2a12c2c96f5da165c07e13aff9264984e"),
     PART1: (480000000000, "6442b1f9224079662c02003c0ef9ef6be6e2aff509510f681dab9e6cc41df246"),
     PART2: (38596067328, "7c3e10646c918eeaffbc39305a75ec96117450262c61454ff194cef00d7617f0"),
     VISION: (970555552, "cc283f032b3e8b8d78aeb5fccaa14e97b859b0c53aae3cd6bffa690ddf0e9e15"),
+    Q2_1017: (365713686528, "753ba9c55ed56e0ca0bf8c87876367349027452629f8f4975cdb09d50189ac07"),
+    VISION_1017: (970555552, "51e4525b67cdaf1f34c569118b268e06466233e9d5dc13442fc65170dbb3fd21"),
 }
 
 
@@ -40,10 +44,11 @@ class DownloadTests(unittest.TestCase):
         text = (ROOT / "download_model.sh").read_text()
         for name, (size, sha) in ARTIFACTS.items():
             data = payload(name)
-            self.assertIn("expected_bytes=" + str(size), text)
-            self.assertIn("expected_sha=" + sha, text)
-            text = text.replace("expected_bytes=" + str(size), "expected_bytes=" + str(len(data)))
-            text = text.replace("expected_sha=" + sha, "expected_sha=" + hashlib.sha256(data).hexdigest())
+            # Replace size and hash together: 1017 files share V4.1 byte sizes.
+            pinned = f"expected_bytes={size}\n            expected_sha={sha}"
+            self.assertIn(pinned, text)
+            text = text.replace(pinned, f"expected_bytes={len(data)}\n            "
+                                        f"expected_sha={hashlib.sha256(data).hexdigest()}")
         self.script.write_text(text)
         hf = self.bin / "hf"
         hf.write_text("""#!/usr/bin/env python3
@@ -52,7 +57,8 @@ from pathlib import Path
 import sys
 args = sys.argv[1:]
 assert args[0] == 'download'
-assert args[1] == 'antirez/deepseek-v4.1-flash-gguf'
+assert args[1] == ('audreyt/deepseek-v4.1-flash-1017-gguf' if '-1017-' in args[2]
+                   else 'antirez/deepseek-v4.1-flash-gguf')
 if os.environ.get('FAIL_DOWNLOAD'):
     sys.exit(7)
 out = Path(args[args.index('--local-dir') + 1])
@@ -84,9 +90,18 @@ out.mkdir(parents=True, exist_ok=True)
         self.assertIn("Verifying SHA-256", self.run_download("ds41f-vision"))
         self.assertEqual(link.resolve(), self.out / Q4)
 
+    def test_1017_quant_and_vision(self):
+        self.assertIn("Verifying SHA-256", self.run_download("ds41f-1017-q2"))
+        link = self.root / "ds4flash.gguf"
+        self.assertEqual(link.resolve(), self.out / Q2_1017)
+        self.assertIn("Verifying SHA-256", self.run_download("ds41f-1017-vision"))
+        self.assertEqual((self.out / VISION_1017).read_bytes(), payload(VISION_1017))
+        self.assertEqual(link.resolve(), self.out / Q2_1017)
+
     def test_truncated_and_corrupt_artifacts(self):
         self.out.mkdir()
-        for target, name in (("ds41f-q2", Q2), ("ds41f-q4", Q4), ("ds41f-vision", VISION)):
+        for target, name in (("ds41f-q2", Q2), ("ds41f-q4", Q4), ("ds41f-vision", VISION),
+                             ("ds41f-1017-q2", Q2_1017), ("ds41f-1017-vision", VISION_1017)):
             with self.subTest(target=target):
                 path = self.out / name
                 path.write_bytes(b"short")
@@ -166,6 +181,8 @@ out.mkdir(parents=True, exist_ok=True)
         self.assertIn("ds41f-q2", help_text)
         self.assertIn("ds41f-q4", help_text)
         self.assertIn("ds41f-vision", help_text)
+        self.assertIn("ds41f-1017-q2", help_text)
+        self.assertIn("ds41f-1017-vision", help_text)
         self.assertIn("Unknown model", self.run_download("nonexistent", ok=False))
         self.assertFalse(self.out.exists())
 
