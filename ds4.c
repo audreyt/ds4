@@ -2790,9 +2790,13 @@ static void model_unmap_engram(ds4_model *m) {
     if (page <= 0 || start % (uint64_t)page || resident_end > start ||
         tables[1]->abs_offset < start + tables[0]->bytes)
         ds4_die("V4.1 Engram tables must follow the page-aligned main weights");
-    if (munmap((void *)(m->map + start), (size_t)(m->size - start)) != 0)
+    /* Cut the mapping at the page-aligned end of the resident tensors, not
+     * at the Engram start: a repacked file may leave a never-referenced gap
+     * before the tables, and Metal wraps all of [0, size) as model views. */
+    const uint64_t cut = (resident_end + (uint64_t)page - 1) / (uint64_t)page * (uint64_t)page;
+    if (munmap((void *)(m->map + cut), (size_t)(m->size - cut)) != 0)
         ds4_die_errno("cannot unmap disk-only region", "Engram");
-    m->size = start;
+    m->size = cut;
 }
 
 /* Like V4.1 Engram, the n-gram table must trail the resident weights. This
