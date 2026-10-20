@@ -14,6 +14,9 @@ DS41_Q4_FILE="DeepSeek-V4.1-Flash-Q4.gguf"
 DS41_VISION_FILE="DeepSeek-V4.1-Flash-Vision.gguf"
 DS41_1017_REPO="audreyt/deepseek-v4.1-flash-1017-gguf"
 DS41_1017_Q2_FILE="DeepSeek-V4.1-Flash-1017-Q2.gguf"
+DS41_Q1_FILE="DeepSeek-V4.1-Flash-1017-Q1.gguf"
+DS41_Q1_DONOR_REPO="unsloth/DeepSeek-V4.1-Flash-1017-GGUF"
+DS41_Q1_DONOR_BASE="UD-IQ1_S/DeepSeek-V4.1-Flash-1017-UD-IQ1_S"
 DS41_1017_VISION_FILE="DeepSeek-V4.1-Flash-1017-Vision.gguf"
 DS41_ABL_REPO="audreyt/DeepSeek-V4.1-Flash-Abliterated-GGUF"
 DS41_ABL_Q2_FILE="DeepSeek-V4.1-Flash-Abliterated-Q2-imatrix.gguf"
@@ -82,6 +85,7 @@ Usage:
   ./download_model.sh ds4f-vision-encoder [--token TOKEN]
   ./download_model.sh ds4f-vision-dspark [--token TOKEN]
   ./download_model.sh ds4f-vision-abliterated [--token TOKEN]  (alias: preferred, vision-abliterated)
+  ./download_model.sh ds41f-q1 [--token TOKEN]
   ./download_model.sh ds41f-q2 [--token TOKEN]
   ./download_model.sh ds41f-q4 [--token TOKEN]
   ./download_model.sh ds41f-vision [--token TOKEN]
@@ -178,6 +182,16 @@ Targets:
        Preferred Vision-Exp abliterated IQ2 (same quant as ds4f-vision-q2 but
        with abliteration). About 80.76 GiB language + 0.9 GiB encoder.
        Downloads both files and links ./ds4flash.gguf. Pi's default.
+
+  ds41f-q1
+       DeepSeek V4.1 Flash 1017 Q1 for one 128 GB Mac. Not a direct download:
+       builds from Unsloth's UD-IQ1_S (shards 2-4 plus imatrix, about 123 GB)
+       and a local ds41f-1017-q2 or ds41f-q2 file, which must be downloaded
+       first. Unsloth's IQ2_XXS experts are requantized to IQ1_S and its
+       Q5_K/Q6_K dense tensors replace the Q8_0/F16 ones, so main weights
+       occupy about 106 GiB (contexts up to 14335 tokens). Engram tables
+       stay on disk. Metal only, fully resident (no SSD streaming, MTP or
+       DSpark). Needs numpy and Homebrew llama.cpp (libggml) for IQ1_S.
 
   ds41f-q2
        DeepSeek V4.1 Flash 1017 calibrated Q2, about 341 GiB on disk. Main weights
@@ -376,6 +390,11 @@ case "$MODEL" in
         MODEL=preferred
         MODEL_FILE=$VISION_ABLITERATED_FILE
         # alias to preferred (abliterated vision)
+        ;;
+    ds41f-q1)
+        MODEL=ds41f-q1
+        MODEL_FILE=$DS41_Q1_FILE
+        # Conversion target; handled specially below.
         ;;
     ds41f-q2)
         REPO=$DS41_REPO
@@ -773,6 +792,63 @@ if [ "$MODEL" = "preferred" ]; then
     echo
     echo "Note: legacy Headroom128 files (if present) are kept. Remove them manually if you need space:"
     echo "  rm -f gguf/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128.gguf gguf/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128-DSpark-support.gguf"
+    echo
+    echo "Done."
+    exit 0
+fi
+
+# ds41f-q1: build the Q1 file locally by transplanting Unsloth UD-IQ1_S
+# routed experts into a ds4-native 1017 Q2 base (see the converter header).
+if [ "$MODEL" = "ds41f-q1" ]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Building ds41f-q1 requires Python 3." >&2
+        exit 1
+    fi
+    BASE=
+    for cand in "$DS41_1017_Q2_FILE" "$DS41_Q2_FILE"; do
+        if [ -s "$OUT_DIR/$cand" ]; then
+            BASE="$OUT_DIR/$cand"
+            break
+        fi
+    done
+    if [ -z "$BASE" ]; then
+        echo "ds41f-q1 needs a ds4-native 1017 Q2 base first. Run one of:" >&2
+        echo "  ./download_model.sh ds41f-1017-q2" >&2
+        echo "  ./download_model.sh ds41f-q2" >&2
+        exit 1
+    fi
+    Q1_OUT="$OUT_DIR/$DS41_Q1_FILE"
+    if [ -s "$Q1_OUT" ]; then
+        echo "Already built: $Q1_OUT"
+    else
+        REPO=$DS41_Q1_DONOR_REPO
+        FORCE_HF_DOWNLOAD=1
+        for part in 00002 00003 00004; do
+            download_one_hf "$DS41_Q1_DONOR_BASE-${part}-of-00005.gguf"
+        done
+        download_one_hf imatrix_unsloth.gguf_file
+        echo "Converting UD-IQ1_S experts into $Q1_OUT (base: $BASE)"
+        set --
+        for role in attn_q_a attn_q_b attn_kv ffn_gate_shexp ffn_up_shexp \
+                    ffn_down_shexp output token_embd engram_kv; do
+            set -- "$@" --dense-from-donor "$role.weight"
+        done
+        python3 "$ROOT/gguf-tools/mixed/deepseek41_q1_from_unsloth.py" \
+            --base "$BASE" \
+            --donor "$OUT_DIR/$DS41_Q1_DONOR_BASE-00002-of-00005.gguf" \
+            --donor "$OUT_DIR/$DS41_Q1_DONOR_BASE-00003-of-00005.gguf" \
+            --donor "$OUT_DIR/$DS41_Q1_DONOR_BASE-00004-of-00005.gguf" \
+            --requant-iq1s --imatrix "$OUT_DIR/imatrix_unsloth.gguf_file" \
+            "$@" --out "$Q1_OUT"
+    fi
+    cd "$ROOT"
+    ln -sfn "$Q1_OUT" ds4flash.gguf
+    echo "Linked ./ds4flash.gguf -> $Q1_OUT"
+    echo
+    echo "Q1 ready. Run resident on Metal (no --ssd-streaming), for example:"
+    echo "  ./ds4 -c 8192 -p \"Hello\""
+    echo "The UD-IQ1_S donor shards under $OUT_DIR/UD-IQ1_S and"
+    echo "$OUT_DIR/imatrix_unsloth.gguf_file can be deleted."
     echo
     echo "Done."
     exit 0
