@@ -2015,6 +2015,105 @@ kernel void kernel_glm_indexer_score_one_direct(
     }
 }
 
+/* One key per thread with the query in threadgroup memory: a SIMD group walks
+ * 32 keys together, so the query reads broadcast and each key row streams once
+ * instead of one threadgroup, sixteen barriers and eight reductions per key. */
+kernel void kernel_glm_indexer_score_one_wide(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        uint3 ntg_u [[threads_per_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+    const uint ntg = ntg_u.x;
+    threadgroup float *qs = shared;           /* [32][128] */
+    threadgroup float *ws = shared + 4096u;   /* [32] */
+    device const float *qf = (device const float *)q;
+    for (uint i = tid; i < 4096u; i += ntg) qs[i] = qf[i];
+    if (tid < 32u) ws[tid] = weights[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint row = tgpig.x * ntg + tid;
+    if (row >= args.n_rows) return;
+    float acc[32];
+    FOR_UNROLL (uint h = 0; h < 32u; h++) acc[h] = 0.0f;
+    const uint64_t base = (uint64_t)row * 128u;
+    for (uint d0 = 0; d0 < 128u; d0 += 16u) {
+        float4 k[4];
+        if (args.cache_f16 != 0u) {
+            device const half4 *kh = (device const half4 *)indexer_key_cache + ((base + d0) >> 2);
+            FOR_UNROLL (uint i = 0; i < 4u; i++) k[i] = float4(kh[i]);
+        } else {
+            device const float4 *kf = (device const float4 *)indexer_key_cache + ((base + d0) >> 2);
+            FOR_UNROLL (uint i = 0; i < 4u; i++) k[i] = kf[i];
+        }
+        FOR_UNROLL (uint h = 0; h < 32u; h++) {
+            threadgroup const float4 *q4 = (threadgroup const float4 *)(qs + h * 128u + d0);
+            acc[h] += dot(q4[0], k[0]) + dot(q4[1], k[1]) + dot(q4[2], k[2]) + dot(q4[3], k[3]);
+        }
+    }
+    float score = 0.0f;
+    FOR_UNROLL (uint h = 0; h < 32u; h++) {
+#pragma clang fp contract(off)
+        score += max(acc[h] * args.scale, 0.0f) * ws[h];
+    }
+    scores[row] = score;
+}
+
+/* The wide kernel over V4.1 candidate keys: key i is position i % 8 of block
+ * list[i / 8], so the scores keep ascending key order. */
+kernel void kernel_dsv41_indexer_score_candidates(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        device const uint *list,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        uint3 ntg_u [[threads_per_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+    const uint ntg = ntg_u.x;
+    threadgroup float *qs = shared;           /* [32][128] */
+    threadgroup float *ws = shared + 4096u;   /* [32] */
+    device const float *qf = (device const float *)q;
+    for (uint i = tid; i < 4096u; i += ntg) qs[i] = qf[i];
+    if (tid < 32u) ws[tid] = weights[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint slot = tgpig.x * ntg + tid;
+    if (slot >= args.n_rows) return;
+    const uint row = list[slot >> 3] * 8u + (slot & 7u);
+    float acc[32];
+    FOR_UNROLL (uint h = 0; h < 32u; h++) acc[h] = 0.0f;
+    const uint64_t base = (uint64_t)row * 128u;
+    for (uint d0 = 0; d0 < 128u; d0 += 16u) {
+        float4 k[4];
+        if (args.cache_f16 != 0u) {
+            device const half4 *kh = (device const half4 *)indexer_key_cache + ((base + d0) >> 2);
+            FOR_UNROLL (uint i = 0; i < 4u; i++) k[i] = float4(kh[i]);
+        } else {
+            device const float4 *kf = (device const float4 *)indexer_key_cache + ((base + d0) >> 2);
+            FOR_UNROLL (uint i = 0; i < 4u; i++) k[i] = kf[i];
+        }
+        FOR_UNROLL (uint h = 0; h < 32u; h++) {
+            threadgroup const float4 *q4 = (threadgroup const float4 *)(qs + h * 128u + d0);
+            acc[h] += dot(q4[0], k[0]) + dot(q4[1], k[1]) + dot(q4[2], k[2]) + dot(q4[3], k[3]);
+        }
+    }
+    float score = 0.0f;
+    FOR_UNROLL (uint h = 0; h < 32u; h++) {
+#pragma clang fp contract(off)
+        score += max(acc[h] * args.scale, 0.0f) * ws[h];
+    }
+    scores[slot] = score;
+}
+
 kernel void kernel_glm_indexer_scores_batch(
         constant ds4_metal_args_glm_indexer_scores_batch & args,
         device const char *q,
@@ -6982,6 +7081,62 @@ kernel void kernel_dsv4_add2_f32_tp_flag_checked(
             atomic_store_explicit(&flag, value, memory_order_relaxed);
         }
     }
+}
+
+// Inline decode gates: the CPU releases the GPU by a store to a system-coherent
+// word that a one-thread kernel spin-reads inside the open command buffer, so
+// the stream neither parks on a shared event nor ends a command buffer per
+// gate. Without that buffer boundary the partial and the flag have to be pushed
+// to system visibility explicitly: both are re-stored through coherent(system)
+// views followed by a system-scope fence.
+#pragma METAL internals : enable
+#ifndef __METAL_MEMORY_SCOPE_SYSTEM__
+#define __METAL_MEMORY_SCOPE_SYSTEM__ 3
+#endif
+namespace metal {
+constexpr constant metal::thread_scope thread_scope_system =
+    static_cast<thread_scope>(__METAL_MEMORY_SCOPE_SYSTEM__);
+}
+
+kernel void kernel_dsv4_tp_payload_publish(
+        volatile coherent(system) device uint * payload,
+        constant uint & n_words,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid < n_words) payload[tid] = payload[tid];
+    metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
+}
+
+kernel void kernel_dsv4_tp_flag_publish(
+        volatile coherent(system) device uint * flag,
+        constant uint & value) {
+    flag[0] = value;
+    metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
+}
+
+// Bounded: a process killed mid-gate never stores the release word, and an
+// unbounded loop strands the kernel in GPU firmware until a reboot (observed).
+// The release seq is compared monotonically so a store is never missed.
+// [1] keeps the spin count of the last wait, [2] counts timeouts.
+kernel void kernel_dsv4_tp_release_wait(
+        volatile coherent(system) device uint * release_word,
+        constant uint & value,
+        constant uint & max_iters) {
+    uint i = 0;
+    for (; i < max_iters; i++) {
+        metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
+        if ((int)(release_word[0] - value) >= 0) break;
+    }
+    release_word[1] = i;
+    if (i >= max_iters) release_word[2] = release_word[2] + 1u;
+    metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
 }
 
 // Tensor-parallel poll gate: waits for the service thread's release of gate

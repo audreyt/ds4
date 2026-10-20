@@ -402,6 +402,38 @@ static int check_rope_stride(void) {
     return 1;
 }
 
+#ifdef __APPLE__
+/* The fused RoPE, quantize and store kernel against the three separate steps. */
+static int check_rope_quantize(void) {
+    enum { WIDTH = 512, TRIALS = 300 };
+    ds4_gpu_tensor *a = upload(NULL, WIDTH * sizeof(float));
+    ds4_gpu_tensor *b = upload(NULL, WIDTH * sizeof(float));
+    ds4_gpu_tensor *c = upload(NULL, (WIDTH + 1u) * sizeof(float));
+    CHECK(a && b && c);
+    float *x = ds4_gpu_tensor_contents(a), *y = ds4_gpu_tensor_contents(b);
+    float *z = ds4_gpu_tensor_contents(c);
+    for (uint32_t t = 0; t < TRIALS; t++) {
+        const ds4_v41_activation_format format = (ds4_v41_activation_format)(1 + t % 3);
+        const uint32_t width = format == DS4_V41_FP4_E8M0 ? 128 : WIDTH;
+        const bool compressed = (t / 3) & 1;
+        const uint32_t pos = (uint32_t)(fabsf(random_value()) * 15000);
+        for (uint32_t i = 0; i < width; i++) x[i] = y[i] = ldexpf(random_value(), (int)(t % 11) - 5);
+        z[width] = 12345;
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_dsv41_rope(a, width, 1, 1, pos, compressed, false));
+        CHECK(ds4_gpu_dsv41_quantize(a, width, 1, format));
+        CHECK(ds4_gpu_dsv41_rope_quantize(b, c, 0, width, pos, compressed, format));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(!memcmp(x, z, width * sizeof(float)) && z[width] == 12345);
+    }
+    ds4_gpu_tensor_free(c); ds4_gpu_tensor_free(b); ds4_gpu_tensor_free(a);
+    fprintf(stderr, "V4.1 fused RoPE quantize: bitwise match with the separate steps PASS\n");
+    return 1;
+}
+#else
+static int check_rope_quantize(void) { return 1; }
+#endif
+
 static int check_pool(void) {
     enum { D = 512, ROWS = 257, PAIRS = ROWS / 2 };
     float *kv = malloc(ROWS * D * sizeof(float)), *scores = malloc(ROWS * D * sizeof(float));
@@ -493,7 +525,7 @@ static int check_candidates(void) {
             CHECK(ds4_gpu_dsv41_candidate_blocks(b, s, n, rows, start, ratio));
             CHECK(ds4_gpu_indexer_topk_tensor(t, b, blocks, rows, top));
             CHECK(ds4_gpu_dsv4_topk_mask_tensor(m, t, blocks, rows, top));
-            CHECK(ds4_gpu_dsv41_candidate_filter(s, m, n, rows, start, ratio));
+            CHECK(ds4_gpu_dsv41_candidate_filter(s, m, n, rows, start, ratio, 0));
             CHECK(ds4_gpu_end_commands());
             CHECK(ds4_gpu_tensor_read(b, 0, maxima, (size_t)blocks * rows * 4));
             CHECK(ds4_gpu_tensor_read(s, 0, got, (size_t)n * rows * 4));
@@ -520,11 +552,69 @@ static int check_candidates(void) {
         }
         CHECK(!ds4_gpu_dsv41_candidate_blocks(b, s, n, rows, UINT32_MAX, 1));
         CHECK(!ds4_gpu_dsv41_candidate_blocks(b, s, n, rows, 0, 0));
-        CHECK(!ds4_gpu_dsv41_candidate_filter(s, m, n, rows + 1, 0, 1));
+        CHECK(!ds4_gpu_dsv41_candidate_filter(s, m, n, rows + 1, 0, 1, 0));
+        CHECK(blocks == 1 || !ds4_gpu_dsv41_candidate_filter(s, m, n, rows, 0, 1, blocks - 1));
         ds4_gpu_tensor_free(s); ds4_gpu_tensor_free(b); ds4_gpu_tensor_free(t); ds4_gpu_tensor_free(m);
         free(scores); free(got); free(maxima); free(sorted); free(kept);
     }
     fprintf(stderr, "V4.1 causal candidate blocks and filtering: exact\n");
+    return 1;
+}
+
+/* Batched block top-k, strided masks and filtering against the per-row calls. */
+static int check_candidates_batch(uint32_t n, uint32_t rows, uint32_t start) {
+    const uint32_t blocks = (n + 7) / 8, stride = blocks + 3;
+    float *scores = malloc((size_t)n * rows * 4), *got = malloc((size_t)n * rows * 4);
+    float *mask = malloc((size_t)stride * rows * 4);
+    CHECK(scores && got && mask);
+    for (uint32_t r = 0; r < rows; r++) for (uint32_t i = 0; i < n; i++)
+        scores[(size_t)r * n + i] = (float)((i * 7919u + r * 1009u) % 104729u) - 50000;
+    for (size_t i = 0; i < (size_t)stride * rows; i++) mask[i] = 7.0f;
+    ds4_gpu_tensor *s = upload(scores, (size_t)n * rows * 4);
+    ds4_gpu_tensor *b = upload(NULL, (size_t)blocks * rows * 4);
+    ds4_gpu_tensor *t = upload(NULL, (size_t)2048 * rows * 4);
+    ds4_gpu_tensor *ref = upload(NULL, (size_t)2048 * rows * 4);
+    ds4_gpu_tensor *m = upload(mask, (size_t)stride * rows * 4);
+    CHECK(s && b && t && ref && m);
+    CHECK(ds4_gpu_begin_commands());
+    CHECK(ds4_gpu_dsv41_candidate_blocks(b, s, n, rows, start, 1));
+    for (uint32_t r = 0; r < rows; r++) {
+        uint32_t visible = (start + r + 8) / 8;
+        if (visible > blocks) visible = blocks;
+        ds4_gpu_tensor *br = ds4_gpu_tensor_view(b, (size_t)r * blocks * 4, (size_t)visible * 4);
+        ds4_gpu_tensor *out = ds4_gpu_tensor_view(ref, (size_t)r * 2048 * 4, 2048 * 4);
+        CHECK(br && out && ds4_gpu_indexer_topk_tensor(out, br, visible, 1, 2048));
+        ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(br);
+    }
+    CHECK(ds4_gpu_dsv41_candidate_topk_batch(t, b, blocks, rows, start));
+    CHECK(ds4_gpu_dsv41_candidate_mask_batch(m, t, blocks, rows, stride));
+    CHECK(ds4_gpu_dsv41_candidate_filter(s, m, n, rows, start, 1, stride));
+    CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
+    const int32_t *ids = ds4_gpu_tensor_contents(t), *expected = ds4_gpu_tensor_contents(ref);
+    CHECK(ids && expected && !memcmp(ids, expected, (size_t)2048 * rows * 4));
+    CHECK(ds4_gpu_tensor_read(m, 0, mask, (size_t)stride * rows * 4));
+    CHECK(ds4_gpu_tensor_read(s, 0, got, (size_t)n * rows * 4));
+    for (uint32_t r = 0; r < rows; r++) {
+        uint32_t visible = start + r + 1;
+        if (visible > n) visible = n;
+        for (uint32_t j = 0; j < blocks; j++) {
+            bool kept = false;
+            for (uint32_t k = 0; k < 2048 && !kept; k++) kept = ids[(size_t)r * 2048 + k] == (int32_t)j;
+            CHECK(mask[(size_t)r * stride + j] == (kept ? 0.0f : -INFINITY));
+        }
+        for (uint32_t j = blocks; j < stride; j++) CHECK(mask[(size_t)r * stride + j] == 7.0f);
+        for (uint32_t i = 0; i < n; i++) {
+            const float expect = i < visible && mask[(size_t)r * stride + i / 8] == 0.0f ?
+                scores[(size_t)r * n + i] : -INFINITY;
+            CHECK(got[(size_t)r * n + i] == expect);
+        }
+    }
+    CHECK(!ds4_gpu_dsv41_candidate_topk_batch(t, b, blocks, rows, 16376));
+    CHECK(!ds4_gpu_dsv41_candidate_mask_batch(m, t, blocks, rows, blocks - 1));
+    ds4_gpu_tensor_free(m); ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(t);
+    ds4_gpu_tensor_free(b); ds4_gpu_tensor_free(s);
+    free(scores); free(got); free(mask);
+    fprintf(stderr, "V4.1 batched candidates n=%u start=%u: exact\n", n, start);
     return 1;
 }
 
@@ -1026,8 +1116,70 @@ static int check_general_topk(void) {
     return 1;
 }
 
+/* The radix-select path against the merge ladder: same values by rank, same
+ * ids and order when the selected values are unique, ties by ascending id. */
+static int check_topk_select(void) {
+    const uint32_t widths[] = {16384, 65536, 131072, 262144};
+    const uint32_t counts[] = {1, 512, 2048};
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(*widths); wi++) {
+        const uint32_t width = widths[wi], rows = 2;
+        ds4_gpu_tensor *scores = upload(NULL, (size_t)width * rows * 4);
+        ds4_gpu_tensor *fast = upload(NULL, (size_t)2048 * rows * 4);
+        ds4_gpu_tensor *slow = upload(NULL, (size_t)2048 * rows * 4);
+        topk_entry *reference = malloc((size_t)width * rows * sizeof(*reference));
+        bool *seen = calloc(width, sizeof(*seen));
+        CHECK(scores && fast && slow && reference && seen);
+        float *s = ds4_gpu_tensor_contents(scores);
+        for (uint32_t pattern = 0; pattern < 4; pattern++) {
+            for (uint32_t t = 0; t < rows; t++) {
+                for (uint32_t i = 0; i < width; i++) {
+                    /* 0: coarse random values with many ties; 1: unique; 2: unique
+                     * with seven of eight blocks masked like the candidate filter;
+                     * 3: fewer finite values than 2048, so ties at -inf are selected */
+                    const float unique = (float)((i * 7919u + t * 1009u) % 1048573u) - 500000.0f;
+                    s[(size_t)t * width + i] = pattern == 0 ? random_value() : pattern == 1 ? unique :
+                        pattern == 2 ? (i / 8 % 8 ? -INFINITY : unique) : (i % 1361 ? -INFINITY : unique);
+                    reference[(size_t)t * width + i] = (topk_entry){s[(size_t)t * width + i], i};
+                }
+                qsort(reference + (size_t)t * width, width, sizeof(*reference), compare_topk_entry);
+            }
+            for (size_t ki = 0; ki < sizeof(counts) / sizeof(*counts); ki++) {
+                const uint32_t k = counts[ki];
+                const uint32_t n = ki == 1 ? 1u : rows;   /* the scratch changes row layout between calls */
+                CHECK(unsetenv("DS4_METAL_DISABLE_V41_TOPK_SELECT") == 0);
+                CHECK(ds4_gpu_dsv41_indexer_topk_tensor(fast, scores, width, n, k));
+                CHECK(setenv("DS4_METAL_DISABLE_V41_TOPK_SELECT", "1", 1) == 0);
+                CHECK(ds4_gpu_indexer_topk_tensor(slow, scores, width, n, k));
+                CHECK(unsetenv("DS4_METAL_DISABLE_V41_TOPK_SELECT") == 0);
+                CHECK(ds4_gpu_synchronize());
+                const int32_t *a = ds4_gpu_tensor_contents(fast), *b = ds4_gpu_tensor_contents(slow);
+                for (uint32_t t = 0; t < n; t++) {
+                    const float *row = s + (size_t)t * width;
+                    const topk_entry *ref = reference + (size_t)t * width;
+                    memset(seen, 0, width * sizeof(*seen));
+                    for (uint32_t i = 0; i < k; i++) {
+                        const int32_t id = a[t * k + i];
+                        CHECK(id >= 0 && (uint32_t)id < width && !seen[id]);
+                        seen[id] = true;
+                        CHECK(row[id] == ref[i].value);
+                        CHECK(row[id] == row[b[t * k + i]]);
+                        if (i && row[id] == row[a[t * k + i - 1]]) CHECK(a[t * k + i - 1] < id);
+                    }
+                    if (pattern == 1 || pattern == 2)
+                        CHECK(!memcmp(a + t * k, b + t * k, k * sizeof(*a)));
+                }
+            }
+        }
+        fprintf(stderr, "V4.1 radix top-k width=%u: values by rank, unique-ID and tie-order oracle PASS\n", width);
+        ds4_gpu_tensor_free(scores); ds4_gpu_tensor_free(fast); ds4_gpu_tensor_free(slow);
+        free(reference); free(seen);
+    }
+    return 1;
+}
+
 static int check_causal_topk(void) {
-    const uint32_t frontiers[] = {1024, 1025, 1535, 2047, 2048, 4095, 4096, 8191, 8192, 16383, 32767, 65535};
+    const uint32_t frontiers[] = {513, 514, 1023, 1024, 1025, 1535, 2047, 2048, 4095, 4096, 8191, 8192,
+                                  16383, 32767, 65535};
     const uint32_t counts[] = {1, 2, 31, 32, 33, 127, 128, 129};
     for (uint32_t ratio = 1; ratio <= 2; ratio++) {
     for (size_t fi = 0; fi < sizeof(frontiers) / sizeof(*frontiers); fi++) {
@@ -1052,6 +1204,10 @@ static int check_causal_topk(void) {
             }
             for (size_t ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
                 const uint32_t rows = counts[ci];
+                /* The causal kernels are the ladder's variants and agree with it
+                 * tie for tie; the radix path orders ties by id, so the reference
+                 * stays on the ladder. */
+                CHECK(setenv("DS4_METAL_DISABLE_V41_TOPK_SELECT", "1", 1) == 0);
                 CHECK(ds4_gpu_begin_commands());
                 for (uint32_t t = 0; t < rows; t++) {
                     const uint32_t visible = (start + t + 1u) / ratio;
@@ -1061,6 +1217,7 @@ static int check_causal_topk(void) {
                     ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(sr);
                 }
                 CHECK(ds4_gpu_end_commands());
+                CHECK(unsetenv("DS4_METAL_DISABLE_V41_TOPK_SELECT") == 0);
                 ids[rows * 512u] = 123456;
                 CHECK(ds4_gpu_dsv41_indexer_topk_batch(selected, scores, width, rows, start, ratio));
                 CHECK(ds4_gpu_synchronize());
@@ -1081,6 +1238,7 @@ static int check_causal_topk(void) {
         CHECK(!ds4_gpu_dsv41_indexer_topk_batch(selected, scores, width, 130, start, ratio));
         CHECK(!ds4_gpu_dsv41_indexer_topk_batch(selected, scores, width, 1, UINT32_MAX, ratio));
         CHECK(!ds4_gpu_dsv41_indexer_topk_batch(selected, scores, width, 1, 0, ratio));
+        CHECK(!ds4_gpu_dsv41_indexer_topk_batch(selected, scores, width, 1, 512u * ratio - 1u, ratio));
         CHECK(!ds4_gpu_dsv41_indexer_topk_batch(selected, scores, width, 1, start, 0));
         fprintf(stderr, "V4.1 causal top-k ratio=%u visible=%u: exact IDs including ties PASS\n", ratio, frontiers[fi]);
         ds4_gpu_tensor_free(reference); ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(scores);
@@ -1089,6 +1247,222 @@ static int check_causal_topk(void) {
     return 1;
 }
 
+
+/* Rows with at most 512 visible keys select every key; other slots stay. */
+static int check_indexer_all(void) {
+    const uint32_t rows = 129u;
+    ds4_gpu_tensor *selected = upload(NULL, (rows * 512u + 1u) * sizeof(int32_t));
+    CHECK(selected);
+    int32_t *ids = ds4_gpu_tensor_contents(selected);
+    CHECK(ids);
+    for (uint32_t ratio = 1; ratio <= 2; ratio++) for (uint32_t start = 0; start <= 300u; start += 300u) {
+        for (uint32_t i = 0; i <= rows * 512u; i++) ids[i] = -1;
+        CHECK(ds4_gpu_dsv41_indexer_all_batch(selected, rows, start, ratio));
+        CHECK(ds4_gpu_synchronize());
+        for (uint32_t t = 0; t < rows; t++) {
+            const uint32_t visible = (start + t + 1u) / ratio;
+            for (uint32_t i = 0; i < 512u; i++)
+                CHECK(ids[t * 512u + i] == (i < visible ? (int32_t)i : -1));
+        }
+        CHECK(ids[rows * 512u] == -1);
+    }
+    CHECK(!ds4_gpu_dsv41_indexer_all_batch(selected, rows, 512u, 1));
+    CHECK(!ds4_gpu_dsv41_indexer_all_batch(selected, rows, 0, 0));
+    ds4_gpu_tensor_free(selected);
+    fprintf(stderr, "V4.1 indexer select-all rows: exact\n");
+    return 1;
+}
+
+#ifdef __APPLE__
+static int compare_score_entry(const void *a, const void *b) {
+    const float *x = *(const float *const *)a, *y = *(const float *const *)b;
+    return *x < *y ? 1 : *x > *y ? -1 : 0;
+}
+
+/* The per-key and the wide single-row index scoring kernels on the same random
+ * query and keys: both against a double oracle, then their top-2048 sets, where
+ * any difference must be a near-tie at the 2048th score. */
+static int check_index_score_wide(void) {
+    enum { HEADS = 32, DIM = 128, TOP = 2048, ROUNDS = 8 };
+    const uint32_t counts[] = {4096, 131072};
+    const uint32_t max_keys = counts[1];
+    ds4_gpu_tensor *qt = upload(NULL, (size_t)HEADS * DIM * sizeof(float));
+    ds4_gpu_tensor *wt = upload(NULL, (size_t)HEADS * sizeof(float));
+    ds4_gpu_tensor *kt = upload(NULL, (size_t)max_keys * DIM * sizeof(float));
+    ds4_gpu_tensor *sd = upload(NULL, ((size_t)max_keys + 1) * sizeof(float));
+    ds4_gpu_tensor *sw = upload(NULL, ((size_t)max_keys + 1) * sizeof(float));
+    CHECK(qt && wt && kt && sd && sw);
+    float *q = ds4_gpu_tensor_contents(qt), *w = ds4_gpu_tensor_contents(wt);
+    float *k = ds4_gpu_tensor_contents(kt);
+    float *direct = ds4_gpu_tensor_contents(sd), *wide = ds4_gpu_tensor_contents(sw);
+    const float **order = malloc((size_t)max_keys * sizeof(*order));
+    unsigned char *in_direct = calloc(max_keys, 1), *in_wide = calloc(max_keys, 1);
+    CHECK(q && w && k && direct && wide && order && in_direct && in_wide);
+    for (size_t ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
+        const uint32_t keys = counts[ci];
+        for (size_t i = 0; i < (size_t)HEADS * DIM; i++)
+            q[i] = ldexpf(random_value(), (int)((i / 32) % 41) - 20);
+        for (size_t i = 0; i < (size_t)keys * DIM; i++)
+            k[i] = ldexpf(random_value(), (int)((i / 32) % 41) - 20);
+        for (size_t i = 0; i < HEADS; i++) w[i] = bf16(random_value());
+        CHECK(ds4_gpu_dsv41_quantize(qt, DIM, HEADS, DS4_V41_FP4_E8M0));
+        CHECK(ds4_gpu_dsv41_quantize(kt, DIM, keys, DS4_V41_FP4_E8M0));
+        direct[keys] = wide[keys] = 12345;
+        double seconds[2] = {0, 0};
+        for (int mode = 0; mode < 2; mode++) {
+            ds4_gpu_test_set_flags(mode ? DS4_GPU_TEST_INDEX_SCORE_WIDE : DS4_GPU_TEST_INDEX_SCORE_DIRECT);
+            for (int round = 0; round < ROUNDS; round++) {
+                const double t0 = monotonic_seconds();
+                CHECK(ds4_gpu_glm_indexer_score_one_tensor(mode ? sw : sd, qt, wt, kt,
+                    keys, HEADS, DIM, 1.0f / 64.0f, false));
+                CHECK(ds4_gpu_synchronize());
+                if (round) seconds[mode] += monotonic_seconds() - t0;
+            }
+        }
+        ds4_gpu_test_set_flags(0);
+        CHECK(direct[keys] == 12345 && wide[keys] == 12345);
+        double worst[2] = {0, 0}, gap = 0;
+        for (uint32_t j = 0; j < keys; j++) {
+            double expected = 0, magnitude = 0;
+            for (uint32_t h = 0; h < HEADS; h++) {
+                double dot = 0;
+                for (uint32_t d = 0; d < DIM; d++)
+                    dot += (double)q[(size_t)h * DIM + d] * k[(size_t)j * DIM + d];
+                const double term = fmax(dot / 64.0, 0) * w[h];
+                expected += term;
+                magnitude += fabs(term);
+            }
+            CHECK(isfinite(direct[j]) && isfinite(wide[j]));
+            worst[0] = fmax(worst[0], fabs(direct[j] - expected) / fmax(magnitude, 1));
+            worst[1] = fmax(worst[1], fabs(wide[j] - expected) / fmax(magnitude, 1));
+            gap = fmax(gap, fabs((double)direct[j] - wide[j]) / fmax(magnitude, 1));
+        }
+        CHECK(worst[0] < 0.00001 && worst[1] < 0.00001);
+        /* top-2048 membership of both kernels */
+        for (uint32_t j = 0; j < keys; j++) order[j] = direct + j;
+        qsort(order, keys, sizeof(*order), compare_score_entry);
+        const float threshold = *order[TOP - 1];
+        memset(in_direct, 0, keys);
+        for (uint32_t i = 0; i < TOP; i++) in_direct[order[i] - direct] = 1;
+        for (uint32_t j = 0; j < keys; j++) order[j] = wide + j;
+        qsort(order, keys, sizeof(*order), compare_score_entry);
+        memset(in_wide, 0, keys);
+        for (uint32_t i = 0; i < TOP; i++) in_wide[order[i] - wide] = 1;
+        uint32_t differing = 0;
+        for (uint32_t j = 0; j < keys; j++) {
+            if (in_direct[j] == in_wide[j]) continue;
+            differing++;
+            CHECK(fabs(direct[j] - threshold) <= 0.00001 * fmax(fabs(threshold), 1));
+        }
+        fprintf(stderr, "V4.1 index score wide keys=%u oracle error direct=%.3g wide=%.3g "
+                "kernel gap=%.3g top-%d symmetric difference=%u (near-ties) "
+                "us per call direct=%.0f wide=%.0f\n",
+                keys, worst[0], worst[1], gap, TOP, differing,
+                seconds[0] / (ROUNDS - 1) * 1e6, seconds[1] / (ROUNDS - 1) * 1e6);
+    }
+    free(in_wide); free(in_direct); free(order);
+    ds4_gpu_tensor_free(sw); ds4_gpu_tensor_free(sd); ds4_gpu_tensor_free(kt);
+    ds4_gpu_tensor_free(wt); ds4_gpu_tensor_free(qt);
+    fprintf(stderr, "V4.1 wide index score: double-precision oracle PASS\n");
+    return 1;
+}
+
+/* Candidate-only index rows against the wide row they replace (wide scores,
+ * candidate filter, radix top-512): the same ids in the same order, with
+ * realistic and wide FP4 block scales, partial newest blocks and ties. */
+static int check_index_candidates(void) {
+    enum { HEADS = 32, DIM = 128, TOP = 512, ROUNDS = 6 };
+    const uint32_t widths[] = {16385, 16391, 20007, 65536, 131072, 131075, 262147};
+    const uint32_t max_keys = 262147, max_blocks = (max_keys + 7) / 8;
+    ds4_gpu_tensor *qt = upload(NULL, (size_t)HEADS * DIM * 4), *wt = upload(NULL, HEADS * 4);
+    ds4_gpu_tensor *kt = upload(NULL, (size_t)max_keys * DIM * 4);
+    ds4_gpu_tensor *full = upload(NULL, (size_t)max_keys * 4), *plain = upload(NULL, (size_t)max_keys * 4);
+    ds4_gpu_tensor *source = upload(NULL, (size_t)max_keys * 4), *cand = upload(NULL, 16384 * 4);
+    ds4_gpu_tensor *list = upload(NULL, 2048 * 4), *blocks_t = upload(NULL, (size_t)max_blocks * 4);
+    ds4_gpu_tensor *picked = upload(NULL, 2048 * 4), *mask = upload(NULL, (size_t)max_blocks * 4);
+    ds4_gpu_tensor *old_sel = upload(NULL, TOP * 4), *new_sel = upload(NULL, TOP * 4);
+    CHECK(qt && wt && kt && full && plain && source && cand && list && blocks_t && picked && mask &&
+          old_sel && new_sel);
+    float *q = ds4_gpu_tensor_contents(qt), *w = ds4_gpu_tensor_contents(wt);
+    float *k = ds4_gpu_tensor_contents(kt), *s = ds4_gpu_tensor_contents(source);
+    const float *p = ds4_gpu_tensor_contents(plain), *c = ds4_gpu_tensor_contents(cand);
+    const float *m = ds4_gpu_tensor_contents(mask);
+    const uint32_t *l = ds4_gpu_tensor_contents(list);
+    const int32_t *a = ds4_gpu_tensor_contents(old_sel), *b = ds4_gpu_tensor_contents(new_sel);
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(*widths); wi++) {
+        const uint32_t n = widths[wi], blocks = (n + 7) / 8, count = 16384 - (blocks * 8 - n);
+        double seconds[2] = {0, 0};
+        uint32_t ties = 0;
+        for (int mode = 0; mode < 4; mode++) {
+            /* bit 0: block exponents over +-20 instead of +-2; bit 1: ties */
+            const int range = mode & 1 ? 20 : 2;
+            for (size_t i = 0; i < (size_t)HEADS * DIM; i++)
+                q[i] = ldexpf(random_value(), (int)((i / 32) % (2 * range + 1)) - range);
+            for (size_t i = 0; i < (size_t)n * DIM; i++)
+                k[i] = ldexpf(random_value(), (int)((i / 32 + n) % (2 * range + 1)) - range);
+            for (size_t i = 0; i < HEADS; i++) w[i] = random_value() * 0.37139f;
+            for (uint32_t i = 0; i < n; i++) s[i] = (float)((i * 7919u + mode) % 1048573u);
+            CHECK(ds4_gpu_dsv41_quantize(qt, DIM, HEADS, DS4_V41_FP4_E8M0));
+            CHECK(ds4_gpu_dsv41_quantize(kt, DIM, n, DS4_V41_FP4_E8M0));
+            CHECK(ds4_gpu_synchronize());
+            if (mode & 2) {
+                /* copy the best key over 1/16 of all keys: the 512th score ties */
+                CHECK(ds4_gpu_dsv41_indexer_score_one_tensor(plain, qt, wt, kt, n, HEADS, DIM,
+                    1.0f / 64.0f, false) && ds4_gpu_synchronize());
+                uint32_t best = 0;
+                for (uint32_t i = 1; i < n; i++) if (p[i] > p[best]) best = i;
+                for (uint32_t i = 0; i < n; i += 16)
+                    memcpy(k + (size_t)(i ^ 5) % n * DIM, k + (size_t)best * DIM, DIM * 4);
+            }
+            CHECK(ds4_gpu_begin_commands());
+            CHECK(ds4_gpu_dsv41_candidate_blocks(blocks_t, source, n, 1, n - 1, 1));
+            CHECK(ds4_gpu_dsv41_indexer_topk_tensor(picked, blocks_t, blocks, 1, 2048));
+            CHECK(ds4_gpu_dsv4_topk_mask_tensor(mask, picked, blocks, 1, 2048));
+            CHECK(ds4_gpu_dsv41_indexer_score_one_tensor(plain, qt, wt, kt, n, HEADS, DIM, 1.0f / 64.0f, false));
+            CHECK(ds4_gpu_end_commands());
+            for (int round = 0; round < ROUNDS; round++) {
+                for (int path = 0; path < 2; path++) {
+                    const double t0 = monotonic_seconds();
+                    CHECK(ds4_gpu_begin_commands());
+                    if (path) {
+                        CHECK(ds4_gpu_dsv41_indexer_candidates_tensor(new_sel, cand, list, qt, wt, kt, mask,
+                            n, 1.0f / 64.0f, TOP));
+                    } else {
+                        CHECK(ds4_gpu_dsv41_indexer_score_one_tensor(full, qt, wt, kt, n, HEADS, DIM,
+                            1.0f / 64.0f, false));
+                        CHECK(ds4_gpu_dsv41_candidate_filter(full, mask, n, 1, n - 1, 1, 0));
+                        CHECK(ds4_gpu_dsv41_indexer_topk_tensor(old_sel, full, n, 1, TOP));
+                    }
+                    CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
+                    if (round) seconds[path] += monotonic_seconds() - t0;
+                }
+                CHECK(!memcmp(a, b, TOP * sizeof(*a)));
+            }
+            /* the list is the mask's candidates in order; each score is the wide one */
+            uint32_t at = 0;
+            for (uint32_t j = 0; j < blocks; j++) if (m[j] == 0.0f) CHECK(at < 2048 && l[at++] == j);
+            CHECK(at == 2048 && l[2047] == blocks - 1);
+            for (uint32_t i = 0; i < count; i++) {
+                const uint32_t key = l[i / 8] * 8 + i % 8;
+                CHECK(key < n && !memcmp(c + i, p + key, sizeof(*c)));
+            }
+            for (uint32_t i = 0; i < TOP; i++) ties += i && p[a[i]] == p[a[i - 1]];
+        }
+        fprintf(stderr, "V4.1 candidate index rows keys=%u candidates=%u: ids, order and scores "
+                "identical (%u tied neighbours) us per row full=%.0f candidates=%.0f\n",
+                n, count, ties, seconds[0] / (4 * (ROUNDS - 1)) * 1e6, seconds[1] / (4 * (ROUNDS - 1)) * 1e6);
+    }
+    CHECK(!ds4_gpu_dsv41_indexer_candidates_tensor(new_sel, cand, list, qt, wt, kt, mask,
+        16384, 1.0f / 64.0f, TOP));
+    ds4_gpu_tensor *tensors[] = {qt, wt, kt, full, plain, source, cand, list, blocks_t, picked, mask,
+                                 old_sel, new_sel};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    return 1;
+}
+#else
+static int check_index_score_wide(void) { return 1; }
+static int check_index_candidates(void) { return 1; }
+#endif
 
 static int check_compact_carry(void) {
     const uint32_t widths[] = {1, 31, 32, 33, 127, 128, 129, 20480};
@@ -1296,13 +1670,33 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--rope-quantize")) {
+        const int ok = ds4_gpu_init() && check_rope_quantize();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--index-scores")) {
         const int ok = ds4_gpu_init() && check_indexer_batch();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--index-score-wide")) {
+        const int ok = ds4_gpu_init() && check_index_score_wide();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--index-candidates")) {
+        const int ok = ds4_gpu_init() && check_index_candidates();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--index-topk")) {
         const int ok = ds4_gpu_init() && check_causal_topk();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--topk-select")) {
+        const int ok = ds4_gpu_init() && check_topk_select();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
@@ -1317,10 +1711,12 @@ int main(int argc, char **argv) {
         return ok ? 0 : 1;
     }
     if (argc != 1) return 2;
-    int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&
-             check_candidates() && check_sparse_gather() && check_indexer_batch() &&
-             check_embedding() && check_index_projection() && check_general_topk() && check_causal_topk() && check_compact_carry() && check_attention_output(false) &&
-             check_tp_attention();
+    int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() &&
+             check_rope_quantize() && check_pool() && check_candidates() && check_candidates_batch(16449, 17, 16400) &&
+             check_candidates_batch(17017, 17, 17000) && check_sparse_gather() && check_indexer_batch() &&
+             check_index_score_wide() && check_index_candidates() && check_embedding() && check_index_projection() && check_general_topk() &&
+             check_topk_select() && check_causal_topk() && check_indexer_all() && check_compact_carry() &&
+             check_attention_output(false) && check_tp_attention();
     ds4_gpu_cleanup();
     return ok ? 0 : 1;
 }

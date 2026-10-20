@@ -293,7 +293,7 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
         /* Fixed concurrency hides random-read latency without caching the table.
          * Each worker owns disjoint output rows; all finish before GPU use. */
         if (count >= ENGRAM_PARALLEL_MIN_ROWS) {
-            batch.readers = ENGRAM_READERS;
+            batch.readers = count < ENGRAM_READERS ? count : ENGRAM_READERS;
 #ifdef __APPLE__
             dispatch_apply_f(batch.readers,
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &batch, read_batch_part);
@@ -327,6 +327,63 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
     int saved = errno;
     free(request);
     errno = saved;
+    return ok;
+}
+
+struct ds4_engram_prefetch {
+    const ds4_engram_table *table;
+    const uint32_t *rows;
+    size_t tokens, stride;
+    float *out;
+    bool ok;
+    int error;
+#ifdef __APPLE__
+    dispatch_group_t group;
+#else
+    pthread_t thread;
+    bool threaded;
+#endif
+};
+
+static void prefetch_run(void *context) {
+    ds4_engram_prefetch *p = context;
+    p->ok = ds4_engram_read_batch(p->table, p->rows, p->tokens, p->stride, p->out);
+    if (!p->ok) p->error = errno ? errno : EIO;
+}
+
+#ifndef __APPLE__
+static void *prefetch_thread(void *context) {
+    prefetch_run(context);
+    return NULL;
+}
+#endif
+
+ds4_engram_prefetch *ds4_engram_read_batch_start(const ds4_engram_table *table, const uint32_t *rows,
+                                                 size_t tokens, size_t stride, float *out) {
+    ds4_engram_prefetch *p = calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    *p = (ds4_engram_prefetch){.table = table, .rows = rows, .tokens = tokens, .stride = stride, .out = out};
+#ifdef __APPLE__
+    p->group = dispatch_group_create();
+    dispatch_group_async_f(p->group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), p, prefetch_run);
+#else
+    p->threaded = pthread_create(&p->thread, NULL, prefetch_thread, p) == 0;
+    if (!p->threaded) prefetch_run(p);
+#endif
+    return p;
+}
+
+bool ds4_engram_read_batch_finish(ds4_engram_prefetch *p) {
+    if (!p) return false;
+#ifdef __APPLE__
+    dispatch_group_wait(p->group, DISPATCH_TIME_FOREVER);
+    dispatch_release(p->group);
+#else
+    if (p->threaded && pthread_join(p->thread, NULL)) abort();
+#endif
+    const bool ok = p->ok;
+    if (!ok) errno = p->error;
+    free(p);
     return ok;
 }
 
