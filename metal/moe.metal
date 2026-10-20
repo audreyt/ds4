@@ -14,7 +14,7 @@
 #define N_R0_Q5_K 4
 #define N_R0_Q6_K 2
 #define N_R0_IQ2_XXS 4
-#define N_R0_IQ1_S 4
+#define N_R0_IQ1_S 2
 #define N_R0_MXFP4 2
 
 static constant float ds4_metal_mxfp4_values[16] = {

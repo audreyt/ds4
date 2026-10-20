@@ -1766,6 +1766,126 @@ done:
     return rc;
 }
 
+/* ggml dequantize_row_iq1_s for one row, in double. */
+static void iq1s_dequant_row(const uint8_t *row, uint32_t n, double *y) {
+    for (uint32_t b = 0; b < n / QK_K; b++) {
+        const block_iq1_s *x = (const block_iq1_s *)(row + (uint64_t)b * sizeof(block_iq1_s));
+        const double d = f16_to_f32(x->d);
+        for (int ib = 0; ib < QK_K / 32; ib++) {
+            const uint16_t qh = x->qh[ib];
+            const double dl = d * (2 * ((qh >> 12) & 7) + 1);
+            const double delta = (qh & 0x8000) ? -0.125 : 0.125;
+            for (int l = 0; l < 4; l++) {
+                const int8_t *grid =
+                    (const int8_t *)(iq1s_grid + (x->qs[4 * ib + l] | (((qh >> (3 * l)) & 7) << 8)));
+                for (int j = 0; j < 8; j++) *y++ = dl * (grid[j] + delta);
+            }
+        }
+    }
+}
+
+/* max |gpu - W x| / sum |W x| over rows of one expert matrix. */
+static double iq1s_matvec_error(const uint8_t *w, uint64_t row_bytes, uint32_t rows,
+                                uint32_t n, const float *x, const float *gpu) {
+    double worst = 0.0, *wf = malloc((size_t)n * sizeof(double));
+    if (!wf) return 1.0;
+    for (uint32_t r = 0; r < rows; r++) {
+        iq1s_dequant_row(w + (uint64_t)r * row_bytes, n, wf);
+        double ref = 0.0, mag = 0.0;
+        for (uint32_t i = 0; i < n; i++) {
+            ref += wf[i] * x[i];
+            mag += fabs(wf[i] * x[i]);
+        }
+        const double rel = fabs(gpu[r] - ref) / (mag + 1e-12);
+        if (rel > worst) worst = rel;
+    }
+    free(wf);
+    return worst;
+}
+
+/* Routed IQ1_S experts (Unsloth V4.1 Q1) through the Metal mul_mv_id gate,
+ * up and down kernels against ggml's scalar dequantization. */
+static int check_iq1s_routed(void) {
+    enum { IN = 512, MID = 512, OUT = 256, TOTAL = 4, USED = 2 };
+    const uint64_t gate_row = IN / QK_K * sizeof(block_iq1_s);
+    const uint64_t down_row = MID / QK_K * sizeof(block_iq1_s);
+    const uint64_t gate_expert = MID * gate_row, down_expert = OUT * down_row;
+    const uint64_t up_off = TOTAL * gate_expert, down_off = 2 * up_off;
+    const uint64_t used = down_off + TOTAL * down_expert;
+    const uint64_t page = (uint64_t)getpagesize(), alloc = (used + page - 1) / page * page;
+    const int32_t selected[USED] = {3, 1};
+    const float weights[USED] = {0.75f, 0.25f};
+    int rc = 1;
+    void *raw = NULL;
+    float x[IN], gate[USED * MID], up[USED * MID], mid[USED * MID], experts[USED * OUT];
+    ds4_gpu_tensor *xt = NULL, *gt = NULL, *ut = NULL, *mt = NULL, *et = NULL, *ot = NULL,
+                   *st = NULL, *wt = NULL;
+    REQUIRE(posix_memalign(&raw, (size_t)page, (size_t)alloc) == 0);
+    uint8_t *w = raw;
+    uint32_t seed = 0x1f2e3d4cu;
+    for (uint64_t i = 0; i < alloc; i++) {
+        seed = seed * 1664525u + 1013904223u;
+        w[i] = (uint8_t)(seed >> 24);
+    }
+    for (uint64_t b = 0; b < used / sizeof(block_iq1_s); b++) {
+        block_iq1_s *blk = (block_iq1_s *)(w + b * sizeof(block_iq1_s));
+        blk->d = (uint16_t)(0x2800u | (blk->d & 0x3ffu));
+    }
+    for (int i = 0; i < IN; i++) {
+        seed = seed * 1664525u + 1013904223u;
+        x[i] = (float)((int)(seed >> 20) - 2048) / 2048.0f;
+    }
+    REQUIRE(ds4_gpu_init() != 0);
+    REQUIRE(ds4_gpu_set_model_map(raw, alloc) != 0);
+    ds4_gpu_set_quality(false);
+    xt = ds4_gpu_tensor_alloc(sizeof(x));
+    gt = ds4_gpu_tensor_alloc(sizeof(gate));
+    ut = ds4_gpu_tensor_alloc(sizeof(up));
+    mt = ds4_gpu_tensor_alloc(sizeof(mid));
+    et = ds4_gpu_tensor_alloc(sizeof(experts));
+    ot = ds4_gpu_tensor_alloc(OUT * sizeof(float));
+    st = ds4_gpu_tensor_alloc(sizeof(selected));
+    wt = ds4_gpu_tensor_alloc(sizeof(weights));
+    REQUIRE(xt && gt && ut && mt && et && ot && st && wt);
+    REQUIRE(ds4_gpu_tensor_write(xt, 0, x, sizeof(x)) != 0);
+    REQUIRE(ds4_gpu_tensor_write(st, 0, selected, sizeof(selected)) != 0);
+    REQUIRE(ds4_gpu_tensor_write(wt, 0, weights, sizeof(weights)) != 0);
+    REQUIRE(ds4_gpu_routed_moe_one_tensor(ot, gt, ut, mt, et, raw, alloc, 0, up_off, down_off,
+                                          DS4_TENSOR_IQ1_S, DS4_TENSOR_IQ1_S,
+                                          gate_expert, gate_row, down_expert, down_row,
+                                          IN, MID, OUT, st, wt, TOTAL, USED, 10.0f,
+                                          xt, NULL, 0, false) != 0);
+    REQUIRE(ds4_gpu_tensor_read(gt, 0, gate, sizeof(gate)) != 0);
+    REQUIRE(ds4_gpu_tensor_read(ut, 0, up, sizeof(up)) != 0);
+    REQUIRE(ds4_gpu_tensor_read(mt, 0, mid, sizeof(mid)) != 0);
+    REQUIRE(ds4_gpu_tensor_read(et, 0, experts, sizeof(experts)) != 0);
+    double worst = 0.0;
+    for (int e = 0; e < USED; e++) {
+        const uint64_t ex = (uint64_t)selected[e];
+        const double g = iq1s_matvec_error(w + ex * gate_expert, gate_row, MID, IN, x, gate + e * MID);
+        const double u = iq1s_matvec_error(w + up_off + ex * gate_expert, gate_row, MID, IN, x,
+                                           up + e * MID);
+        const double d = iq1s_matvec_error(w + down_off + ex * down_expert, down_row, OUT, MID,
+                                           mid + e * MID, experts + e * OUT);
+        printf("iq1s-routed: expert %d gate %.3g up %.3g down %.3g\n", (int)ex, g, u, d);
+        worst = fmax(worst, fmax(g, fmax(u, d)));
+    }
+    REQUIRE(worst < 1e-5);
+    rc = 0;
+done:
+    ds4_gpu_tensor_free(xt);
+    ds4_gpu_tensor_free(gt);
+    ds4_gpu_tensor_free(ut);
+    ds4_gpu_tensor_free(mt);
+    ds4_gpu_tensor_free(et);
+    ds4_gpu_tensor_free(ot);
+    ds4_gpu_tensor_free(st);
+    ds4_gpu_tensor_free(wt);
+    free(raw);
+    if (!rc) puts("iq1s-routed: OK");
+    return rc;
+}
+
 static int check_vision_routing(void) {
     enum { ROWS = 33, EXPERTS = 384, USED = 6 };
     ds41_gpu_graph *g = calloc(1, sizeof(*g));
@@ -1906,6 +2026,8 @@ int main(int argc, char **argv) {
         return check_batch_head(argv[1]);
     if (argc == 2 && !strcmp(argv[1], "--context-fit"))
         return check_context_fit();
+    if (argc == 2 && !strcmp(argv[1], "--iq1s-routed"))
+        return check_iq1s_routed();
     if (argc == 2 && !strcmp(argv[1], "--vision-routing"))
         return check_vision_routing();
     if (argc == 5 && !strcmp(argv[1], "--vision-encoder"))

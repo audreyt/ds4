@@ -31675,8 +31675,10 @@ static uint32_t ds4_gpu_routed_mv_nr0(uint32_t type) {
     case DS4_METAL_TENSOR_Q4_K:    return 2;
     case DS4_METAL_TENSOR_MXFP4:   return 2;
     case DS4_METAL_TENSOR_Q2_K:
-    case DS4_METAL_TENSOR_IQ2_XXS:
-    case DS4_METAL_TENSOR_IQ1_S:   return 4;
+    case DS4_METAL_TENSOR_IQ2_XXS: return 4;
+    /* Must match N_R0_IQ1_S. Two rows per SIMD group decode V4.1 Q1 routed
+     * experts ~1.5% faster than four on M5 Max; per-row sums are unchanged. */
+    case DS4_METAL_TENSOR_IQ1_S:   return 2;
     default:                       return 0;
     }
 }
