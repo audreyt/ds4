@@ -5292,7 +5292,8 @@ static void test_dequant_k_block(uint32_t type, const uint8_t *b, float *y) {
 }
 
 /* Q5_K/Q6_K dense weights (Unsloth V4.1 attention/shared/head) through the
- * generic quant matmul at decode (mv_ext) and prefill (mm/NAX) widths, and
+ * generic quant matmul at decode (SIMD matvec at 1, mv_ext at 4) and prefill
+ * (mm/NAX) widths, and
  * the Q6_K embedding get-rows, against the scalar ggml dequantization. */
 static void test_metal_dense_q5_q6_k(void) {
     const uint32_t in_dim = 512, out_dim = 64;

@@ -19994,6 +19994,53 @@ static int ds4_gpu_matmul_quant_impl_tensor(
             }
         }
 
+        /*
+         * Single-token Q5_K/Q6_K (Unsloth V4.1 attention, shared expert and
+         * vocabulary head): the GLM routed down kernels with one always-
+         * selected expert are exactly a dense llama.cpp-style K-quant matvec.
+         * mul_mv_ext r1_1 streamed only ~130 GB/s on these shapes.
+         */
+        if ((weight_type == DS4_METAL_TENSOR_Q5_K || weight_type == DS4_METAL_TENSOR_Q6_K) &&
+            n_tok == 1u &&
+            (in_dim % 256u) == 0 &&
+            getenv("DS4_METAL_DISABLE_QK_SIMD_MV") == NULL) {
+            const bool q5 = weight_type == DS4_METAL_TENSOR_Q5_K;
+            id<MTLComputePipelineState> pipeline = q5 ?
+                ds4_gpu_hot_pipeline(g_glm_q5_k_down_f32_pipeline, "kernel_glm_q5_K_down_f32") :
+                ds4_gpu_hot_pipeline(g_glm_q6_k_down_f32_pipeline, "kernel_glm_q6_K_down_f32");
+            if (pipeline) {
+                ds4_gpu_glm_routed_moe_args args = {
+                    .in_dim = (uint32_t)in_dim,
+                    .mid_dim = (uint32_t)in_dim,
+                    .out_dim = (uint32_t)out_dim,
+                    .n_total_expert = 1,
+                    .n_expert_used = 1,
+                    .n_tokens = 1,
+                    .mid_token_stride = (uint32_t)in_dim,
+                    .down_type = weight_type,
+                    .tp_world = 1,
+                    .down_expert_bytes = weight_bytes,
+                    .down_row_bytes = row_bytes,
+                };
+                const int32_t expert = 0;
+                /* Two SIMD groups of N_R0_Q5_K = 4 or N_R0_Q6_K = 2 rows. */
+                const NSUInteger rows_ptg = q5 ? 8u : 4u;
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:pipeline];
+                [enc setBytes:&args length:sizeof(args) atIndex:0];
+                [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+                [enc setBytes:&expert length:sizeof(expert) atIndex:2];
+                [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:3];
+                [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
+                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + rows_ptg - 1u) / rows_ptg, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+
+                if (!ds4_gpu_finish_command_buffer(cb, owned, "Q5_K/Q6_K SIMD matvec")) return 0;
+                return 1;
+            }
+        }
+
         if (n_tok <= 8u && (in_dim % 128u) == 0) {
             const int16_t nsg = 2;
             const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
