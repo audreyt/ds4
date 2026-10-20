@@ -1733,6 +1733,39 @@ done:
     return rc;
 }
 
+/* The resident context fit keeps every shape that already fits, then gives up
+ * the wide-prefill carry and prefill width in order before refusing. */
+static int check_context_fit(void) {
+    int rc = 1;
+    g_ds4_shape = DS4_SHAPE_FLASH41;
+    g_ds41_prefill_ceiling = 0;
+    const uint64_t def8k = ds41_graph_bytes(8192), def256k = ds41_graph_bytes(262144);
+    REQUIRE(ds41_carry_cap(8192) > 0 && ds41_carry_cap(262144) > 0);
+    REQUIRE(ds41_fit_context(8192, 1, def8k + 1) == 0);
+    REQUIRE(ds41_graph_bytes(8192) == def8k && ds41_carry_cap(8192) > 0);
+    REQUIRE(ds41_fit_context(262144, 1, def256k) == 2048);
+    REQUIRE(ds41_carry_cap(262144) == 0 && ds41_prefill_limit(262144) == 2048);
+    const uint64_t r2048 = ds41_graph_bytes(262144);
+    g_ds41_prefill_ceiling = 1024;
+    const uint64_t r1024 = ds41_graph_bytes(262144);
+    g_ds41_prefill_ceiling = 512;
+    const uint64_t r512 = ds41_graph_bytes(262144);
+    REQUIRE(r512 < r1024 && r1024 < r2048 && r2048 < def256k);
+    REQUIRE(ds41_fit_context(262144, 1, r2048) == 1024);
+    REQUIRE(ds41_fit_context(262144, 1, r1024) == 512);
+    REQUIRE(ds41_fit_context(262144, 1, r512) == UINT32_MAX);
+    REQUIRE(g_ds41_prefill_ceiling == 0 && ds41_graph_bytes(262144) == def256k);
+    REQUIRE(ds41_fit_context(8192, 2, 2 * def8k + 1) == 0);
+    REQUIRE(ds41_fit_context(8192, 2, 2 * def8k) == 2048);
+    g_ds41_prefill_ceiling = 2048;
+    REQUIRE(ds41_prefill_limit(1000) == 1000);
+    rc = 0;
+done:
+    g_ds41_prefill_ceiling = 0;
+    if (!rc) puts("context-fit: OK");
+    return rc;
+}
+
 static int check_vision_routing(void) {
     enum { ROWS = 33, EXPERTS = 384, USED = 6 };
     ds41_gpu_graph *g = calloc(1, sizeof(*g));
@@ -1871,6 +1904,8 @@ int main(int argc, char **argv) {
         return check_batch_admission();
     if (argc == 3 && !strcmp(argv[2], "--batch-head"))
         return check_batch_head(argv[1]);
+    if (argc == 2 && !strcmp(argv[1], "--context-fit"))
+        return check_context_fit();
     if (argc == 2 && !strcmp(argv[1], "--vision-routing"))
         return check_vision_routing();
     if (argc == 5 && !strcmp(argv[1], "--vision-encoder"))

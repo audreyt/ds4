@@ -41858,9 +41858,15 @@ static void ds41_dspark_reset(ds41_dspark *d);
 static bool ds41_dspark_capture(ds41_dspark *d, uint32_t layer, uint32_t pos,
                                 const ds4_gpu_tensor *residual, uint32_t rows);
 
+/* Engine-wide prefill ceiling. Zero keeps the ctx-tiered prefill width and
+ * the wide-prefill carry; ds41_fit_context sets it, which also drops the
+ * carry, only when a resident context would not fit otherwise. */
+static uint32_t g_ds41_prefill_ceiling;
+
 static uint32_t ds41_prefill_limit(uint32_t ctx) {
-    const uint32_t limit = ctx < 8192u || getenv("DS4_METAL_DISABLE_V41_WIDE_CHUNK") ? 2048u :
+    uint32_t limit = ctx < 8192u || getenv("DS4_METAL_DISABLE_V41_WIDE_CHUNK") ? 2048u :
         (ctx < 16384u || getenv("DS4_METAL_DISABLE_V41_8K_CHUNK")) ? 4096u : DS41_PREFILL_CAP;
+    if (g_ds41_prefill_ceiling && limit > g_ds41_prefill_ceiling) limit = g_ds41_prefill_ceiling;
     return ctx < limit ? ctx : limit;
 }
 
@@ -41870,6 +41876,7 @@ static uint32_t ds41_carry_words(uint32_t width, uint32_t format, bool compact) 
 }
 
 static uint32_t ds41_carry_cap(uint32_t ctx) {
+    if (g_ds41_prefill_ceiling) return 0;
     const bool compact = !getenv("DS4_METAL_DISABLE_V41_COMPACT_CARRY");
     const uint64_t row_bytes = ((uint64_t)ds41_carry_words(DS4_N_HC * DS4_N_EMBD,
         DS4_V41_CARRY_BF16, compact) + DS4_N_HC + 24u + DS4_N_INDEXER_TOP_K +
@@ -42081,6 +42088,22 @@ static uint64_t ds41_graph_bytes(uint32_t ctx) {
     /* The index sorter owns two full-width merge buffers outside the graph. */
     const uint64_t sort = (uint64_t)DS41_INDEX_BATCH * ctx * 2u * sizeof(uint32_t);
     return floats * sizeof(float) + sizeof(*g) + (uint64_t)DS4_N_VOCAB * 4u + packed + sort;
+}
+
+/* Picks the widest buffer shape whose graphs fit in `room` bytes: the
+ * ctx-tiered default, then no wide-prefill carry with 2048, 1024 and 512
+ * prefill rows. Without the carry, prefill already runs in chunks of at most
+ * 2048 rows, so the first fallback keeps that arithmetic and gives up only
+ * the layer-major sweep. Returns the ceiling (0 for the default), or
+ * UINT32_MAX with the default restored when nothing fits. */
+static uint32_t ds41_fit_context(uint32_t ctx, uint32_t sessions, uint64_t room) {
+    static const uint32_t ceilings[] = {0u, 2048u, 1024u, 512u};
+    for (size_t i = 0; i < sizeof(ceilings) / sizeof(ceilings[0]); i++) {
+        g_ds41_prefill_ceiling = ceilings[i];
+        if (ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions) < room) return ceilings[i];
+    }
+    g_ds41_prefill_ceiling = 0;
+    return UINT32_MAX;
 }
 
 static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
@@ -72685,26 +72708,37 @@ static bool engine_warm_full_model(const ds4_engine_options *opt) {
 }
 
 #ifdef DS4_HAS_DEEPSEEK41_GPU
-static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
-                                      bool fit_cache, uint64_t host,
-                                      uint64_t recommended) {
+/* Bytes V4.1 needs before any expert cache for `graph_bytes` of session
+ * graphs, the safe budget, and the routed expert size when streaming. */
+static bool ds41_memory_need(ds4_engine *e, uint64_t graph_bytes, uint64_t host,
+                             uint64_t recommended, uint64_t *fixed, uint64_t *budget,
+                             uint64_t *expert) {
     const uint64_t gib = UINT64_C(1073741824);
-    uint64_t budget = host / 8u * 7u;
-    if (!host || !recommended) {
-        fprintf(stderr, "ds4: cannot determine a safe V4.1 memory budget\n");
-        return false;
-    }
-    if (budget > recommended) budget = recommended;
+    if (!host || !recommended) return false;
+    *budget = host / 8u * 7u;
+    if (*budget > recommended) *budget = recommended;
     uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
     if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
     weights = ds4_add_sat_u64(weights, e->vision_model.size);
     weights = ds4_add_sat_u64(weights, e->mtp_model.size);
     if (e->dspark) graph_bytes = ds4_add_sat_u64(graph_bytes,
         ds4_mul_sat_u64(UINT64_C(64) << 20, engine_placement_session_count(e)));
-    const uint64_t fixed = ds4_add_sat_u64(weights,
+    *fixed = ds4_add_sat_u64(weights,
         ds4_add_sat_u64(graph_bytes, 2u * gib + e->ssd_streaming_prefill_headroom_bytes));
-    uint64_t expert = 0;
-    if (e->ssd_streaming && !ds4_streaming_routed_expert_bytes(&e->weights, &expert)) return false;
+    *expert = 0;
+    return !e->ssd_streaming || ds4_streaming_routed_expert_bytes(&e->weights, expert);
+}
+
+static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
+                                      bool fit_cache, uint64_t host,
+                                      uint64_t recommended) {
+    if (!host || !recommended) {
+        fprintf(stderr, "ds4: cannot determine a safe V4.1 memory budget\n");
+        return false;
+    }
+    uint64_t fixed = 0, budget = 0, expert = 0;
+    if (!ds41_memory_need(e, graph_bytes, host, recommended, &fixed, &budget, &expert))
+        return false;
     if (fixed >= budget || (expert && budget - fixed < expert)) {
         fprintf(stderr, "ds4: V4.1 needs %.2f GiB before the expert cache; safe budget %.2f GiB. "
                         "Use --ssd-streaming or a smaller context.\n",
@@ -72725,15 +72759,44 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
     return true;
 }
 
-static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cache) {
+static uint64_t ds41_host_memory_bytes(void) {
     uint64_t host = glm_graph_host_memory_bytes();
 #ifdef __linux__
     const long pages = sysconf(_SC_PHYS_PAGES), page_size = sysconf(_SC_PAGESIZE);
     if (pages > 0 && page_size > 0 && (uint64_t)pages <= UINT64_MAX / (uint64_t)page_size)
         host = (uint64_t)pages * (uint64_t)page_size;
 #endif
+    return host;
+}
+
+static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cache) {
     return ds41_memory_admit_for_host(e, graph_bytes, fit_cache,
-        host, ds4_gpu_recommended_working_set_size());
+        ds41_host_memory_bytes(), ds4_gpu_recommended_working_set_size());
+}
+
+/* Admits the engine's context. A single-host resident Metal context that
+ * does not fit at the default buffer shape is first fitted by
+ * ds41_fit_context; later sessions of this engine keep the fitted shape. */
+static bool ds41_admit_engine_context(ds4_engine *e, const ds4_engine_options *opt) {
+    const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
+    const uint32_t sessions = e->placement_session_count_hint > 0 ?
+        (uint32_t)e->placement_session_count_hint : 1;
+    const uint32_t previous = g_ds41_prefill_ceiling;
+    g_ds41_prefill_ceiling = 0;
+    uint64_t base = 0, budget = 0, expert = 0;
+    if (e->backend == DS4_BACKEND_METAL && !e->ssd_streaming && !e->tp.active &&
+        opt->distributed.role == DS4_DISTRIBUTED_NONE &&
+        !getenv("DS4_METAL_DISABLE_V41_CONTEXT_FIT") &&
+        ds41_memory_need(e, 0, ds41_host_memory_bytes(),
+            ds4_gpu_recommended_working_set_size(), &base, &budget, &expert) &&
+        budget > base) {
+        const uint32_t ceiling = ds41_fit_context(ctx, sessions, budget - base);
+        /* Engine open admits twice; report a fitted shape once. */
+        if (ceiling != 0 && ceiling != UINT32_MAX && ceiling != previous)
+            fprintf(stderr, "ds4: V4.1 ctx %u fits resident without the wide-prefill carry, "
+                            "in %u-row prefill chunks\n", ctx, ceiling);
+    }
+    return ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true);
 }
 #endif
 
@@ -73177,10 +73240,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #endif
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
-        const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
-        const uint32_t sessions = e->placement_session_count_hint > 0 ?
-            (uint32_t)e->placement_session_count_hint : 1;
-        if (!ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true)) {
+        if (!ds41_admit_engine_context(e, opt)) {
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -73668,10 +73728,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
-            const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
-            const uint32_t sessions = e->placement_session_count_hint > 0 ?
-                (uint32_t)e->placement_session_count_hint : 1;
-            if (!ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true)) {
+            if (!ds41_admit_engine_context(e, opt)) {
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
