@@ -1,0 +1,18 @@
+{
+  "format": "ds4-directional-steering-v1",
+  "shape": [
+    40,
+    5120
+  ],
+  "profile": "deepseek-v41-flash",
+  "component": "ffn_out",
+  "thinking": true,
+  "pair_normalize": false,
+  "orthogonalize_control_mean": false,
+  "keep_layers": "3:36",
+  "good_file": "candor-pos.txt (data/pos.txt from zjj1993's Qwen3.8 Flash Next direction on Hugging Face, user turns only)",
+  "bad_file": "candor-neg.txt (data/neg.txt from the same repository)",
+  "model": "gguf/DeepSeek-V4.1-Flash-1017-Q1.gguf",
+  "source": "contrast-pair recipe published by zjj1993, ported to V4.1; prompts under the Qwen Community License 1.0, not redistributed here",
+  "note": "use --dir-steering-ffn 1: projects the component out of every HC copy; larger scales flip it"
+}

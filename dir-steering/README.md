@@ -17,7 +17,8 @@ The file shape depends on the model:
 - DeepSeek V4 Flash: `43 x 4096`.
 - DeepSeek V4.1 Flash: `40 x 5120`. The FFN scale edits the post-layer
   residual across the hyper-connection copies (the GLP refusal-vector site);
-  the attention scale edits the attention block output.
+  the attention scale edits the attention block output. Dumps average those
+  copies at the last prompt token, at the same site.
 - GLM 5.3 Flash: `45 x 4096`. The separate MTP predictor layer is omitted.
 - Qwen3.8 Flash Next: `48 x 2560`. FFN steering is applied to each
   hyper-connection branch of the residual; dumps average those branches
@@ -210,3 +211,78 @@ Qwen steering is Metal-only. `--mtp-model`, SSD streaming, and `--power`
 remain unsupported for this graph. The bank contains only the 48 trunk layers;
 the embedded MTP predictor remains unsteered. Its drafts are verified by the
 steered target trunk, so `--mtp` remains supported.
+
+## DeepSeek V4.1 Flash: a candor direction
+
+`out/candor-v41.f32` is a V4.1 direction for questions on politically
+sensitive history, where a model may answer with a refusal, an evasion or a
+single account presented as settled instead of the evidence. It follows the
+contrast-pair recipe zjj1993 published for Qwen3.8 Flash Next on Hugging
+Face: 30 pairs, in English and Chinese, each putting a sensitive event next
+to a comparable event elsewhere, asked the same way. The direction is the
+per-layer mean of the sensitive prompts minus the mean of their comparisons,
+normalized and not orthogonalized. At scale 1 the FFN edit projects it out
+of every hyper-connection copy, `h - (h.d)d`, for prompt and generated tokens
+alike.
+
+The prompt files are under the Qwen Community License 1.0 and are not copied
+here. They wrap each question in Qwen's chat template, while ds4 applies its
+own, so keep only the user turn:
+
+```sh
+for f in pos neg held; do
+  curl -fsSL https://huggingface.co/zjj1993/Qwen3.8-Flash-Next-uncensored-china/resolve/main/data/$f.txt |
+    python3 -c 'import re, sys
+for line in sys.stdin:
+    m = re.search(r"<\|im_start\|>user\n(.*?)<\|im_end\|>", line.replace("\\n", "\n"), re.S)
+    if m: print(m.group(1).strip())' > /tmp/candor-$f.txt
+done
+```
+
+Build from the unabliterated weights, capturing at the start of thinking, and
+keep layers 3 to 36. The source kept 4 to 44 of 48; this window likewise
+leaves the last layers, next to the logits, untouched:
+
+```sh
+python3 dir-steering/tools/build_direction.py \
+  --profile deepseek-v41-flash \
+  --ds4 ./ds4 \
+  --model gguf/DeepSeek-V4.1-Flash-1017-Q1.gguf \
+  --good-file /tmp/candor-pos.txt \
+  --bad-file /tmp/candor-neg.txt \
+  --out dir-steering/out/candor-v41.json \
+  --component ffn_out \
+  --think --no-orthogonalize --keep-layers 3:36
+```
+
+Run it at scale 1. Larger scales flip the component instead of removing it,
+and on V4.1 scale 2 added factual errors without reducing evasion further:
+
+```sh
+./ds4-server --dir-steering-file dir-steering/out/candor-v41.f32 --dir-steering-ffn 1
+```
+
+On 68 held-out prompts (48 on sensitive history, 20 comparisons about other
+places, half in each language), each layer's direction separates the two
+groups at AUC 0.84 to 0.93 from layer 12 on. Greedy, non-thinking answers
+from the abliterated Q1, graded into the source's categories; the last
+column adds the system prompt `Present fairly all stakeholder perspectives
+and the uncommon ground that bridges them.`:
+
+| Sensitive-history prompts (48) | scale 0 | scale 1 | scale 1 + prompt |
+|---|---|---|---|
+| evasive (refusal, feigned ignorance, one account as settled) | 23 | 9 | 3 |
+| calibrated (substantive, says where evidence is disputed) | 14 | 25 | 33 |
+| one-sided | 8 | 13 | 8 |
+| major factual error | 3 | 1 | 4 |
+
+The comparison prompts stayed at 16 of 20 calibrated at scale 1 (17, with
+3 factual errors, with the prompt added), and 20 short arithmetic, fact and
+code checks stayed correct. The projection removes the evasion without
+pushing the model the other way, so some former refusals come back
+one-sided, and memorised one-line answers to sovereignty questions survive
+the direction alone. With the system prompt as well, both sovereignty test
+questions came back with the positions laid out side by side. With thinking
+on the results point the same way but are sampled and noisier, and about a
+quarter of the sensitive prompts thought until a 3000-token cap, steered or
+not.

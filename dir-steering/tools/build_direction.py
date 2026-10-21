@@ -141,6 +141,8 @@ def main() -> None:
                     help="average normalized per-pair differences")
     ap.add_argument("--no-orthogonalize", action="store_true",
                     help="do not remove the component parallel to the control mean")
+    ap.add_argument("--keep-layers", default="",
+                    help="lo:hi inclusive; rows outside are written as zeros (no edit)")
     args = ap.parse_args()
 
     ds4 = Path(args.ds4).resolve()
@@ -200,6 +202,10 @@ def main() -> None:
             ])
         layers.append(direction)
 
+    if args.keep_layers:
+        lo, hi = (int(x) for x in args.keep_layers.split(":"))
+        layers = [d if lo <= i <= hi else [0.0] * n_embd for i, d in enumerate(layers)]
+
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -210,6 +216,7 @@ def main() -> None:
         "thinking": bool(args.think),
         "pair_normalize": bool(args.pair_normalize),
         "orthogonalize_control_mean": not args.no_orthogonalize,
+        "keep_layers": args.keep_layers or "all",
         "good_file": str(Path(args.good_file)),
         "bad_file": str(Path(args.bad_file)),
         "model": str(model_arg),
