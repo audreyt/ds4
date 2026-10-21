@@ -26046,8 +26046,9 @@ static int routed_moe_launch(
     }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
     const int iq2_path = (gate_type == 16u && down_type == 10u);
+    const int iq1_path = (gate_type == 19u && down_type == 19u);
     const int mxfp4_path = (gate_type == 39u && down_type == 39u);
-    if (!q4k_path && !iq2_path && !mxfp4_path) return 0;
+    if (!q4k_path && !iq2_path && !iq1_path && !mxfp4_path) return 0;
 
     /* Resident support models must not use the target model's SSD cache. */
     const bool stream_model = g_ssd_streaming_mode && model_map == g_model_fd_host_base;
@@ -26536,6 +26537,32 @@ static int routed_moe_launch(
         cuda_resolve_weight_ptr(model_map, down_offset, down_bytes,
                                 logical_tier, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
+
+    if (iq1_path) {
+        const cudaStream_t stream = cuda_decode_stream();
+        const uint64_t assignments = (uint64_t)n_tokens * n_expert;
+        int rc = ds4_mmq_iq1_s_moe(gate_w, (const float *)x->ptr,
+            (const int32_t *)selected->ptr, (float *)gate->ptr,
+            expert_mid_dim, expert_in_dim, n_tokens, n_total_expert, n_expert, stream);
+        if (rc == 0) rc = ds4_mmq_iq1_s_moe(up_w, (const float *)x->ptr,
+            (const int32_t *)selected->ptr, (float *)up->ptr,
+            expert_mid_dim, expert_in_dim, n_tokens, n_total_expert, n_expert, stream);
+        if (rc != 0) return 0;
+        const uint64_t nmid = assignments * expert_mid_dim;
+        moe_mmq_swiglu_weighted_clamp_kernel<<<(nmid + 255) / 256, 256, 0, stream>>>(
+            (float *)mid->ptr, (const float *)gate->ptr, (const float *)up->ptr,
+            (const float *)weights->ptr, expert_mid_dim, n_tokens, n_expert, clamp);
+        if (!cuda_ok(cudaGetLastError(), "iq1 moe swiglu")) return 0;
+        rc = ds4_mmq_iq1_s_moe(down_w, (const float *)mid->ptr,
+            (const int32_t *)selected->ptr, (float *)down->ptr,
+            out_dim, expert_mid_dim, assignments, n_total_expert, 1, stream);
+        if (rc != 0) return 0;
+        const uint64_t nout = (uint64_t)n_tokens * out_dim;
+        moe_mmq_sum_kernel<<<(nout + 255) / 256, 256, 0, stream>>>(
+            (float *)out->ptr, (const float *)down->ptr, NULL,
+            out_dim, n_expert, n_tokens, 1);
+        return cuda_ok(cudaGetLastError(), "iq1 moe sum");
+    }
 
     /* V4.1's short TP prefills need scalar-row arithmetic. Keep existing
      * multi-GPU batching dispatch unchanged for other model geometries. */
@@ -29586,12 +29613,14 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
         token >= n_vocab) {
         return 0;
     }
-    if (weight_type != 8u) {   /* DS4_TENSOR_Q8_0 */
+    if (weight_type != 8u && weight_type != 14u) {
         fprintf(stderr, "ds4: embed_token_quant: unsupported type %u\n",
                 weight_type);
         return 0;
     }
-    const uint64_t row_bytes = ((uint64_t)n_embd / 32u) * 34u;
+    if (weight_type == 14u && n_embd % 256u) return 0;
+    const uint64_t row_bytes = weight_type == 14u ?
+        ((uint64_t)n_embd / 256u) * 210u : ((uint64_t)n_embd / 32u) * 34u;
     if (weight_offset > model_size ||
         (uint64_t)n_vocab * row_bytes > model_size - weight_offset ||
         out->bytes < (uint64_t)n_embd * sizeof(float)) {
@@ -29602,6 +29631,9 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
             model_map, weight_offset, (uint64_t)n_vocab * row_bytes,
             logical_tier, "glm_token_embd");
     if (!w) return 0;
+    if (weight_type == 14u)
+        return ds4_mmq_q6_K_embed(w, NULL, (float *)out->ptr,
+            token, 1, n_embd, cuda_decode_stream()) == 0;
     glm_embed_token_q8_0_kernel<<<(n_embd + 255) / 256, 256>>>(
             (float *)out->ptr, w, token, n_embd);
     return cuda_ok(cudaGetLastError(), "glm embed token launch");
@@ -29639,12 +29671,14 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
         (n_embd & 31u) != 0u) {
         return 0;
     }
-    if (weight_type != 8u) {   /* DS4_TENSOR_Q8_0 */
+    if (weight_type != 8u && weight_type != 14u) {
         fprintf(stderr, "ds4: embed_tokens_quant: unsupported type %u\n",
                 weight_type);
         return 0;
     }
-    const uint64_t row_bytes = ((uint64_t)n_embd / 32u) * 34u;
+    if (weight_type == 14u && n_embd % 256u) return 0;
+    const uint64_t row_bytes = weight_type == 14u ?
+        ((uint64_t)n_embd / 256u) * 210u : ((uint64_t)n_embd / 32u) * 34u;
     if (weight_offset > model_size ||
         (uint64_t)n_vocab * row_bytes > model_size - weight_offset ||
         out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float) ||
@@ -29657,6 +29691,9 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
             logical_tier, "glm_token_embd");
     if (!w) return 0;
     uint64_t n = (uint64_t)n_tokens * n_embd;
+    if (weight_type == 14u)
+        return ds4_mmq_q6_K_embed(w, (const int32_t *)tokens->ptr, (float *)out->ptr,
+            0, n_tokens, n_embd, cuda_decode_stream()) == 0;
     glm_embed_tokens_q8_0_kernel<<<(n + 255) / 256, 256>>>(
             (float *)out->ptr,
             (const int32_t *)tokens->ptr,
@@ -34992,6 +35029,9 @@ static int cuda_matmul_mmq_dense_quant(
     switch (weight_type) {
     case 10u: block_elems = 256u; block_bytes = 84u; label = "Q2_K"; break;
     case 12u: block_elems = 256u; block_bytes = 144u; label = "Q4_K"; break;
+    case 13u: block_elems = 256u; block_bytes = 176u; label = "Q5_K"; break;
+    case 14u: block_elems = 256u; block_bytes = 210u; label = "Q6_K"; break;
+    case 19u: block_elems = 256u; block_bytes = 50u; label = "IQ1_S"; break;
     case 16u: block_elems = 256u; block_bytes = 66u; label = "IQ2_XXS"; break;
     case 39u: block_elems = 32u; block_bytes = 17u; label = "MXFP4"; break;
     default: return 0;
@@ -35023,6 +35063,13 @@ static int cuda_matmul_mmq_dense_quant(
     if (!weights) return 0;
     int rc = -1;
     switch (weight_type) {
+    case 13u:
+    case 14u:
+    case 19u:
+        rc = ds4_mmq_q1_dense(weight_type, weights, (const float *)x->ptr,
+            (float *)out->ptr, (int)out_dim, (int)n_tok, (int)in_dim,
+            cuda_decode_stream());
+        break;
     case 10u:
         rc = ds4_mmq_q2_K_dense(weights, (const float *)x->ptr,
             (float *)out->ptr, (int)out_dim, (int)n_tok, (int)in_dim,
@@ -35072,6 +35119,9 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
                                          x, n_tok);
     case 10u:  /* Q2_K */
     case 12u:  /* Q4_K */
+    case 13u:  /* Q5_K */
+    case 14u:  /* Q6_K */
+    case 19u:  /* IQ1_S */
     case 16u:  /* IQ2_XXS */
     case 39u:  /* MXFP4 */
         return cuda_matmul_mmq_dense_quant(

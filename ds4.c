@@ -3313,13 +3313,19 @@ static void model_unmap_engram(ds4_model *m) {
     if (!tables[0] || !tables[1]) ds4_die("V4.1 GGUF is missing Engram tables");
     const uint64_t start = tables[0]->abs_offset;
     const long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0 || start % (uint64_t)page || resident_end > start ||
+    if (page <= 0) ds4_die("cannot determine page size");
+    const uint64_t cut = (resident_end + (uint64_t)page - 1) / (uint64_t)page * (uint64_t)page;
+    if (cut > start ||
         tables[1]->abs_offset < start + tables[0]->bytes)
         ds4_die("V4.1 Engram tables must follow the page-aligned main weights");
     /* Cut the mapping at the page-aligned end of the resident tensors, not
      * at the Engram start: a repacked file may leave a never-referenced gap
-     * before the tables, and Metal wraps all of [0, size) as model views. */
-    const uint64_t cut = (resident_end + (uint64_t)page - 1) / (uint64_t)page * (uint64_t)page;
+     * before the tables, and Metal wraps all of [0, size) as model views.
+     * Only this cut needs host-page alignment: Engram uses pread offsets,
+     * so a GGUF written on 16 KiB pages also works on a 64 KiB host. */
+    fprintf(stderr, "ds4: Engram disk boundary: resident_end=%" PRIu64
+            " cut=%" PRIu64 " table_start=%" PRIu64 " page=%ld\n",
+            resident_end, cut, start, page);
     if (munmap((void *)(m->map + cut), (size_t)(m->size - cut)) != 0)
         ds4_die_errno("cannot unmap disk-only region", "Engram");
     m->size = cut;
@@ -43466,6 +43472,25 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
+    if (il == 6 && metal_graph_debug_wants("v41_sublayer", il, g->pos)) {
+        metal_graph_debug_dump_tensor("v41_layer_input", g->residual,
+            (uint64_t)DS4_N_HC * DS4_N_EMBD, il, g->pos);
+        if (!ds41_graph_before_moe(g, m, l, il)) return false;
+        /* The fused attention expand need not materialize block. Project
+         * its retained low input for the dump without changing after_attn. */
+        if (!ds41_attention_b(g, m, l, g->block)) return false;
+        metal_graph_debug_dump_tensor("v41_attn_output", g->block, DS4_N_EMBD, il, g->pos);
+        metal_graph_debug_dump_tensor("v41_after_attn", g->after_attn,
+            (uint64_t)DS4_N_HC * DS4_N_EMBD, il, g->pos);
+        metal_graph_debug_dump_tensor("v41_ffn_input", g->norm, DS4_N_EMBD, il, g->pos);
+        if (!ds41_moe(g, m, l, il, (uint32_t)token)) return false;
+        metal_graph_debug_dump_tensor("v41_routed", g->routed, DS4_N_EMBD, il, g->pos);
+        metal_graph_debug_dump_tensor("v41_selected_i32", g->selected, DS4_N_EXPERT_USED, il, g->pos);
+        metal_graph_debug_dump_tensor("v41_route_weights", g->route_weights, DS4_N_EXPERT_USED, il, g->pos);
+        if (!ds41_graph_after_moe(g, m, l, il, false)) return false;
+        metal_graph_debug_dump_tensor("v41_shared", g->shared, DS4_N_EMBD, il, g->pos);
+        return ds41_steering_ffn(g, g->residual, il, DS4_N_HC);
+    }
     return ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
         ds41_graph_after_moe(g, m, l, il, il + 1u == DS4_N_LAYER) &&
         ds41_steering_ffn(g, g->residual, il, DS4_N_HC);
@@ -43708,6 +43733,17 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds41_graph_layer(g, m, l, il, token);
 #endif
         }
+        if (ok && metal_graph_debug_wants("v41_residual", il, g->pos))
+            metal_graph_debug_dump_tensor("v41_residual", g->residual,
+                (uint64_t)DS4_N_HC * DS4_N_EMBD, il, g->pos);
+        if (ok && il <= 6 && metal_graph_debug_wants("v41_sublayer", il, g->pos))
+            fprintf(stderr, "v41 structure layer=%u ratio=%u kv_source=%u index_source=%u engram=%u "
+                "types qa=%u qb=%u kv=%u oa=%u ob=%u router=%u routed=%u/%u/%u shared=%u/%u/%u\n",
+                il, ds4_layer_compress_ratio(il), ds41_kv_source(il), ds41_index_source(il),
+                ds41_engram_layer(il), l->attn_q_a->type, l->attn_q_b->type, l->attn_kv->type,
+                l->attn_output_a->type, l->attn_output_b->type, l->ffn_gate_inp->type,
+                l->ffn_gate_exps->type, l->ffn_up_exps->type, l->ffn_down_exps->type,
+                l->ffn_gate_shexp->type, l->ffn_up_shexp->type, l->ffn_down_shexp->type);
         /* TP gates already submit ordered, bounded command buffers; they keep
          * the layer 13 drain. Drain before publishing the token to the CPU. */
         const bool drain = !queue_layers || (g->tp_world == 2 && il == 13) ||
@@ -44285,10 +44321,17 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     else {
                         for (uint32_t t = 0; t < count; t++) pre[t * DS4_N_HC] = 1;
                         ok = ds4_gpu_tensor_write(g->batch.pre, 0, pre,
-                            (uint64_t)count * DS4_N_HC * sizeof(float)) &&
-                            ds4_gpu_embed_tokens_hc_tensor(g->batch.residual, g->prefill_tokens,
+                            (uint64_t)count * DS4_N_HC * sizeof(float));
+                        if (ok && w->token_embd->type == DS4_TENSOR_F16)
+                            ok = ds4_gpu_embed_tokens_hc_tensor(g->batch.residual, g->prefill_tokens,
                                 m->map, m->size, w->token_embd->abs_offset,
                                 DS4_N_VOCAB, count, DS4_N_EMBD, DS4_N_HC);
+                        else if (ok)
+                            ok = ds4_gpu_embed_tokens_quant_tensor(g->batch.x, g->prefill_tokens,
+                                m->map, m->size, w->token_embd->abs_offset, w->token_embd->type,
+                                DS4_N_VOCAB, count, DS4_N_EMBD) &&
+                                ds4_gpu_repeat_hc_rows_tensor(g->batch.residual, g->batch.x,
+                                    count, DS4_N_EMBD, DS4_N_HC);
                         free(pre);
                     }
                 } else
@@ -73310,7 +73353,12 @@ static bool ds41_memory_need(ds4_engine *e, uint64_t graph_bytes, uint64_t host,
                              uint64_t *expert) {
     const uint64_t gib = UINT64_C(1073741824);
     if (!host || !recommended) return false;
-    *budget = host / 8u * 7u;
+    /* Diagnostic sizing for constrained unified-memory hosts; the explicit
+     * runtime reserve below and the backend's limit still apply. */
+    const char *fraction = getenv("DS4_V41_MEMORY_GUARD_FRACTION");
+    *budget = fraction ? (uint64_t)((double)host *
+        glm_graph_env_double("DS4_V41_MEMORY_GUARD_FRACTION", 0.875, 0.50, 0.99)) :
+        host / 8u * 7u;
     if (*budget > recommended) *budget = recommended;
     uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
     if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
@@ -73691,8 +73739,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
-    /* IQ1_S routed experts and Q5_K/Q6_K dense weights have a CPU reference
-     * and a generic Metal path only. Refuse every other execution mode at
+    /* IQ1_S routed experts and Q5_K/Q6_K dense weights have CPU, Metal and
+     * resident CUDA paths. Refuse other execution modes at
      * open, before any GPU buffer exists, instead of falling into dispatch
      * that does not know these types. */
     {
@@ -73707,14 +73755,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 has_metal_only = true;
         }
         if (has_metal_only &&
-            (e->backend == DS4_BACKEND_CUDA || e->ssd_streaming ||
+            (
+#ifdef DS4_ROCM_BUILD
+             e->backend == DS4_BACKEND_CUDA ||
+#endif
+             (e->ssd_streaming && e->backend != DS4_BACKEND_CUDA) ||
              e->cuda_tensor_parallel ||
              e->distributed.role != DS4_DISTRIBUTED_NONE ||
              opt->tp.role != DS4_TP_NONE || opt->tp.requested ||
              (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4 &&
               DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41))) {
             fprintf(stderr,
-                    "ds4: IQ1_S routed experts and Q5_K/Q6_K dense weights are supported only for DeepSeek models on Metal/CPU without SSD streaming, tensor parallelism, or distributed inference\n");
+                    "ds4: IQ1_S routed experts and Q5_K/Q6_K dense weights require DeepSeek on Metal/CPU/CUDA, SSD streaming requires CUDA, and tensor parallelism/distributed inference are unsupported\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;

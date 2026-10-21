@@ -32,6 +32,15 @@ extern "C" {
 //   device: CUDA device ordinal (0 for the primary GPU).
 // Returns 0 on success.
 int ds4_mmq_init(int device);
+/* V4.1 Q1: raw GGUF blocks; MMVQ for short rows, MMQ for prefill.
+ * Dense layout is [N,M], routed layout [token,slot,M]. */
+int ds4_mmq_q1_dense(int type, const void *W, const float *X, float *out,
+                     int M, int N, int K, cudaStream_t stream);
+int ds4_mmq_iq1_s_moe(const void *W, const float *X, const int32_t *ids,
+                     float *out, int M, int K, int tokens, int experts,
+                     int used, cudaStream_t stream);
+int ds4_mmq_q6_K_embed(const void *W, const int32_t *tokens, float *out,
+                      int token, int count, int width, cudaStream_t stream);
 void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes);
 
 // Query whether ds4_mmq is willing to handle a given matmul. Returns

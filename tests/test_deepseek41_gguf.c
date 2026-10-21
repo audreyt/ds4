@@ -47,9 +47,13 @@ static void tensor(FILE *fp, const char *name, uint32_t type,
 
 static int run_fixture(int bad_layout) {
     enum { ALIGN = 16384 };
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    const uint64_t cut = align_up(ALIGN + 64, page);
     const uint32_t rows = (1u << 24) + 3;
     const uint64_t table_bytes = (uint64_t)rows * DS4_ENGRAM_ROW_BYTES;
-    const uint64_t first = 2 * ALIGN + (bad_layout ? 32 : 0);
+    /* Disk-only tables need not share the runtime's page alignment. A table
+     * overlapping the resident weights must still be rejected. */
+    const uint64_t first = bad_layout ? ALIGN + 32 : cut + ALIGN + 32;
     const uint64_t second = align_up(first + table_bytes, ALIGN);
     const uint64_t file_size = second + table_bytes;
     char path[] = "/tmp/ds41-gguf.XXXXXX";
@@ -85,11 +89,11 @@ static int run_fixture(int bad_layout) {
     } else for (int shared = 0; shared < 2; shared++) {
         ds4_model m;
         model_open(&m, path, shared != 0, false);
-        assert(m.file_size == file_size && m.size == first);
+        assert(m.file_size == file_size && m.size == cut);
         assert(m.max_tensor_bytes == 64);
         char resident;
-        assert(mincore((void *)m.map, ALIGN, &resident) == 0);
-        check_unmapped(m.map + first, ALIGN);
+        assert(mincore((void *)m.map, page, &resident) == 0);
+        check_unmapped(m.map + cut, page);
         const ds4_tensor *t = model_find_tensor(&m, "blk.14.engram_embd.weight");
         assert(t && t->abs_offset == second && t->bytes == table_bytes);
         assert(*(const float *)tensor_data(&m, model_find_tensor(&m, "test.weight")) == 0);

@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstring>
+#include <vector>
 
 #if defined(__has_include)
 #if __has_include(<nvtx3/nvToolsExt.h>)
@@ -1544,6 +1545,50 @@ int ds4_mmq_moe_impl(
         return -2;
     }
 
+    /* Compact the expert-major work map for IQ1. SSD ids address a global
+     * cache, but a layer uses only its nonempty expert buckets. Preserve
+     * gathered row/destination indices and stage packed (not dequantized)
+     * weights in the same dense bucket order. */
+    int mmq_experts = n_experts;
+    int64_t mmq_columns = ne_get_rows;
+    const char *mmq_weights = (const char *)W;
+    const int32_t *mmq_bounds = expert_bounds.get();
+    ggml_cuda_pool_alloc<char> compact_weights(ctx->pool());
+    ggml_cuda_pool_alloc<int32_t> compact_bounds(ctx->pool());
+    if (type == GGML_TYPE_IQ1_S) {
+        std::vector<int32_t> bounds(n_experts + 1);
+        CUDA_CHECK(cudaMemcpyAsync(bounds.data(), expert_bounds.get(),
+            bounds.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<int32_t> active, dense_bounds;
+        mmq_columns = 0;
+        for (int expert = 0; expert < n_experts; expert++) {
+            const int count = bounds[expert + 1] - bounds[expert];
+            if (!count) continue;
+            active.push_back(expert);
+            dense_bounds.push_back(bounds[expert]);
+            mmq_columns = std::max(mmq_columns, (int64_t)count);
+        }
+        if (active.empty()) return -1;
+        mmq_experts = (int)active.size();
+        if (mmq_experts != n_experts) {
+            dense_bounds.push_back(bounds.back());
+            const size_t expert_bytes = (size_t)s02 * ggml_type_size(type);
+            compact_weights.alloc(ctx->pool(), active.size() * expert_bytes);
+            compact_bounds.alloc(ctx->pool(), dense_bounds.size());
+            CUDA_CHECK(cudaMemcpyAsync(compact_bounds.get(), dense_bounds.data(),
+                dense_bounds.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            /* The pageable host vectors must outlive their asynchronous copies. */
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            for (size_t i = 0; i < active.size(); i++)
+                CUDA_CHECK(cudaMemcpyAsync(compact_weights.get() + i * expert_bytes,
+                    (const char *)W + (size_t)active[i] * expert_bytes, expert_bytes,
+                    cudaMemcpyDeviceToDevice, stream));
+            mmq_weights = compact_weights.get();
+            mmq_bounds = compact_bounds.get();
+        }
+    }
+
     // 2. Gather + quantize activations, retaining Q8 precision for MXFP4.
     const bool use_native_fp4 =
         type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc);
@@ -1613,6 +1658,17 @@ int ds4_mmq_moe_impl(
         (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc);
 
+    /* Retain a conservative overflow bound even for unusually large
+     * compacted batches. Current V4.1 batches fit a single launch. */
+    int expert_chunk = mmq_experts;
+    if (type == GGML_TYPE_IQ1_S && use_stream_k) {
+        const int64_t work_per_expert = ((mmq_columns + 7) / 8) *
+            ((M + get_mmq_y_host(cc) - 1) / get_mmq_y_host(cc)) * s01;
+        const int64_t max_channels = ((int64_t{1} << 30) - 1) / work_per_expert;
+        if (max_channels < 1) return -1;
+        if (max_channels < expert_chunk) expert_chunk = (int)max_channels;
+    }
+
     if (out_memset_enabled()) {
         (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
     }
@@ -1642,11 +1698,11 @@ int ds4_mmq_moe_impl(
     }
 
     const mmq_args args = {
-        /*x=*/(const char *)W,
+        /*x=*/mmq_weights,
         /*type_x=*/type,
         /*y=*/(const int *)src1_q8_1.get(),
         /*ids_dst=*/ids_dst.get(),
-        /*expert_bounds=*/expert_bounds.get(),
+        /*expert_bounds=*/mmq_bounds,
         /*dst=*/out_f32,
         /*ncols_x=*/ne00,
         /*nrows_x=*/(int64_t)M,
@@ -1654,8 +1710,8 @@ int ds4_mmq_moe_impl(
         /*stride_row_x=*/s01,
         /*ncols_y=*/ne_get_rows,
         /*nrows_dst=*/s1,
-        /*nchannels_x=*/(int64_t)n_experts,
-        /*nchannels_y=*/(int64_t)n_experts,
+        /*nchannels_x=*/(int64_t)mmq_experts,
+        /*nchannels_y=*/(int64_t)mmq_experts,
         /*stride_channel_x=*/s02,
         /*stride_channel_y=*/s12_mmq,
         /*stride_channel_dst=*/(int64_t)0,
@@ -1665,12 +1721,20 @@ int ds4_mmq_moe_impl(
         /*stride_sample_y=*/s13_mmq,
         /*stride_sample_dst=*/0,
         /*use_stream_k=*/use_stream_k,
-        /*ncols_max=*/ne_get_rows,
+        /*ncols_max=*/mmq_columns,
         /*x_soa=*/x_soa,
         /*soa_blocks=*/soa_blocks,
     };
 
-    mul_mat_q_case<type>(*ctx, args, stream);
+    for (int first = 0; first < mmq_experts; first += expert_chunk) {
+        mmq_args chunk = args;
+        const int count = std::min(expert_chunk, mmq_experts - first);
+        chunk.x += (int64_t)first * s02 * ggml_type_size(type);
+        chunk.expert_bounds += first;
+        chunk.nchannels_x = count;
+        chunk.nchannels_y = count;
+        mul_mat_q_case<type>(*ctx, chunk, stream);
+    }
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -5704,3 +5768,65 @@ template void mul_mat_q_case<GGML_TYPE_Q4_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_MXFP4>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_Q5_K>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_Q6_K>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ1_S>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+
+/* Reuse the pinned ggml-cuda MMVQ/MMQ implementations rather than a
+ * dequantized model cache: the Q1 resident weights already fill GB10 RAM. */
+template <ggml_type type>
+static int ds4_q1_dense(const void *W, const float *X, float *out,
+                        int M, int N, int K, cudaStream_t stream) {
+    if (N <= 8)
+        return ds4_mmq_dense_vec_impl<type>("q1 dense vector", W, X, out, M, N, K, stream);
+    return ds4_mmq_dense_impl<type>("q1 dense batch", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_q1_dense(int type, const void *W, const float *X, float *out,
+                                int M, int N, int K, cudaStream_t stream) {
+    switch (type) {
+    case GGML_TYPE_Q5_K: return ds4_q1_dense<GGML_TYPE_Q5_K>(W, X, out, M, N, K, stream);
+    case GGML_TYPE_Q6_K: return ds4_q1_dense<GGML_TYPE_Q6_K>(W, X, out, M, N, K, stream);
+    case GGML_TYPE_IQ1_S: return ds4_q1_dense<GGML_TYPE_IQ1_S>(W, X, out, M, N, K, stream);
+    default: return -1;
+    }
+}
+
+extern "C" int ds4_mmq_iq1_s_moe(const void *W, const float *X, const int32_t *ids,
+                                float *out, int M, int K, int tokens, int experts,
+                                int used, cudaStream_t stream) {
+    if (tokens <= 8)
+        return ds4_mmq_moe_vec_impl<GGML_TYPE_IQ1_S>(
+            "iq1_s moe vector", W, X, ids, out, M, K, tokens, experts, used, stream);
+    return ds4_mmq_moe_impl<GGML_TYPE_IQ1_S>(
+        "iq1_s moe batch", W, X, ids, out, M, K, tokens, experts, used, stream);
+}
+
+/* Scalar-index form of llama.cpp dequantize_row_q6_K, same pinned revision
+ * as the MMQ kernels. Only the requested embedding rows are expanded. */
+__global__ static void ds4_q6_K_embed_kernel(
+        const block_q6_K *W, const int32_t *tokens, float *out,
+        int token, int count, int width) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (uint64_t)count * width) return;
+    const int row = i / width, col = i % width;
+    const int tok = tokens ? tokens[row] : token;
+    const block_q6_K &b = W[(uint64_t)tok * (width / 256) + col / 256];
+    const int j = col % 256, n = j / 128, l = j % 32, q = (j % 128) / 32;
+    const int low = (b.ql[n * 64 + (q % 2) * 32 + l] >> (q / 2 * 4)) & 15;
+    const int high = (b.qh[n * 32 + l] >> (q * 2)) & 3;
+    out[i] = __half2float(b.d) * b.scales[n * 8 + q * 2 + l / 16] *
+             ((low | (high << 4)) - 32);
+}
+
+extern "C" int ds4_mmq_q6_K_embed(const void *W, const int32_t *tokens, float *out,
+                                 int token, int count, int width, cudaStream_t stream) {
+    if (!W || !out || count <= 0 || width <= 0 || width % 256) return -1;
+    const uint64_t n = (uint64_t)count * width;
+    ds4_q6_K_embed_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
+        (const block_q6_K *)W, tokens, out, token, count, width);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}

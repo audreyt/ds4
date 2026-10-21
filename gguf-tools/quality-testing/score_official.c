@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
@@ -13,6 +14,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static double score_now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
 
 static void die(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -934,7 +942,7 @@ int main(int argc, char **argv) {
             "\tapi_top1_count\tapi_top1_match\tapi_top1_rate"
             "\tapi_topn_ref\tapi_topn_hit\tapi_topn_recall"
             "\tapi_top_logprob_count\tapi_top_mae\tapi_top_mean_delta"
-            "\tapi_pair_total\tapi_pair_agree\tapi_pair_rate\n");
+            "\tapi_pair_total\tapi_pair_agree\tapi_pair_rate\telapsed_seconds\n");
 
     char line[8192];
     int case_n = 0;
@@ -950,6 +958,7 @@ int main(int argc, char **argv) {
         strip_newline(line);
         if (!line[0] || line[0] == '#') continue;
         if (max_cases != 0 && case_n >= max_cases) break;
+        const double case_start = score_now_sec();
 
         char *id = strtok(line, "\t");
         char *prompt_path = strtok(NULL, "\t");
@@ -1136,6 +1145,7 @@ int main(int argc, char **argv) {
         }
 
         const double avg = target.len ? nll / (double)target.len : 0.0;
+        const double elapsed = score_now_sec() - case_start;
         fprintf(out,
                 "%s\t%d\t%d\t%.9f\t%.9f\t%d\t%d"
                 "\t%d\t%ld\t%.9f\t%.9f"
@@ -1143,7 +1153,7 @@ int main(int argc, char **argv) {
                 "\t%ld\t%ld\t%.9f"
                 "\t%ld\t%ld\t%.9f"
                 "\t%ld\t%.9f\t%.9f"
-                "\t%ld\t%ld\t%.9f\n",
+                "\t%ld\t%ld\t%.9f\t%.6f\n",
                 id, prompt.len, target.len, nll, avg, first_match ? 1 : 0, lcp,
                 have_api ? ref.n_pos : 0,
                 cm.target_count,
@@ -1163,7 +1173,7 @@ int main(int argc, char **argv) {
                 safe_avg(cm.top_signed_delta, cm.top_logprob_count),
                 cm.pair_total,
                 cm.pair_agree,
-                safe_ratio(cm.pair_agree, cm.pair_total));
+                safe_ratio(cm.pair_agree, cm.pair_total), elapsed);
         fflush(out);
 
         case_n++;
@@ -1175,14 +1185,14 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "%s cases=%d prompt=%d target=%d avg_nll=%.6f lcp=%d "
                 "api_target_mae=%.6f api_top_coverage=%ld/%ld "
-                "api_top1=%.3f api_topn=%.3f api_pair=%.3f\n",
+                "api_top1=%.3f api_topn=%.3f api_pair=%.3f elapsed_seconds=%.6f\n",
                 id, case_n, prompt.len, target.len, avg, lcp,
                 safe_avg(cm.target_abs_delta, cm.target_count),
                 cm.top_mapped,
                 cm.top_items,
                 safe_ratio(cm.top1_match, cm.top1_count),
                 safe_ratio(cm.topn_hit, cm.topn_ref),
-                safe_ratio(cm.pair_agree, cm.pair_total));
+                safe_ratio(cm.pair_agree, cm.pair_total), elapsed);
 
         api_ref_free(&ref);
         ds4_tokens_free(&prompt);
