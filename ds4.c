@@ -44102,6 +44102,30 @@ static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) 
     return g->prefill_cap;
 }
 
+/* Last prompt token, HC-mean of the post-layer residual: the site FFN steering
+ * edits. Only with DS4_*_GRAPH_DUMP_PREFIX set; pos0 naming matches the layout
+ * dir-steering/tools/build_direction.py reads for the other graphs. */
+static void ds41_dump_last_ffn(ds4_gpu_tensor *residual, uint32_t il) {
+    const char *prefix = metal_graph_debug_prefix_for("ffn_out", il, 0);
+    if (!residual || !prefix) return;
+    const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC;
+    float *hc_row = xmalloc((size_t)hc * E * sizeof(hc_row[0]));
+    if (ds4_gpu_tensor_read(residual, 0, hc_row, (uint64_t)hc * E * sizeof(float)) != 0) {
+        float *mean = xmalloc((size_t)E * sizeof(mean[0]));
+        for (uint32_t i = 0; i < E; i++) {
+            float s = 0.0f;
+            for (uint32_t h = 0; h < hc; h++) s += hc_row[(uint64_t)h * E + i];
+            mean[i] = s / (float)hc;
+        }
+        char path[1024];
+        snprintf(path, sizeof(path), "%s_ffn_out-%u_pos0.bin", prefix, il);
+        if (write_f32_binary_file(path, mean, E))
+            fprintf(stderr, "ds4: dumped V4.1 ffn_out layer %u last-token HC-mean to %s\n", il, path);
+        free(mean);
+    }
+    free(hc_row);
+}
+
 /* Process rows in causal order within each layer. Selection/candidate rows
  * travel down the stack with their token, while only source layers append KV.
  * A failed partial chunk cannot be snapshotted: its layers have different
@@ -44408,8 +44432,10 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
             if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
             const double t_done = profile ? now_sec() : 0;
-            if (ok && !encoder_only && off + count == total_count)
+            if (ok && !encoder_only && off + count == total_count) {
+                ds41_dump_last_ffn(g->rows_view[count - 1u].residual, il);
                 ok = ds41_prefill_seed(g, m, &w->layer[il], il, count);
+            }
             if (engram_prefetched && ds41_engram_layer(il) && off + count == total_count &&
                 !ds41_engram_prefetch_join(&engram_prefetch, !ok)) ok = false;
             if (profile)
