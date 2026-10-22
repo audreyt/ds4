@@ -159,6 +159,27 @@ static int check_attention_layouts(const char *path) {
     config_validate_model(&model);
     assert(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
     weights_bind(&weights, &model, false, 0, UINT32_MAX, true, false);
+    /* Maya uses Q8 embeddings and indexer projections; validation must admit
+     * the formats already handled by the V4.1 get-rows/matmul paths. */
+    const pid_t q8_child = fork();
+    assert(q8_child >= 0);
+    if (!q8_child) {
+        weights.token_embd->type = DS4_TENSOR_Q8_0;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            ds4_layer_weights *l = &weights.layer[il];
+            if (l->attn_compressor_kv) l->attn_compressor_kv->type = DS4_TENSOR_Q8_0;
+            if (l->attn_compressor_gate) l->attn_compressor_gate->type = DS4_TENSOR_Q8_0;
+            if (l->indexer_attn_k) l->indexer_attn_k->type = DS4_TENSOR_Q8_0;
+            if (l->indexer_attn_q_b) l->indexer_attn_q_b->type = DS4_TENSOR_Q8_0;
+            if (l->indexer_proj) l->indexer_proj->type = DS4_TENSOR_Q8_0;
+        }
+        weights_validate_layout(&weights, 0, UINT32_MAX, true, true);
+        _exit(0);
+    }
+    int q8_status;
+    pid_t q8_done;
+    do { q8_done = waitpid(q8_child, &q8_status, 0); } while (q8_done < 0 && errno == EINTR);
+    assert(q8_done == q8_child && WIFEXITED(q8_status) && WEXITSTATUS(q8_status) == 0);
     const uint32_t layers[] = {0, 39};
     const uint32_t types[] = {DS4_TENSOR_Q4_0, DS4_TENSOR_Q4_K};
     for (unsigned i = 0; i < 2; i++) {
@@ -181,7 +202,7 @@ static int check_attention_layouts(const char *path) {
         }
     }
     model_close(&model);
-    puts("V4.1 Q8 attention admitted, unsupported Q4 output layouts rejected before GPU allocation: PASS");
+    puts("V4.1 Q8 embedding/compressor/indexer/attention admitted, unsupported Q4 output layouts rejected before GPU allocation: PASS");
     return 0;
 }
 

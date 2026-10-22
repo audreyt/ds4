@@ -6492,10 +6492,12 @@ static void weights_validate_layout(
 
     if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
     if (w->token_embd) {
-        /* V4.1 Metal also embeds through a Q6_K get-rows (Unsloth dense). */
+        /* V4.1 Metal also embeds through quantized get-rows. */
         tensor_expect_layout(w->token_embd,
             DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
-            w->token_embd->type == DS4_TENSOR_Q6_K ? DS4_TENSOR_Q6_K : DS4_TENSOR_F16,
+            (w->token_embd->type == DS4_TENSOR_Q6_K ||
+             w->token_embd->type == DS4_TENSOR_Q8_0) ?
+                w->token_embd->type : DS4_TENSOR_F16,
             2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
@@ -6540,23 +6542,23 @@ static void weights_validate_layout(
             tensor_expect_layout(l->attn_output_b, DS4_TENSOR_Q8_0, 2,
                 out_low_dim, DS4_N_EMBD, 0);
             if (ds41_kv_source(il)) {
-                tensor_expect_layout(l->attn_compressor_kv, DS4_TENSOR_F16, 2,
+                tensor_expect_f16_or_q8_0_layout(l->attn_compressor_kv, 2,
                                      DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
                 tensor_expect_layout(l->attn_compressor_norm, DS4_TENSOR_F32, 1,
                                      DS4_N_HEAD_DIM, 0, 0);
                 if (ratio == 2)
-                    tensor_expect_layout(l->attn_compressor_gate, DS4_TENSOR_F16, 2,
+                    tensor_expect_f16_or_q8_0_layout(l->attn_compressor_gate, 2,
                                          DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
-                tensor_expect_layout(l->indexer_attn_k, DS4_TENSOR_F16, 2,
+                tensor_expect_f16_or_q8_0_layout(l->indexer_attn_k, 2,
                                      DS4_N_HEAD_DIM, DS4_N_INDEXER_HEAD_DIM, 0);
                 tensor_expect_layout(l->indexer_k_norm, DS4_TENSOR_F32, 1,
                                      DS4_N_INDEXER_HEAD_DIM, 0, 0);
             }
             if (ds41_index_source(il)) {
-                tensor_expect_layout(l->indexer_attn_q_b, DS4_TENSOR_F16, 2,
+                tensor_expect_f16_or_q8_0_layout(l->indexer_attn_q_b, 2,
                                      DS4_N_LORA_Q,
                                      DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM, 0);
-                tensor_expect_layout(l->indexer_proj, DS4_TENSOR_F16, 2,
+                tensor_expect_f16_or_q8_0_layout(l->indexer_proj, 2,
                                      DS4_N_EMBD, DS4_N_INDEXER_HEAD, 0);
             }
             if (ds41_engram_layer(il)) {
